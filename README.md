@@ -72,6 +72,12 @@ python main.py
 - Group state persists across hide/show
 - Clips in same group are visually grouped together
 
+## Screenshots
+
+![Main UI](images/e7c172843cb7bb43cbe68a2e0c12d5c0.png)
+
+![Another view](images/2e90668ee2477c10b916f8a05dc5320b.png)
+
 ## Architecture
 
 ```
