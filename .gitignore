@@ -1,0 +1,47 @@
+# Database files
+*.db
+*.db-wal
+*.db-shm
+
+# Generated application files
+clipboard.db          # SQLite database created at runtime
+
+# Backup files
+backups/
+*.bak
+
+# Legacy data file
+data.json
+
+# Image storage
+images/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
