@@ -1,8 +1,20 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "PyQt6",
+# ]
+# ///
 import sys
 import os
 import hashlib
 import ctypes
+import ctypes.wintypes
 import atexit
+import faulthandler
+import logging
+import threading
+import time
+import traceback
 from PyQt6.QtWidgets import (
     QApplication,
     QWidget,
@@ -46,9 +58,8 @@ from PyQt6.QtGui import (
     QImage,
 )
 
-# Sử dụng pynput cho cả Hotkey và Paste để tránh kẹt phím
-from pynput import keyboard
-from pynput.keyboard import Key, Controller as KeyboardController
+# Pure Win32 clipboard monitor & hotkey (no pynput, no keyboard hooks)
+from win32_monitor import Win32ClipboardMonitor, VK_CONTROL, VK_MENU, simulate_paste
 
 # Import storage and backup modules
 from storage import get_storage, ClipboardStorage
@@ -62,6 +73,9 @@ from backup_manager import (
 # --- Cấu hình ---
 DATA_FILE = os.path.join(os.path.dirname(__file__), "data.json")
 IMAGE_DIR = os.path.join(os.path.dirname(__file__), "images")
+LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+DEBUG_LOG_FILE = os.path.join(LOG_DIR, "Advance Clipboard.debug.log")
+FAULT_LOG_FILE = os.path.join(LOG_DIR, "Advance Clipboard.fault.log")
 
 # Pagination config
 PAGE_SIZE_HISTORY = 20
@@ -73,6 +87,43 @@ UI_EDGE_MARGIN = 150  # Minimum distance from screen edges
 # Ensure image directory exists
 if not os.path.exists(IMAGE_DIR):
     os.makedirs(IMAGE_DIR)
+if not os.path.exists(LOG_DIR):
+    os.makedirs(LOG_DIR)
+
+
+logger = logging.getLogger("advance_clipboard")
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    file_handler = logging.FileHandler(DEBUG_LOG_FILE, encoding="utf-8")
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    )
+    logger.addHandler(file_handler)
+    logger.propagate = False
+
+
+_fault_log_handle = open(FAULT_LOG_FILE, "a", encoding="utf-8")
+faulthandler.enable(_fault_log_handle, all_threads=True)
+
+
+def _log_unhandled_exception(exc_type, exc_value, exc_tb):
+    logger.critical(
+        "Unhandled exception:\n%s",
+        "".join(traceback.format_exception(exc_type, exc_value, exc_tb)),
+    )
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+
+def _log_thread_exception(args):
+    logger.critical(
+        "Unhandled thread exception in %s:\n%s",
+        getattr(args.thread, "name", "unknown-thread"),
+        "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)),
+    )
+
+
+sys.excepthook = _log_unhandled_exception
+threading.excepthook = _log_thread_exception
 
 
 # --- Smooth scrolling list widget ---
@@ -150,36 +201,6 @@ class SearchLineEdit(QLineEdit):
 
     def _reset_click_count(self):
         self.click_count = 0
-
-
-# --- Worker xử lý Hotkey (Logic từ auto-suggest) ---
-class HotkeyWorker(QObject):
-    activated = pyqtSignal()
-    escape_pressed = pyqtSignal()
-
-    def __init__(self):
-        super().__init__()
-        self.hotkeys = None
-        self.listener = None
-
-    def start(self):
-        self.hotkeys = keyboard.GlobalHotKeys({"<ctrl>+<alt>+v": self.on_activate})
-        self.listener = keyboard.Listener(on_press=self.on_press)
-        self.hotkeys.start()
-        self.listener.start()
-
-    def on_activate(self):
-        self.activated.emit()
-
-    def on_press(self, key):
-        if key == Key.esc:
-            self.escape_pressed.emit()
-
-    def stop(self):
-        if self.hotkeys:
-            self.hotkeys.stop()
-        if self.listener:
-            self.listener.stop()
 
 
 # --- Group Header Widget (Collapsible) ---
@@ -333,34 +354,43 @@ class ClipItemWidget(QWidget):
             self.content_layout.addWidget(self.lbl_content, 0, 0)
             self.display_height = THUMB_SIZE.height()
 
-        # 2. Cụm Badge và Tag (Overlay)
+        # 2. Tag row (below content, not overlapping)
         tag_text = self.item_data.get("tag", "")
         group_name = self.item_data.get("group_name", "")
         badge_text = tag_text or (
             f"[{group_name}]" if group_name and not is_grouped else ""
         )
 
-        self.lbl_tag = QLabel(badge_text)
-        self.lbl_tag.setStyleSheet("""
-            QLabel {
-                color: #d18616; 
-                font-size: 10pt; 
-                font-style: italic;
-                font-weight: normal;
-                background: rgba(209, 134, 22, 0.2); 
-                border-top-left-radius: 4px;
-                padding: 1px 4px;
-                margin: 0px;
-            }
-        """)
-        self.lbl_tag.setVisible(bool(badge_text))
-        # Căn lề dưới-phải để sát khung
-        self.content_layout.addWidget(
-            self.lbl_tag,
-            0,
-            0,
-            Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight,
-        )
+        self.has_tag = bool(badge_text)
+        self.tag_height = 0
+        if self.has_tag:
+            self.lbl_tag = QLabel(badge_text)
+            self.lbl_tag.setStyleSheet("""
+                QLabel {
+                    color: #d18616; 
+                    font-size: 8pt; 
+                    font-style: italic;
+                    font-weight: normal;
+                    background: rgba(209, 134, 22, 0.15); 
+                    border-radius: 3px;
+                    padding: 1px 6px;
+                    margin: 0px;
+                }
+            """)
+            tag_font = QFont("Segoe UI", 8)
+            tag_fm = QFontMetrics(tag_font)
+            self.tag_height = tag_fm.height() + 6  # padding
+            self.lbl_tag.setFixedHeight(self.tag_height)
+            self.lbl_tag.setMaximumWidth(200)
+            self.lbl_tag.setSizePolicy(
+                QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed
+            )
+            self.content_layout.addWidget(
+                self.lbl_tag,
+                1,
+                0,
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+            )
 
         # Cột các nút badge (Số dòng, Lên, Xuống) nằm riêng ở Col 1
         self.btn_v_widget = QWidget()
@@ -399,8 +429,10 @@ class ClipItemWidget(QWidget):
         self.btn_v_layout.addWidget(self.btn_down)
         self.btn_v_layout.addStretch()
 
+        # Span both rows (content + tag) if tag exists
+        row_span = 2 if self.has_tag else 1
         self.content_layout.addWidget(
-            self.btn_v_widget, 0, 1, Qt.AlignmentFlag.AlignTop
+            self.btn_v_widget, 0, 1, row_span, 1, Qt.AlignmentFlag.AlignTop
         )
         self.content_layout.setColumnStretch(0, 1)  # Nội dung chính co giãn
         self.content_layout.setColumnStretch(1, 0)  # Cột nút cố định
@@ -445,7 +477,8 @@ class ClipItemWidget(QWidget):
         self.setLayout(layout)
 
         min_widget_h = 35 if self.is_pinned else 60
-        self.setFixedHeight(max(self.display_height, min_widget_h) + 10)
+        total_h = self.display_height + self.tag_height
+        self.setFixedHeight(max(total_h, min_widget_h) + 10)
 
     def show_line_info(self):
         self.popup = LineInfoPopup(self.line_count)
@@ -558,13 +591,13 @@ class ClientApp(QWidget):
         self.group_headers = {}  # group_name -> QListWidgetItem
 
         # UI state
-        self.ignore_clipboard_change = False
-        self.kb_controller = KeyboardController()
+        self.pending_clipboard_guard = None
         self.is_ui_dirty = True
         self.input_locked = False
         self.last_active_window_handle = None
         self.current_search_query = ""
         self._is_refreshing = False  # Guard for changeEvent during refresh
+        self._paste_in_progress = False
 
         # Init UI
         self.initUI()
@@ -572,15 +605,21 @@ class ClientApp(QWidget):
         # Load data with disaster recovery
         self._init_data()
 
-        # Clipboard monitoring
+        # Qt clipboard object — used to READ clipboard content only
         self.clipboard = QApplication.clipboard()
-        self.clipboard.dataChanged.connect(self.on_clipboard_change)
 
-        # Hotkey handling
-        self.hotkey_worker = HotkeyWorker()
-        self.hotkey_worker.activated.connect(self.toggle_visibility)
-        self.hotkey_worker.escape_pressed.connect(self.hide_if_visible)
-        self.hotkey_worker.start()
+        # Win32 Clipboard Monitor — dedicated hidden window that NEVER gets
+        # destroyed. This replaces both Qt's dataChanged signal and the old
+        # AddClipboardFormatListener on self.winId().
+        # Also handles Ctrl+Alt+V hotkey via RegisterHotKey (no keyboard hooks).
+        self.win32_monitor = Win32ClipboardMonitor()
+        self.win32_monitor.clipboard_changed.connect(
+            self.on_clipboard_change_delayed, Qt.ConnectionType.QueuedConnection
+        )
+        self.win32_monitor.hotkey_toggle.connect(
+            self.toggle_visibility, Qt.ConnectionType.QueuedConnection
+        )
+        self.win32_monitor.start()
 
         # Backup scheduling (30s debounce)
         self.backup_scheduler = BackupScheduler(self._perform_backup)
@@ -624,6 +663,10 @@ class ClientApp(QWidget):
 
     def _cleanup_on_exit(self):
         """Cleanup when app exits."""
+        logger.info("cleanup_on_exit storage_need_backup=%s", self.storage.need_backup)
+        # Stop Win32 monitor thread
+        if hasattr(self, "win32_monitor"):
+            self.win32_monitor.stop()
         # Force immediate backup if needed
         if self.storage.need_backup:
             self.backup_scheduler.force_now()
@@ -761,7 +804,9 @@ class ClientApp(QWidget):
                 self._append_items(history_clips, self.list_history, False)
                 self.history_has_more = False  # search returns all matches
             else:
-                history_clips = self.storage.get_history(limit=PAGE_SIZE_HISTORY, offset=0)
+                history_clips = self.storage.get_history(
+                    limit=PAGE_SIZE_HISTORY, offset=0
+                )
                 if len(history_clips) < PAGE_SIZE_HISTORY:
                     self.history_has_more = False
                 self._append_items(history_clips, self.list_history, False)
@@ -945,56 +990,196 @@ class ClientApp(QWidget):
                 pass
         self.raise_()
         self.activateWindow()
-        self.list_history.setFocus()
-        if self.list_history.count() > 0:
-            self.list_history.setCurrentRow(0)
+        self.search_input.setFocus()
+        self.search_input.selectAll()
 
     def on_item_clicked(self, item):
         if self.input_locked:
+            logger.info("item_click_ignored reason=input_locked")
             return
         data = item.data(Qt.ItemDataRole.UserRole)
         if data and isinstance(data, dict) and "content" in data:
+            logger.info(
+                "item_clicked clip_id=%s type=%s preview=%r",
+                data.get("id"),
+                data.get("type"),
+                str(data.get("content", ""))[:80],
+            )
             self.handle_paste(data)
 
     def handle_paste(self, data):
-        self.ignore_clipboard_change = True
+        if self._paste_in_progress or not data or "content" not in data:
+            logger.info(
+                "handle_paste_skipped in_progress=%s has_data=%s has_content=%s",
+                self._paste_in_progress,
+                bool(data),
+                bool(data and "content" in data),
+            )
+            return
 
-        # Clear search after paste
-        self.search_input.clear()
-        self.current_search_query = ""
+        self._paste_in_progress = True
+        self.input_locked = True
+        logger.info(
+            "handle_paste_start clip_id=%s type=%s target_hwnd=%s",
+            data.get("id"),
+            data.get("type"),
+            self.last_active_window_handle,
+        )
 
-        if data["type"] == "text":
-            self.clipboard.setText(data["content"])
-        else:
-            p = os.path.join(IMAGE_DIR, data["content"])
-            if os.path.exists(p):
-                self.clipboard.setPixmap(QPixmap(p))
-        QApplication.processEvents()
         self.hide()
+        QTimer.singleShot(0, self._reset_ui_after_paste_request)
+        QTimer.singleShot(0, lambda: self._prepare_clipboard_and_paste(data, 0))
 
-        # Reset scroll to top so next open starts at the beginning
-        self.list_history.verticalScrollBar().setValue(0)
-        self.list_pinned.verticalScrollBar().setValue(0)
-        if sys.platform == "win32" and self.last_active_window_handle:
-            try:
-                ctypes.windll.user32.SetForegroundWindow(self.last_active_window_handle)
-            except:
-                pass
-        QTimer.singleShot(150, self._perform_keyboard_paste)
+    def _prepare_clipboard_and_paste(self, data, attempt_index):
+        retry_delays = (0, 30, 70, 140)
+        logger.info(
+            "prepare_clipboard attempt=%s clip_id=%s type=%s",
+            attempt_index,
+            data.get("id"),
+            data.get("type"),
+        )
+
+        if not self._write_clipboard_payload(data):
+            next_attempt = attempt_index + 1
+            logger.warning(
+                "prepare_clipboard_failed attempt=%s clip_id=%s next_attempt=%s",
+                attempt_index,
+                data.get("id"),
+                next_attempt,
+            )
+            if next_attempt < len(retry_delays):
+                QTimer.singleShot(
+                    retry_delays[next_attempt],
+                    lambda: self._prepare_clipboard_and_paste(data, next_attempt),
+                )
+            else:
+                logger.error(
+                    "prepare_clipboard_exhausted clip_id=%s type=%s",
+                    data.get("id"),
+                    data.get("type"),
+                )
+                self._finish_paste_attempt(clear_guard=True)
+            return
+
+        self._set_pending_clipboard_guard(data)
+        logger.info("prepare_clipboard_success clip_id=%s", data.get("id"))
+        QTimer.singleShot(10, lambda: self._restore_focus_and_paste(12))
+
+    def _write_clipboard_payload(self, data):
+        try:
+            if data["type"] == "text":
+                self.clipboard.setText(data["content"])
+                ok = self.clipboard.text() == data["content"]
+                logger.info(
+                    "write_clipboard_text clip_id=%s success=%s length=%s",
+                    data.get("id"),
+                    ok,
+                    len(data["content"]),
+                )
+                return ok
+
+            p = os.path.join(IMAGE_DIR, data["content"])
+            if not os.path.exists(p):
+                logger.error("write_clipboard_image_missing clip_id=%s path=%s", data.get("id"), p)
+                return False
+
+            pixmap = QPixmap(p)
+            if pixmap.isNull():
+                logger.error("write_clipboard_image_invalid clip_id=%s path=%s", data.get("id"), p)
+                return False
+
+            self.clipboard.setPixmap(pixmap)
+            mime = self.clipboard.mimeData()
+            if not mime or not mime.hasImage():
+                logger.error("write_clipboard_image_no_mime clip_id=%s", data.get("id"))
+                return False
+
+            img = QImage(mime.imageData())
+            ok = not img.isNull() and self._image_storage_name(img) == data["content"]
+            logger.info("write_clipboard_image clip_id=%s success=%s", data.get("id"), ok)
+            return ok
+        except Exception:
+            logger.exception("write_clipboard_payload_exception clip_id=%s", data.get("id"))
+            return False
 
     def _perform_keyboard_paste(self):
+        """Simulate Ctrl+V using pure Win32 keybd_event (no pynput)."""
         try:
-            self.kb_controller.release(Key.ctrl)
-            self.kb_controller.release(Key.alt)
-            with self.kb_controller.pressed(Key.ctrl):
-                self.kb_controller.press("v")
-                self.kb_controller.release("v")
+            logger.info("perform_keyboard_paste_start target_hwnd=%s", self.last_active_window_handle)
+            simulate_paste()
         except Exception:
-            pass
+            logger.exception("perform_keyboard_paste_exception")
         finally:
+            logger.info("perform_keyboard_paste_end")
+            self._finish_paste_attempt()
+
+    def _reset_ui_after_paste_request(self):
+        self.search_input.clear()
+        self.current_search_query = ""
+        self.list_history.verticalScrollBar().setValue(0)
+        self.list_pinned.verticalScrollBar().setValue(0)
+
+    def _finish_paste_attempt(self, clear_guard=False):
+        if clear_guard:
+            self.pending_clipboard_guard = None
+        logger.info(
+            "finish_paste_attempt clear_guard=%s target_hwnd=%s",
+            clear_guard,
+            self.last_active_window_handle,
+        )
+        self._paste_in_progress = False
+        self.input_locked = False
+
+    def _restore_focus_and_paste(self, attempts_remaining):
+        target_hwnd = self.last_active_window_handle if sys.platform == "win32" else None
+        if sys.platform == "win32" and target_hwnd:
+            user32 = ctypes.windll.user32
+            foreground_hwnd = user32.GetForegroundWindow()
+            if foreground_hwnd != target_hwnd:
+                try:
+                    ft = user32.GetWindowThreadProcessId(foreground_hwnd, None)
+                    tt = user32.GetWindowThreadProcessId(target_hwnd, None)
+                    user32.AttachThreadInput(ft, tt, True)
+                    user32.SetForegroundWindow(target_hwnd)
+                    user32.SetFocus(target_hwnd)
+                    user32.AttachThreadInput(ft, tt, False)
+                except Exception:
+                    logger.exception(
+                        "restore_focus_exception target_hwnd=%s foreground_hwnd=%s",
+                        target_hwnd,
+                        foreground_hwnd,
+                    )
+
+        ready = self._ready_to_paste()
+        logger.info(
+            "restore_focus_check attempts_remaining=%s ready=%s target_hwnd=%s foreground_hwnd=%s",
+            attempts_remaining,
+            ready,
+            target_hwnd,
+            ctypes.windll.user32.GetForegroundWindow() if sys.platform == "win32" else None,
+        )
+        if attempts_remaining > 0 and not ready:
             QTimer.singleShot(
-                500, lambda: setattr(self, "ignore_clipboard_change", False)
+                20, lambda: self._restore_focus_and_paste(attempts_remaining - 1)
             )
+            return
+
+        self._perform_keyboard_paste()
+
+    def _ready_to_paste(self):
+        if sys.platform != "win32":
+            return True
+
+        user32 = ctypes.windll.user32
+        ctrl_down = bool(user32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
+        alt_down = bool(user32.GetAsyncKeyState(VK_MENU) & 0x8000)
+        if ctrl_down or alt_down:
+            return False
+
+        target_hwnd = self.last_active_window_handle
+        if target_hwnd:
+            return user32.GetForegroundWindow() == target_hwnd
+        return True
 
     def handle_move(self, clip_id, direction, is_pinned):
         """Move clip up/down."""
@@ -1021,10 +1206,50 @@ class ClientApp(QWidget):
             self.storage.clear_history()
         self.refresh_lists()
 
-    def on_clipboard_change(self):
-        if self.ignore_clipboard_change:
-            return
+    def on_clipboard_change_delayed(self):
+        """Delay reading clipboard slightly so source apps can finish publishing data."""
+        QTimer.singleShot(15, lambda: self._process_clipboard_data_retry(0))
+
+    def _process_clipboard_data(self):
+        self._process_clipboard_data_retry(0)
+
+    def _process_clipboard_data_retry(self, attempt_index):
+        retry_delays = (15, 35, 75, 120)
+
+        mime = None
+        has_content = False
+
+        # QClipboard is sometimes unreliable immediately after WM_CLIPBOARDUPDATE
         mime = self.clipboard.mimeData()
+        if self._should_ignore_clipboard_update(mime):
+            return
+
+        # Check if it has actual content (sometimes hasText is true but text is empty)
+        if mime:
+            if mime.hasImage() and not mime.imageData().isNull():
+                has_content = True
+            elif mime.hasText() and mime.text().strip():
+                has_content = True
+
+        if not has_content:
+            next_attempt = attempt_index + 1
+            if next_attempt < len(retry_delays):
+                QTimer.singleShot(
+                    retry_delays[next_attempt],
+                    lambda: self._process_clipboard_data_retry(next_attempt),
+                )
+            else:
+                print(
+                    "[Win32Monitor] Warning: Received clipboard event but content is empty or unreadable after retries."
+                )
+            return
+
+        if not has_content or not mime:
+            print(
+                "[Win32Monitor] Warning: Received clipboard event but content is empty or unreadable after retries."
+            )
+            return
+
         clip_type = None
         content = None
 
@@ -1052,16 +1277,52 @@ class ClientApp(QWidget):
             self.is_ui_dirty = True
 
     def save_image_if_new(self, img):
+        fn = self._image_storage_name(img)
+        fp = os.path.join(IMAGE_DIR, fn)
+        if not os.path.exists(fp):
+            img.save(fp, "PNG")
+        return fn
+
+    def _image_storage_name(self, img):
         ba = QByteArray()
         buf = QBuffer(ba)
         buf.open(QIODevice.OpenModeFlag.WriteOnly)
         img.save(buf, "PNG")
         ih = hashlib.md5(ba.data()).hexdigest()
-        fn = f"{ih}.png"
-        fp = os.path.join(IMAGE_DIR, fn)
-        if not os.path.exists(fp):
-            img.save(fp, "PNG")
-        return fn
+        return f"{ih}.png"
+
+    def _set_pending_clipboard_guard(self, data):
+        self.pending_clipboard_guard = {
+            "type": data["type"],
+            "content": data["content"],
+            "expires_at": time.monotonic() + 1.5,
+        }
+
+    def _clear_pending_clipboard_guard_if_expired(self):
+        if (
+            self.pending_clipboard_guard
+            and time.monotonic() > self.pending_clipboard_guard["expires_at"]
+        ):
+            self.pending_clipboard_guard = None
+
+    def _should_ignore_clipboard_update(self, mime):
+        self._clear_pending_clipboard_guard_if_expired()
+        guard = self.pending_clipboard_guard
+        if not guard or not mime:
+            return False
+
+        if guard["type"] == "text" and mime.hasText():
+            if mime.text() == guard["content"]:
+                self.pending_clipboard_guard = None
+                return True
+        elif guard["type"] == "image" and mime.hasImage():
+            img = QImage(mime.imageData())
+            if not img.isNull() and self._image_storage_name(img) == guard["content"]:
+                self.pending_clipboard_guard = None
+                return True
+
+        self.pending_clipboard_guard = None
+        return False
 
     def refresh_lists(self):
         """Refresh both lists from SQLite with pagination reset."""
@@ -1167,14 +1428,13 @@ class ClientApp(QWidget):
         self.list_pinned.verticalScrollBar().setValue(p_s)
 
     def handle_copy_only(self, data):
-        self.ignore_clipboard_change = True
+        self._set_pending_clipboard_guard(data)
         if data["type"] == "text":
             self.clipboard.setText(data["content"])
         else:
             p = os.path.join(IMAGE_DIR, data["content"])
             if os.path.exists(p):
                 self.clipboard.setPixmap(QPixmap(p))
-        QTimer.singleShot(800, lambda: setattr(self, "ignore_clipboard_change", False))
 
     def handle_star(self, clip_id, should_pin):
         """Pin or unpin a clip."""
@@ -1214,6 +1474,7 @@ class ClientApp(QWidget):
 
 
 def main():
+    logger.info("main_start pid=%s", os.getpid())
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setStyle("Fusion")
@@ -1222,7 +1483,10 @@ def main():
     palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
     app.setPalette(palette)
     window = ClientApp()
-    sys.exit(app.exec())
+    exit_code = app.exec()
+    logger.info("main_exit exit_code=%s", exit_code)
+    _fault_log_handle.flush()
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
