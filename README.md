@@ -13,7 +13,7 @@ A lightweight, fast clipboard manager for Windows with SQLite storage, group org
 - **Duplicate Detection**: MD5 hash prevents duplicate entries
 - **Tagging**: Add custom tags to pinned items
 - **Groups**: Organize pinned clips into collapsible groups (e.g., `docker`, `ssh`)
-- **Search**: Real-time search across pinned clips
+- **Hybrid Search**: Real-time lexical + light RAG retrieval across pinned and history
 - **Quick Paste**: Click or Enter to paste directly into active window
 - **SQLite Storage**: Fast, reliable database with WAL mode
 - **Auto Backup**: JSON backup every 30 seconds with checksum validation
@@ -63,6 +63,7 @@ python main.py
 ### Search Box
 
 - Type to filter pinned clips in real-time
+- Hybrid retrieval combines existing SQL matching with a local semantic reranker
 - **Triple-click** to clear search
 - Search is cleared after paste
 
@@ -82,9 +83,9 @@ python main.py
 
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  Clipboard  │────▶│   SQLite    │────▶│     UI      │
+│  Clipboard  │────▶│   SQLite    │────▶│ Light RAG   │────▶│     UI      │
 │  Monitor    │     │  (storage)  │     │   (PyQt6)   │
-└─────────────┘     └──────┬──────┘     └─────────────┘
+└─────────────┘     └──────┬──────┘     └──────┬──────┘     └─────────────┘
                            │
                            ▼ (30s debounce)
                     ┌─────────────┐
@@ -94,8 +95,9 @@ python main.py
 
 ### Data Flow
 
-- **Read**: UI ← SQLite (pagination, 20 items/page)
+- **Read**: UI ← hybrid retrieval ← SQLite (pagination, 20 items/page)
 - **Write**: Clipboard change → SQLite (immediate, <5ms)
+- **Retrieve**: SQL lexical search + local semantic reranking (no external API)
 - **Backup**: SQLite → JSON (every 30s or on exit)
 - **Recovery**: JSON → SQLite (on corrupt DB)
 
@@ -105,6 +107,7 @@ python main.py
 advance-clipboard/
 ├── main.py              # UI and app logic (PyQt6)
 ├── storage.py           # SQLite storage layer
+├── rag_search.py        # Lightweight local RAG / hybrid retriever
 ├── backup_manager.py    # JSON backup with checksum
 ├── requirements.txt
 ├── README.md

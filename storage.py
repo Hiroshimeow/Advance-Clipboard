@@ -15,6 +15,8 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 from contextlib import contextmanager
 
+from rag_search import LightRAGRetriever
+
 DB_FILE = os.path.join(os.path.dirname(__file__), "clipboard.db")
 
 # Thread-local storage for connections
@@ -50,6 +52,8 @@ class ClipboardStorage:
     _backup_callback = None
 
     def __init__(self):
+        self._search_revision = 0
+        self._retriever = LightRAGRetriever()
         self._init_db()
 
     def _init_db(self):
@@ -96,6 +100,8 @@ class ClipboardStorage:
     def _mark_dirty(self):
         """Mark that backup is needed."""
         ClipboardStorage._need_backup = True
+        self._search_revision += 1
+        self._retriever.invalidate()
         if self._backup_callback:
             self._backup_callback()
 
@@ -363,13 +369,56 @@ class ClipboardStorage:
             "SELECT COUNT(*) FROM clips WHERE is_pinned = 1"
         ).fetchone()[0]
 
+    def _get_all_pinned_for_search(self) -> List[Dict[str, Any]]:
+        """Load full pinned corpus for hybrid retrieval."""
+        conn = _get_connection()
+        rows = conn.execute(
+            """SELECT id, type, content, hash, tag, group_name, created_at, updated_at
+               FROM clips WHERE is_pinned = 1
+               ORDER BY pin_order DESC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _get_all_history_for_search(self) -> List[Dict[str, Any]]:
+        """Load full history corpus for hybrid retrieval."""
+        conn = _get_connection()
+        rows = conn.execute(
+            """SELECT id, type, content, hash, tag, created_at, updated_at
+               FROM clips WHERE is_pinned = 0
+               ORDER BY updated_at DESC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     @staticmethod
     def _split_search_terms(query: str) -> List[str]:
         """Split free-text query into normalized AND-search tokens."""
         return [term for term in re.split(r"\s+", (query or "").strip()) if term]
 
     def search_pinned(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
-        """Search pinned clips by content, tag, or group_name."""
+        """Hybrid search for pinned clips using lexical + light RAG ranking."""
+        terms = self._split_search_terms(query)
+        if not terms:
+            return []
+
+        lexical_rows = self._search_pinned_sql(query, max(limit * 3, 20))
+        all_rows = self._get_all_pinned_for_search()
+        ranked_ids = self._retriever.search(
+            namespace="pinned",
+            revision=self._search_revision,
+            records=all_rows,
+            query=query,
+            limit=max(limit * 3, 20),
+            lexical_ids=[row["id"] for row in lexical_rows],
+        )
+        return self._merge_ranked_results(
+            ranked_ids=ranked_ids,
+            semantic_rows=all_rows,
+            lexical_rows=lexical_rows,
+            limit=limit,
+        )
+
+    def _search_pinned_sql(self, query: str, limit: int) -> List[Dict[str, Any]]:
+        """Baseline SQL search used as one signal in hybrid retrieval."""
         terms = self._split_search_terms(query)
         if not terms:
             return []
@@ -393,7 +442,30 @@ class ClipboardStorage:
         return [dict(r) for r in rows]
 
     def search_history(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
-        """Search history clips by content."""
+        """Hybrid search for history clips using lexical + light RAG ranking."""
+        terms = self._split_search_terms(query)
+        if not terms:
+            return []
+
+        lexical_rows = self._search_history_sql(query, max(limit * 3, 20))
+        all_rows = self._get_all_history_for_search()
+        ranked_ids = self._retriever.search(
+            namespace="history",
+            revision=self._search_revision,
+            records=all_rows,
+            query=query,
+            limit=max(limit * 3, 20),
+            lexical_ids=[row["id"] for row in lexical_rows],
+        )
+        return self._merge_ranked_results(
+            ranked_ids=ranked_ids,
+            semantic_rows=all_rows,
+            lexical_rows=lexical_rows,
+            limit=limit,
+        )
+
+    def _search_history_sql(self, query: str, limit: int) -> List[Dict[str, Any]]:
+        """Baseline SQL search used as one signal in hybrid retrieval."""
         terms = self._split_search_terms(query)
         if not terms:
             return []
@@ -414,6 +486,37 @@ class ClipboardStorage:
             params + [limit],
         ).fetchall()
         return [dict(r) for r in rows]
+
+    @staticmethod
+    def _merge_ranked_results(
+        *,
+        ranked_ids: List[int],
+        semantic_rows: List[Dict[str, Any]],
+        lexical_rows: List[Dict[str, Any]],
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Preserve hybrid ranking while keeping lexical fallback coverage."""
+        rows_by_id = {int(row["id"]): row for row in semantic_rows}
+        ordered_rows: List[Dict[str, Any]] = []
+        seen_ids = set()
+
+        for clip_id in ranked_ids:
+            row = rows_by_id.get(int(clip_id))
+            if row and clip_id not in seen_ids:
+                ordered_rows.append(row)
+                seen_ids.add(clip_id)
+                if len(ordered_rows) >= limit:
+                    return ordered_rows
+
+        for row in lexical_rows:
+            clip_id = int(row["id"])
+            if clip_id not in seen_ids:
+                ordered_rows.append(row)
+                seen_ids.add(clip_id)
+                if len(ordered_rows) >= limit:
+                    break
+
+        return ordered_rows
 
     def is_duplicate(self, content: str) -> bool:
         """Check if content already exists."""
