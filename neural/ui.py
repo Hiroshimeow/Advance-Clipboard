@@ -60,7 +60,7 @@ class SidecarWindow(QWidget):
             "force_collision_base": 10,
             "force_collision_degree_scale": 2,
             "background_color": "#000000",
-            "tooltip_max_chars": 500,
+            "tooltip_max_chars": 9000,
             "rainbow_mode": True,
         }
         try:

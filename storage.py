@@ -842,7 +842,7 @@ class ClipboardStorage:
         nodes = []
         for r in rows:
             content = r["content"]
-            full_content = content[:500]
+            full_content = content
             if r["type"] == "text":
                 content = content[:50].replace("\n", " ")
             nodes.append(

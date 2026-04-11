@@ -70,7 +70,7 @@
         "force_link_distance": 80,
         "_doc_force_link_distance": "Khoảng cách lý tưởng (px) giữa các node liên kết. Lớn hơn = phân tán hơn.",
 
-        "force_charge_strength": -150,
+        "force_charge_strength": -60,
         "_doc_force_charge_strength": "Lực đẩy giữa các node. Giá trị âm lớn hơn = đẩy mạnh hơn.",
 
         "force_collision_base": 10,
@@ -82,7 +82,7 @@
         "background_color": "#000000",
         "_doc_background_color": "Màu nền của bản đồ.",
 
-        "tooltip_max_chars": 900,
+        "tooltip_max_chars": 9000,
         "_doc_tooltip_max_chars": "Số ký tự tối đa hiện khi hover vào node.",
 
         "rainbow_mode": true,

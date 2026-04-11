@@ -1171,6 +1171,7 @@ class ClientApp(QWidget):
         if r is not None:
             w.setCurrentRow(r)
         self.search_input.setFocus()
+        self._sync_selection_to_map()
 
     def _nav_down(self):
         w = self._active_list()
@@ -1181,6 +1182,21 @@ class ClientApp(QWidget):
         if r is not None:
             w.setCurrentRow(r)
         self.search_input.setFocus()
+        self._sync_selection_to_map()
+
+    def _sync_selection_to_map(self):
+        """Sync the currently selected clip to the neural map (focus node)."""
+        if not self.sidecar or not self.sidecar.isVisible():
+            return
+        w = self._active_list()
+        if not w:
+            return
+        ci = w.currentItem()
+        if not self._is_pasteable_item(ci):
+            return
+        d = ci.data(Qt.ItemDataRole.UserRole)
+        if isinstance(d, dict) and "id" in d:
+            self.sidecar.focus_node(d["id"])
 
     def _nav_left(self):
         # Left/Right in the search field switch between columns (history/pinned).
@@ -1282,7 +1298,7 @@ class ClientApp(QWidget):
                     if self.sidecar
                     else None
                 )
-                self._focus_query_timer.start(500)
+                self._focus_query_timer.start(300)
             self.search_input.setFocus()
             print(f"[MainUI] _do_search completed in {time.time() - t0:.3f}s")
         finally:
@@ -1520,8 +1536,13 @@ class ClientApp(QWidget):
             target_x = geo.x()
             target_y = geo.y() - map_h
 
+        # Force exact size + position (reset any manual resize the user did)
         self.sidecar.setGeometry(target_x, target_y, map_w, map_h)
         self.sidecar.show()
+        # Re-apply after show() — on Windows, setGeometry before show() can be
+        # ignored when the window was previously shown at a different size.
+        self.sidecar.move(target_x, target_y)
+        self.sidecar.resize(map_w, map_h)
         # Delay galaxy load to give QWebEngineView time to acquire real dimensions
         QTimer.singleShot(500, self._load_full_galaxy_into_sidecar)
 
