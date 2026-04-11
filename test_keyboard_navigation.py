@@ -1,12 +1,76 @@
 import os
 import sys
 import unittest
+from unittest.mock import MagicMock, patch
 from PyQt6.QtCore import QEvent
 from PyQt6.QtGui import QKeyEvent
 
 
 # Ensure headless Qt (caller also sets this env var)
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+# Mock heavy Neural modules BEFORE importing main to avoid WebEngine crash in tests
+sys.modules.setdefault("neural.engine", MagicMock())
+sys.modules.setdefault("neural.ui", MagicMock())
+sys.modules.setdefault("neural.bridge", MagicMock())
+sys.modules.setdefault("PyQt6.QtWebEngineWidgets", MagicMock())
+sys.modules.setdefault("PyQt6.QtWebChannel", MagicMock())
+
+# Patch NeuralEngine and SidecarWindow with safe stubs
+import types
+
+_neural_engine_mod = types.ModuleType("neural.engine")
+
+
+class _StubEngine:
+    name = "NeuralEngine"
+
+    def __init__(self, *a, **kw):
+        pass
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+
+_neural_engine_mod.NeuralEngine = _StubEngine
+sys.modules["neural.engine"] = _neural_engine_mod
+
+_neural_ui_mod = types.ModuleType("neural.ui")
+
+
+class _StubSidecar:
+    def __init__(self, *a, **kw):
+        self.bridge = MagicMock()
+        self.bridge.node_clicked = MagicMock()
+        self.bridge.node_clicked.connect = MagicMock()
+        self.search_bar = MagicMock()
+        self.search_bar.textChanged = MagicMock()
+        self.search_bar.textChanged.connect = MagicMock()
+
+    def show(self):
+        pass
+
+    def hide(self):
+        pass
+
+    def close(self):
+        pass
+
+    def move(self, *a):
+        pass
+
+    def update_data(self, *a):
+        pass
+
+    def focus_node(self, *a):
+        pass
+
+
+_neural_ui_mod.SidecarWindow = _StubSidecar
+sys.modules["neural.ui"] = _neural_ui_mod
 
 
 from PyQt6.QtCore import Qt

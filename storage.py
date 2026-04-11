@@ -55,6 +55,7 @@ class ClipboardStorage:
         self._search_revision = 0
         self._retriever = LightRAGRetriever()
         self._init_db()
+        self._init_neural_tables()
 
     def _init_db(self):
         """Initialize database schema if not exists."""
@@ -87,6 +88,24 @@ class ClipboardStorage:
                 "CREATE INDEX IF NOT EXISTS idx_updated ON clips(updated_at DESC)"
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_group ON clips(group_name)")
+
+    def _init_neural_tables(self):
+        """Initialize neural search tables."""
+        with _transaction() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS neural_vectors (
+                    clip_id INTEGER PRIMARY KEY,
+                    vector BLOB
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS neural_links (
+                    source_id INTEGER,
+                    target_id INTEGER,
+                    weight REAL,
+                    PRIMARY KEY (source_id, target_id)
+                )
+            """)
 
     @staticmethod
     def compute_hash(content: str) -> str:
@@ -261,10 +280,6 @@ class ClipboardStorage:
                         "UPDATE clips SET pin_order = ? WHERE id = ?",
                         (current_order, target_id),
                     )
-                    conn.execute(
-                        "UPDATE clips SET pin_order = ? WHERE id = ?",
-                        (current_order, target["id"]),
-                    )
             else:
                 # For history, reorder by updated_at
                 clips = list(
@@ -434,7 +449,7 @@ class ClipboardStorage:
         rows = conn.execute(
             f"""SELECT id, type, content, hash, tag, group_name, created_at, updated_at
                FROM clips WHERE is_pinned = 1
-               AND {' AND '.join(where_clauses)}
+               AND {" AND ".join(where_clauses)}
                ORDER BY pin_order DESC
                LIMIT ?""",
             params + [limit],
@@ -480,7 +495,7 @@ class ClipboardStorage:
         rows = conn.execute(
             f"""SELECT id, type, content, hash, tag, created_at, updated_at
                FROM clips WHERE is_pinned = 0
-               AND {' AND '.join(where_clauses)}
+               AND {" AND ".join(where_clauses)}
                ORDER BY updated_at DESC
                LIMIT ?""",
             params + [limit],
@@ -586,6 +601,98 @@ class ClipboardStorage:
             return conn.execute("SELECT COUNT(*) FROM clips").fetchone()[0]
         except Exception:
             return 0
+
+    # ==================== NEURAL OPERATIONS ====================
+
+    def save_vector(self, clip_id: int, vector_bytes: bytes):
+        """Save neural vector for a clip."""
+        with _transaction() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO neural_vectors (clip_id, vector) VALUES (?, ?)",
+                (clip_id, vector_bytes),
+            )
+
+    def get_vector(self, clip_id: int) -> Optional[bytes]:
+        """Get neural vector for a clip."""
+        conn = _get_connection()
+        row = conn.execute(
+            "SELECT vector FROM neural_vectors WHERE clip_id = ?", (clip_id,)
+        ).fetchone()
+        return row["vector"] if row else None
+
+    def save_links(self, links_list: List[Tuple[int, int, float]]):
+        """Save neural links between clips."""
+        with _transaction() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO neural_links (source_id, target_id, weight) VALUES (?, ?, ?)",
+                links_list,
+            )
+
+    def get_links(self, clip_id_list: List[int]) -> List[Dict[str, Any]]:
+        """Get links where source or target is in the provided list."""
+        if not clip_id_list:
+            return []
+        conn = _get_connection()
+        placeholders = ",".join(["?"] * len(clip_id_list))
+        rows = conn.execute(
+            f"SELECT source_id, target_id, weight FROM neural_links WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})",
+            clip_id_list + clip_id_list,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_unindexed_clip_ids(self, limit: int = 100) -> List[int]:
+        """Get IDs of clips that haven't been indexed yet."""
+        conn = _get_connection()
+        rows = conn.execute(
+            """SELECT id FROM clips 
+               WHERE id NOT IN (SELECT clip_id FROM neural_vectors)
+               ORDER BY id DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [r["id"] for r in rows]
+
+    def get_all_clip_ids_with_vectors(self, limit: int = 500) -> List[int]:
+        """Get IDs of clips that have vectors."""
+        conn = _get_connection()
+        rows = conn.execute(
+            "SELECT clip_id FROM neural_vectors WHERE vector != '' ORDER BY clip_id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [r["clip_id"] for r in rows]
+
+    def get_neural_data(
+        self, clip_ids: List[int]
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Get nodes and links for a list of clip IDs."""
+        if not clip_ids:
+            return [], []
+
+        conn = _get_connection()
+        placeholders = ",".join(["?"] * len(clip_ids))
+
+        # Get nodes (content limited for graph)
+        rows = conn.execute(
+            f"SELECT id, type, content, is_pinned FROM clips WHERE id IN ({placeholders})",
+            clip_ids,
+        ).fetchall()
+        nodes = []
+        for r in rows:
+            content = r["content"]
+            if r["type"] == "text":
+                content = content[:50].replace("\n", " ")
+            nodes.append(
+                {
+                    "id": r["id"],
+                    "content": content,
+                    "type": "pinned" if r["is_pinned"] else "history",
+                }
+            )
+
+        # Get links
+        links = self.get_links(clip_ids)
+
+        return nodes, links
 
 
 # Global instance

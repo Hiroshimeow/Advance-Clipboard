@@ -70,6 +70,11 @@ from backup_manager import (
     BackupScheduler,
 )
 
+# Neural Memory modules — QtWebEngineWidgets MUST be imported before QApplication
+from PyQt6.QtWebEngineWidgets import QWebEngineView  # noqa: F401 (must come first)
+from neural.engine import NeuralEngine
+from neural.ui import SidecarWindow
+
 # --- Cấu hình ---
 DATA_FILE = os.path.join(os.path.dirname(__file__), "data.json")
 IMAGE_DIR = os.path.join(os.path.dirname(__file__), "images")
@@ -658,6 +663,19 @@ class ClientApp(QWidget):
         # Keyboard navigation state
         self.active_side = "history"  # default to history when UI opens
 
+        # Neural Memory state
+        self.neural_enabled = False
+        self.neural_engine = NeuralEngine(
+            self.storage,
+            os.path.join(os.path.dirname(__file__), "neural", "config.json"),
+        )
+        self.neural_engine.start()
+        self.sidecar = SidecarWindow(self.storage)
+
+        # Connect neural signals
+        self.sidecar.bridge.node_clicked.connect(self._on_node_clicked)
+        self.sidecar.search_bar.textChanged.connect(self._on_sidecar_search_changed)
+
         # Init UI
         self.initUI()
 
@@ -791,6 +809,22 @@ class ClientApp(QWidget):
             on_enter=self._activate_current,
         )
         search_row.addWidget(self.search_input, stretch=1)
+
+        # Neural Toggle
+        self.btn_neural = QPushButton("Neural")
+        self.btn_neural.setCheckable(True)
+        self.btn_neural.setFixedSize(60, 24)
+        self.btn_neural.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_neural.setStyleSheet("""
+            QPushButton { 
+                background: #001100; border: 1px solid #00ff41; 
+                color: #00ff41; font-size: 8pt; font-weight: bold; border-radius: 3px;
+            }
+            QPushButton:checked { background: #00ff41; color: #000; }
+            QPushButton:hover { background: #003300; }
+        """)
+        self.btn_neural.toggled.connect(self._toggle_neural)
+        search_row.addWidget(self.btn_neural)
 
         btn_clear_p = QPushButton("Clear")
         btn_clear_p.setFixedSize(40, 20)
@@ -1114,21 +1148,21 @@ class ClientApp(QWidget):
             active_widget = self._active_list()
             if active_widget is not None:
                 self._select_with_fallback_rules(active_widget, prev_clip_id, prev_row)
+
+            # Update Neural Sidecar if enabled
+            if self.neural_enabled:
+                self._update_sidecar_graph()
+
             self.search_input.setFocus()
         finally:
             self._is_refreshing = False
-
-    def on_search_changed(self, text):
-        """Handle search input change (legacy, not used with debounce)."""
-        self.current_search_query = text.strip()
-        self.refresh_pinned_list()
 
     def _on_history_scroll(self, value):
         """Load more history items when scrolling to bottom."""
         if not self.history_has_more:
             return
         scrollbar = self.list_history.verticalScrollBar()
-        if value >= scrollbar.maximum() - 50:  # Near bottom
+        if value >= scrollbar.maximum() - 50:
             self._load_more_history()
 
     def _on_pinned_scroll(self, value):
@@ -1136,7 +1170,7 @@ class ClientApp(QWidget):
         if not self.pinned_has_more:
             return
         scrollbar = self.list_pinned.verticalScrollBar()
-        if value >= scrollbar.maximum() - 50:  # Near bottom
+        if value >= scrollbar.maximum() - 50:
             self._load_more_pinned()
 
     def _load_more_history(self):
@@ -1158,7 +1192,6 @@ class ClientApp(QWidget):
         if len(clips) < PAGE_SIZE_PINNED:
             self.pinned_has_more = False
         if clips:
-            # Append ungrouped only
             ungrouped = [c for c in clips if not c.get("group_name")]
             self._append_items(ungrouped, self.list_pinned, True)
             self.pinned_offset += len(clips)
@@ -1180,32 +1213,21 @@ class ClientApp(QWidget):
         """Expand a group to show its children."""
         if group_name in self.expanded_groups:
             return
-
         self.expanded_groups.add(group_name)
-
-        # Find the group header item
         if group_name not in self.group_headers:
             return
-
         header_item = self.group_headers[group_name]
         header_row = self.list_pinned.row(header_item)
-
-        # Get clips in this group
         clips = self.storage.get_clips_by_group(group_name)
-
-        # Insert after header
         width = self.list_pinned.viewport().width()
         if width <= 10:
             width = (self.width() // 2) - 25
-
         for i, clip in enumerate(clips):
             item = QListWidgetItem()
             ui = ClipItemWidget(clip, True, self, is_grouped=True)
             item.setSizeHint(QSize(width, ui.height()))
             item.setData(Qt.ItemDataRole.UserRole, clip)
-            item.setData(
-                Qt.ItemDataRole.UserRole + 1, group_name
-            )  # Mark as group child
+            item.setData(Qt.ItemDataRole.UserRole + 1, group_name)
             self.list_pinned.insertItem(header_row + 1 + i, item)
             self.list_pinned.setItemWidget(item, ui)
 
@@ -1213,17 +1235,12 @@ class ClientApp(QWidget):
         """Collapse a group to hide its children."""
         if group_name not in self.expanded_groups:
             return
-
         self.expanded_groups.discard(group_name)
-
-        # Remove all items that belong to this group
         items_to_remove = []
         for i in range(self.list_pinned.count()):
             item = self.list_pinned.item(i)
             if item and item.data(Qt.ItemDataRole.UserRole + 1) == group_name:
                 items_to_remove.append(i)
-
-        # Remove in reverse order to maintain indices
         for i in reversed(items_to_remove):
             self.list_pinned.takeItem(i)
 
@@ -1256,12 +1273,9 @@ class ClientApp(QWidget):
                 )
             except:
                 pass
-
-        # Always start on history side and reset selection to newest item
         self.active_side = "history"
         self.refresh_lists(force_reset_selection=True)
         self.is_ui_dirty = False
-
         cp = QCursor.pos()
         w, h = self.width(), self.height()
         sc = QGuiApplication.screenAt(cp) or QGuiApplication.primaryScreen()
@@ -1292,6 +1306,75 @@ class ClientApp(QWidget):
         self.search_input.setFocus()
         self.search_input.setCursorPosition(len(self.search_input.text()))
         self._on_ui_opened()
+
+    def closeEvent(self, event):
+        """Clean up background threads on close."""
+        if hasattr(self, "neural_engine"):
+            self.neural_engine.stop()
+        if hasattr(self, "sidecar"):
+            self.sidecar.close()
+        super().closeEvent(event)
+
+    def _toggle_neural(self, checked):
+        self.neural_enabled = checked
+        if checked:
+            # Position sidecar near main window
+            geo = self.geometry()
+            self.sidecar.move(geo.right() + 10, geo.top())
+            self.sidecar.show()
+            self._update_sidecar_graph()
+        else:
+            self.sidecar.hide()
+
+    def _on_sidecar_search_changed(self, text):
+        if self.search_input.text() != text:
+            self.search_input.setText(text)
+
+    def _on_node_clicked(self, clip_id):
+        """Jump to clip in UI when node is clicked in graph."""
+        # Find in history or pinned
+        for widget in [self.list_history, self.list_pinned]:
+            for r in range(widget.count()):
+                it = widget.item(r)
+                data = it.data(Qt.ItemDataRole.UserRole)
+                if isinstance(data, dict) and data.get("id") == clip_id:
+                    self.active_side = (
+                        "history" if widget == self.list_history else "pinned"
+                    )
+                    widget.setCurrentRow(r)
+                    widget.scrollToItem(it)
+                    self.show()
+                    self.activateWindow()
+                    return
+
+    def _update_sidecar_graph(self):
+        """Fetch relevant nodes and links for current search result and sync sidecar."""
+        ids = []
+        for widget in [self.list_history, self.list_pinned]:
+            for r in range(min(widget.count(), 20)):
+                it = widget.item(r)
+                if it:
+                    d = it.data(Qt.ItemDataRole.UserRole)
+                    if isinstance(d, dict) and d.get("id"):
+                        ids.append(d["id"])
+
+        if ids:
+            nodes, links = self.storage.get_neural_data(ids)
+            formatted_links = [
+                {
+                    "source": l["source_id"],
+                    "target": l["target_id"],
+                    "weight": l["weight"],
+                }
+                for l in links
+            ]
+            self.sidecar.update_data(nodes, formatted_links)
+
+            active_widget = self._active_list()
+            if active_widget.currentItem():
+                d = active_widget.currentItem().data(Qt.ItemDataRole.UserRole)
+                if isinstance(d, dict) and d.get("id"):
+                    self.sidecar.focus_node(d["id"])
 
     def on_item_clicked(self, item):
         if self.input_locked:
@@ -1424,19 +1507,16 @@ class ClientApp(QWidget):
                 20, lambda: self._restore_focus_and_paste(attempts_remaining - 1)
             )
             return
-
         self._perform_keyboard_paste()
 
     def _ready_to_paste(self):
         if sys.platform != "win32":
             return True
-
         user32 = ctypes.windll.user32
         ctrl_down = bool(user32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
         alt_down = bool(user32.GetAsyncKeyState(VK_MENU) & 0x8000)
         if ctrl_down or alt_down:
             return False
-
         target_hwnd = self.last_active_window_handle
         if target_hwnd:
             return user32.GetForegroundWindow() == target_hwnd
@@ -1486,7 +1566,6 @@ class ClientApp(QWidget):
         guard = self.pending_clipboard_guard
         if not guard or not mime:
             return False
-
         if guard["type"] == "text" and mime.hasText():
             if mime.text() == guard["content"]:
                 self.pending_clipboard_guard = None
@@ -1496,11 +1575,10 @@ class ClientApp(QWidget):
             if not img.isNull() and self._image_storage_name(img) == guard["content"]:
                 self.pending_clipboard_guard = None
                 return True
-
         self.pending_clipboard_guard = None
         return False
 
-    def _get_current_selection_info(self, widget: QListWidget):
+    def _get_current_selection_info(self, widget):
         row = widget.currentRow() if widget else -1
         clip_id = None
         if widget and self._is_pasteable_item(widget.currentItem()):
@@ -1526,32 +1604,21 @@ class ClientApp(QWidget):
         self._is_refreshing = True
         try:
             self.setUpdatesEnabled(False)
-
-            # Reset pagination
             self.history_offset = 0
             self.pinned_offset = 0
             self.history_has_more = True
             self.pinned_has_more = True
             self.expanded_groups.clear()
             self.group_headers.clear()
-
-            # Clear lists
             self.list_history.clear()
             self.list_pinned.clear()
-
-            # Load initial page of history
             history_clips = self.storage.get_history(limit=PAGE_SIZE_HISTORY, offset=0)
             if len(history_clips) < PAGE_SIZE_HISTORY:
                 self.history_has_more = False
             self._append_items(history_clips, self.list_history, False)
             self.history_offset = len(history_clips)
-
-            # Refresh pinned with grouping
             self.refresh_pinned_list()
-
-            # Restore selection
             self._select_with_fallback_rules(active_widget, prev_clip_id, prev_row)
-
             self.list_history.verticalScrollBar().setValue(h_s)
             self.list_pinned.verticalScrollBar().setValue(p_s)
             self.setUpdatesEnabled(True)
@@ -1561,46 +1628,30 @@ class ClientApp(QWidget):
     def refresh_pinned_list(self):
         """Refresh pinned list with groups and search."""
         p_s = self.list_pinned.verticalScrollBar().value()
-
-        # Save currently expanded groups to restore later
         previously_expanded = self.expanded_groups.copy()
-
         self.list_pinned.clear()
         self.group_headers.clear()
-
-        # Reset pagination
         self.pinned_offset = 0
         self.pinned_has_more = True
-
         width = self.list_pinned.viewport().width()
         if width <= 10:
             width = (self.width() // 2) - 25
-
         if self.current_search_query:
-            # Search mode - show flat results
             clips = self.storage.search_pinned(self.current_search_query)
             self._append_items(clips, self.list_pinned, True)
         else:
-            # Normal mode - show groups + ungrouped
             groups = self.storage.get_groups()
-
-            # Add group headers
             for group_name in groups:
                 clips_in_group = self.storage.get_clips_by_group(group_name)
                 if clips_in_group:
                     item = QListWidgetItem()
                     header = GroupHeaderWidget(group_name, len(clips_in_group), self)
-
-                    # Restore expanded state
                     if group_name in previously_expanded:
                         header.set_expanded(True)
-
                     item.setSizeHint(QSize(width, 45))
                     self.list_pinned.addItem(item)
                     self.list_pinned.setItemWidget(item, header)
                     self.group_headers[group_name] = item
-
-                    # If was expanded, add children immediately
                     if group_name in previously_expanded:
                         self.expanded_groups.add(group_name)
                         for clip in clips_in_group:
@@ -1611,8 +1662,6 @@ class ClientApp(QWidget):
                             child_item.setData(Qt.ItemDataRole.UserRole + 1, group_name)
                             self.list_pinned.addItem(child_item)
                             self.list_pinned.setItemWidget(child_item, ui)
-
-            # Add ungrouped clips
             ungrouped = self.storage.get_ungrouped_pinned(
                 limit=PAGE_SIZE_PINNED, offset=0
             )
@@ -1620,7 +1669,6 @@ class ClientApp(QWidget):
                 self.pinned_has_more = False
             self._append_items(ungrouped, self.list_pinned, True)
             self.pinned_offset = len(ungrouped)
-
         self.list_pinned.verticalScrollBar().setValue(p_s)
 
     def handle_copy_only(self, data):
@@ -1669,22 +1717,15 @@ class ClientApp(QWidget):
 
     def _process_clipboard_data_retry(self, attempt_index):
         retry_delays = (15, 35, 75, 120)
-
-        mime = None
-        has_content = False
-
-        # QClipboard is sometimes unreliable immediately after WM_CLIPBOARDUPDATE
         mime = self.clipboard.mimeData()
         if self._should_ignore_clipboard_update(mime):
             return
-
-        # Check if it has actual content (sometimes hasText is true but text is empty)
+        has_content = False
         if mime:
             if mime.hasImage() and not mime.imageData().isNull():
                 has_content = True
             elif mime.hasText() and mime.text().strip():
                 has_content = True
-
         if not has_content:
             next_attempt = attempt_index + 1
             if next_attempt < len(retry_delays):
@@ -1697,16 +1738,8 @@ class ClientApp(QWidget):
                     "[Win32Monitor] Warning: Received clipboard event but content is empty or unreadable after retries."
                 )
             return
-
-        if not has_content or not mime:
-            print(
-                "[Win32Monitor] Warning: Received clipboard event but content is empty or unreadable after retries."
-            )
-            return
-
         clip_type = None
         content = None
-
         if mime.hasImage():
             img = QImage(mime.imageData())
             if not img.isNull():
@@ -1717,14 +1750,9 @@ class ClientApp(QWidget):
             if t and t.strip():
                 clip_type = "text"
                 content = t
-
         if not clip_type or not content:
             return
-
-        # Add to SQLite (handles dedup internally)
         clip_id, is_new = self.storage.add_clip(clip_type, content)
-
-        # Update UI
         if self.isVisible():
             self.refresh_lists()
         else:

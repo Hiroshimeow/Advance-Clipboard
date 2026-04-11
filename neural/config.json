@@ -1,0 +1,6 @@
+{
+    "max_legacy_index": 50,
+    "theme": "matrix",
+    "similarity_threshold": 0.65,
+    "max_neighbors": 5
+}
