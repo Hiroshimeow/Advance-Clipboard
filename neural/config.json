@@ -1,6 +1,97 @@
 {
-    "max_legacy_index": 50,
-    "theme": "matrix",
-    "similarity_threshold": 0.65,
-    "max_neighbors": 5
+    "_doc": "Neural Memory Map — Tệp cấu hình. Chỉnh sửa các giá trị bên dưới để tùy chỉnh hành vi.",
+
+    "max_legacy_index": 500,
+    "_doc_max_legacy_index": "Tương thích ngược. Tên cũ của max_recent_index.",
+
+    "max_recent_index": 300,
+    "_doc_max_recent_index": "Số lượng clip gần nhất (không được ghim) được đưa vào cửa sổ index neural.",
+
+    "index_pinned_always": true,
+    "_doc_index_pinned_always": "Nếu true, tất cả clip được ghim luôn được index bất kể max_recent_index.",
+
+    "similarity_threshold": 0.45,
+    "_doc_similarity_threshold": "Ngưỡng tương đồng cosine tối thiểu (0.0-1.0) để hai clip được liên kết. Thấp hơn = nhiều liên kết hơn.",
+
+    "max_neighbors": 5,
+    "_doc_max_neighbors": "Số liên kết tối đa được lưu cho mỗi clip (top N tương đồng cao nhất).",
+
+    "lexical_prefix_boost": 0.30,
+    "_doc_lexical_prefix_boost": "Điểm thưởng khi hai clip có cùng 10 ký tự đầu (ví dụ cùng prefix command).",
+
+    "lexical_word_boost": 0.15,
+    "_doc_lexical_word_boost": "Điểm thưởng khi hai clip có chung một từ dài (>6 ký tự).",
+
+    "graph": {
+        "_doc": "Cài đặt hiển thị cho bản đồ galaxy D3.js. Áp dụng khi mở lại bản đồ.",
+
+        "node_base_radius": 2,
+        "_doc_node_base_radius": "Bán kính cơ bản (px) của node khi có 0 kết nối.",
+
+        "node_degree_scale": 0.8,
+        "_doc_node_degree_scale": "Bán kính tăng thêm mỗi kết nối. Bán kính cuối = base + degree * scale.",
+
+        "node_stroke_width": 0.5,
+        "_doc_node_stroke_width": "Độ dày viền (px) của mỗi node.",
+
+        "node_color": "#003b00",
+        "_doc_node_color": "Màu nền của node.",
+
+        "node_stroke_color": "#50635b",
+        "_doc_node_stroke_color": "Màu viền của node.",
+
+        "link_color": "#003b00",
+        "_doc_link_color": "Màu của đường nối giữa các node.",
+
+        "link_width": 2,
+        "_doc_link_width": "Độ dày (px) của đường nối.",
+
+        "label_font_size": 7,
+        "_doc_label_font_size": "Kích thước font (px) của label luôn hiển thị.",
+
+        "label_color": "#005511",
+        "_doc_label_color": "Màu của label luôn hiển thị.",
+
+        "label_max_chars": 18,
+        "_doc_label_max_chars": "Số ký tự tối đa hiển thị cho label node.",
+
+        "highlight_font_size": 9,
+        "_doc_highlight_font_size": "Kích thước font (px) khi node được hover hoặc tìm kiếm.",
+
+        "highlight_color": "#00ff41",
+        "_doc_highlight_color": "Màu của label khi được highlight.",
+
+        "search_highlight_stroke": "#ffffff",
+        "_doc_search_highlight_stroke": "Màu viền của node khi khớp tìm kiếm.",
+
+        "search_highlight_width": 20,
+        "_doc_search_highlight_width": "Độ dày viền (px) của node khi khớp tìm kiếm.",
+
+        "force_link_distance": 80,
+        "_doc_force_link_distance": "Khoảng cách lý tưởng (px) giữa các node liên kết. Lớn hơn = phân tán hơn.",
+
+        "force_charge_strength": -150,
+        "_doc_force_charge_strength": "Lực đẩy giữa các node. Giá trị âm lớn hơn = đẩy mạnh hơn.",
+
+        "force_collision_base": 10,
+        "_doc_force_collision_base": "Bán kính va chạm cơ bản. Ngăn node chồng lên nhau.",
+
+        "force_collision_degree_scale": 2,
+        "_doc_force_collision_degree_scale": "Bán kính va chạm tăng thêm theo số kết nối.",
+
+        "background_color": "#000000",
+        "_doc_background_color": "Màu nền của bản đồ.",
+
+        "tooltip_max_chars": 900,
+        "_doc_tooltip_max_chars": "Số ký tự tối đa hiện khi hover vào node.",
+
+        "rainbow_mode": true,
+        "_doc_rainbow_mode": "Bật chế độ cầu vồng: node nhỏ=đỏ, node to=tím. Tắt=dùng node_color.",
+
+        "twinkle_enabled": true,
+        "_doc_twinkle_enabled": "Bật hiệu ứng nhấp nháy ngẫu nhiên cho các node.",
+
+        "twinkle_interval_ms": 200,
+        "_doc_twinkle_interval_ms": "Khoảng thời gian (ms) giữa mỗi lần nhấp nháy."
+    }
 }

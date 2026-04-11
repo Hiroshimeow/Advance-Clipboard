@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 import re
+import threading
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -71,16 +72,104 @@ class IndexedDocument:
 
 
 class LightRAGRetriever:
-    """Dependency-free hybrid retriever with lazy index rebuilds."""
+    """Dependency-free hybrid retriever with background rebuilds."""
 
     def __init__(self):
         self._cache: Dict[str, Tuple[int, List[IndexedDocument]]] = {}
+        self._doc_freq: Dict[str, Tuple[Counter[str], Counter[str]]] = {}
+        self._indexed_ids: Dict[str, set[int]] = {}
+        self._rebuild_lock = threading.Lock()
+        self._rebuilding = False
 
     def invalidate(self, namespace: Optional[str] = None) -> None:
         if namespace is None:
             self._cache.clear()
+            self._doc_freq.clear()
+            self._indexed_ids.clear()
             return
         self._cache.pop(namespace, None)
+        self._doc_freq.pop(namespace, None)
+        self._indexed_ids.pop(namespace, None)
+
+    def add_record(self, namespace: str, record: Dict[str, Any]) -> None:
+        """Incrementally add a single record to an existing index."""
+        cached = self._cache.get(namespace)
+        if not cached:
+            return
+
+        clip_id = int(record["id"])
+        if namespace not in self._indexed_ids:
+            self._indexed_ids[namespace] = set()
+        if clip_id in self._indexed_ids[namespace]:
+            return
+
+        revision, documents = cached
+        token_doc_freq, ngram_doc_freq = self._doc_freq.get(
+            namespace, (Counter(), Counter())
+        )
+
+        search_text = self._build_search_text(record)
+        tokens = _tokenize(search_text)
+        ngrams = _char_ngrams(search_text)
+
+        token_doc_freq.update(set(tokens))
+        ngram_doc_freq.update(set(ngrams))
+
+        total_docs = max(len(documents) + 1, 1)
+        token_tf_idf = self._tf_idf(tokens, token_doc_freq, total_docs)
+        ngram_tf_idf = self._tf_idf(ngrams, ngram_doc_freq, total_docs)
+
+        documents.append(
+            IndexedDocument(
+                clip_id=clip_id,
+                search_text=_normalize(search_text),
+                tokens=set(tokens),
+                token_tf_idf=token_tf_idf,
+                token_norm=math.sqrt(sum(v * v for v in token_tf_idf.values())),
+                ngrams=set(ngrams),
+                ngram_tf_idf=ngram_tf_idf,
+                ngram_norm=math.sqrt(sum(v * v for v in ngram_tf_idf.values())),
+            )
+        )
+        self._cache[namespace] = (revision + 1, documents)
+        self._doc_freq[namespace] = (token_doc_freq, ngram_doc_freq)
+        self._indexed_ids[namespace].add(clip_id)
+
+    def rebuild_async(
+        self,
+        namespace: str,
+        revision: int,
+        records: Sequence[Dict[str, Any]],
+        on_done=None,
+    ) -> None:
+        """Build index in background thread. Search uses old index until done.
+        on_done is called (in background thread) when rebuild completes."""
+        if self._rebuilding:
+            return  # Already rebuilding, skip
+
+        def _worker():
+            self._rebuilding = True
+            try:
+                import time
+
+                t0 = time.time()
+                print(
+                    f"[RAG] Background rebuild starting for '{namespace}' ({len(records)} records)..."
+                )
+                documents, token_doc_freq, ngram_doc_freq = self._build_index(records)
+                with self._rebuild_lock:
+                    self._cache[namespace] = (revision, documents)
+                    self._doc_freq[namespace] = (token_doc_freq, ngram_doc_freq)
+                    self._indexed_ids[namespace] = {d.clip_id for d in documents}
+                print(
+                    f"[RAG] Background rebuild done in {time.time() - t0:.1f}s ({len(documents)} docs)"
+                )
+                if on_done:
+                    on_done()
+            finally:
+                self._rebuilding = False
+
+        threading.Thread(target=_worker, daemon=True, name="RAG-Rebuild").start()
 
     def search(
         self,
@@ -96,8 +185,10 @@ class LightRAGRetriever:
         if not normalized_query:
             return []
 
-        documents = self._ensure_index(namespace, revision, records)
+        # NEVER rebuild synchronously — use whatever index we have
+        documents = self._get_index(namespace)
         if not documents:
+            # No index at all — fall back to empty (rebuild_async should be called separately)
             return []
 
         lexical_boost_ids = set(lexical_ids or [])
@@ -116,7 +207,9 @@ class LightRAGRetriever:
 
         for doc in documents:
             token_overlap = (
-                len(query_tokens & doc.tokens) / len(query_tokens) if query_tokens else 0.0
+                len(query_tokens & doc.tokens) / len(query_tokens)
+                if query_tokens
+                else 0.0
             )
             lexical_bonus = 0.18 if doc.clip_id in lexical_boost_ids else 0.0
             phrase_bonus = 0.28 if phrase and phrase in doc.search_text else 0.0
@@ -127,7 +220,8 @@ class LightRAGRetriever:
                 query_ngram_counter, query_ngram_norm, doc.ngram_tf_idf, doc.ngram_norm
             )
             fuzzy_overlap = (
-                len(set(query_ngram_counter) & doc.ngrams) / len(set(query_ngram_counter))
+                len(set(query_ngram_counter) & doc.ngrams)
+                / len(set(query_ngram_counter))
                 if query_ngram_counter
                 else 0.0
             )
@@ -147,21 +241,35 @@ class LightRAGRetriever:
         scored.sort(key=lambda item: item[0], reverse=True)
         return [clip_id for _, clip_id in scored[:limit]]
 
+    def _get_index(self, namespace: str) -> List[IndexedDocument]:
+        """Get current index without triggering rebuild."""
+        with self._rebuild_lock:
+            cached = self._cache.get(namespace)
+            return cached[1] if cached else []
+
+    def has_index(self, namespace: str) -> bool:
+        return namespace in self._cache
+
     def _ensure_index(
         self,
         namespace: str,
         revision: int,
         records: Sequence[Dict[str, Any]],
     ) -> List[IndexedDocument]:
+        """Legacy: only used by rebuild_async internally."""
         cached = self._cache.get(namespace)
         if cached and cached[0] == revision:
             return cached[1]
 
-        documents = self._build_index(records)
+        documents, token_doc_freq, ngram_doc_freq = self._build_index(records)
         self._cache[namespace] = (revision, documents)
+        self._doc_freq[namespace] = (token_doc_freq, ngram_doc_freq)
+        self._indexed_ids[namespace] = {d.clip_id for d in documents}
         return documents
 
-    def _build_index(self, records: Sequence[Dict[str, Any]]) -> List[IndexedDocument]:
+    def _build_index(
+        self, records: Sequence[Dict[str, Any]]
+    ) -> Tuple[List[IndexedDocument], Counter[str], Counter[str]]:
         prepared: List[Tuple[Dict[str, Any], List[str], List[str]]] = []
         token_doc_freq: Counter[str] = Counter()
         ngram_doc_freq: Counter[str] = Counter()
@@ -199,7 +307,7 @@ class LightRAGRetriever:
                 )
             )
 
-        return documents
+        return documents, token_doc_freq, ngram_doc_freq
 
     @staticmethod
     def _build_search_text(record: Dict[str, Any]) -> str:

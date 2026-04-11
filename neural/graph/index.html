@@ -5,80 +5,242 @@
     <style>
         body { margin: 0; background: #000; overflow: hidden; font-family: 'Courier New', Courier, monospace; }
         #graph { width: 100vw; height: 100vh; }
-        .node { stroke: #00ff41; stroke-width: 1.5px; cursor: pointer; }
-        .link { stroke: #003b00; stroke-opacity: 0.6; stroke-width: 1px; }
-        .label { fill: #00ff41; font-size: 10px; pointer-events: none; text-shadow: 0 0 5px #000; }
-        .search-highlight { stroke: #fff !important; stroke-width: 3px !important; filter: drop-shadow(0 0 8px #00ff41); }
+        #tooltip {
+            position: fixed; display: none; pointer-events: none; z-index: 9999;
+            background: rgba(0,20,0,0.95); border: 1px solid #00ff41; border-radius: 4px;
+            color: #00ff41; font-size: 11px; padding: 8px 10px; max-width: 400px;
+            white-space: pre-wrap; word-break: break-all; line-height: 1.4;
+            box-shadow: 0 0 15px rgba(0,255,65,0.3);
+        }
     </style>
-    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <script src="d3.v7.min.js"></script>
+    <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
 </head>
 <body>
     <div id="graph"></div>
+    <div id="tooltip"></div>
     <script>
-        const width = window.innerWidth;
-        const height = window.innerHeight;
-        const svg = d3.select("#graph").append("svg").attr("width", width).attr("height", height);
+        let CFG = {
+            node_base_radius: 2, node_degree_scale: 0.8,
+            node_stroke_width: 1, node_color: "#003b00", node_stroke_color: "#00ff41",
+            link_color: "#003b00", link_width: 0.5,
+            label_font_size: 7, label_color: "#005511", label_max_chars: 18,
+            highlight_font_size: 9, highlight_color: "#00ff41",
+            search_highlight_stroke: "#ffffff", search_highlight_width: 2,
+            force_link_distance: 80, force_charge_strength: -150,
+            force_collision_base: 10, force_collision_degree_scale: 2,
+            background_color: "#000000",
+            tooltip_max_chars: 500,
+            rainbow_mode: true,
+            twinkle_enabled: true,
+            twinkle_interval_ms: 2000
+        };
+
+        const tooltip = document.getElementById('tooltip');
+
+        // Rainbow: degree 0=red → 1=orange → 2=yellow → 3=green → 4=cyan → 5=blue → 6+=violet
+        const RAINBOW = [
+            [255, 60, 60],    // red
+            [255, 140, 40],   // orange
+            [255, 220, 50],   // yellow
+            [80, 220, 80],    // green
+            [60, 200, 255],   // cyan
+            [80, 100, 255],   // blue
+            [160, 60, 255],   // violet
+        ];
+
+        function rainbowColor(d) {
+            if (!CFG.rainbow_mode) return CFG.node_color;
+            const deg = Math.min((d.degree || 0), RAINBOW.length - 1);
+            const c = RAINBOW[deg];
+            // Dim slightly so hover/focus is still brighter
+            return `rgb(${Math.round(c[0]*0.7)},${Math.round(c[1]*0.7)},${Math.round(c[2]*0.7)})`;
+        }
+
+        function rainbowGlow(d) {
+            if (!CFG.rainbow_mode) {
+                const deg = d.degree || 0;
+                const intensity = Math.min(deg * 2, 12);
+                return `drop-shadow(0 0 ${intensity}px rgba(0,255,65,${Math.min(0.1+deg*0.08,0.7)}))`;
+            }
+            const deg = Math.min((d.degree || 0), RAINBOW.length - 1);
+            const c = RAINBOW[deg];
+            const intensity = 3 + deg * 2;
+            return `drop-shadow(0 0 ${intensity}px rgba(${c[0]},${c[1]},${c[2]},0.6))`;
+        }
+
+        function applyConfig(cfg) {
+            Object.assign(CFG, cfg);
+            document.body.style.background = CFG.background_color;
+            simulation
+                .force("link", d3.forceLink().id(d => d.id).distance(CFG.force_link_distance))
+                .force("charge", d3.forceManyBody().strength(CFG.force_charge_strength))
+                .force("collision", d3.forceCollide().radius(d => CFG.force_collision_base + (d.degree || 0) * CFG.force_collision_degree_scale));
+            console.log('[D3] Config applied');
+        }
+
+        let width = window.innerWidth || 800;
+        let height = window.innerHeight || 600;
+        const svg = d3.select("#graph").append("svg")
+            .attr("width", "100%").attr("height", "100%")
+            .attr("viewBox", `0 0 ${width} ${height}`);
         const g = svg.append("g");
 
+        let link, node, label;
+        let currentNodes = [];
+
         const simulation = d3.forceSimulation()
-            .force("link", d3.forceLink().id(d => d.id).distance(100))
-            .force("charge", d3.forceManyBody().strength(-200))
+            .force("link", d3.forceLink().id(d => d.id).distance(CFG.force_link_distance))
+            .force("charge", d3.forceManyBody().strength(CFG.force_charge_strength))
             .force("center", d3.forceCenter(width / 2, height / 2))
-            .force("collision", d3.forceCollide().radius(30));
+            .force("collision", d3.forceCollide().radius(d => CFG.force_collision_base + (d.degree || 0) * CFG.force_collision_degree_scale));
 
-        let link = g.append("g").attr("class", "links").selectAll("line");
-        let node = g.append("g").attr("class", "nodes").selectAll("circle");
-        let label = g.append("g").attr("class", "labels").selectAll("text");
+        link = g.append("g").selectAll("line");
+        node = g.append("g").selectAll("circle");
+        label = g.append("g").selectAll("text");
 
-        const zoom = d3.zoom().on("zoom", (e) => g.attr("transform", e.transform));
+        const zoom = d3.zoom().on("zoom", (e) => {
+            if (e.transform && !isNaN(e.transform.x) && !isNaN(e.transform.y) && !isNaN(e.transform.k)) {
+                g.attr("transform", e.transform);
+            }
+        });
         svg.call(zoom);
 
         function updateGraph(data) {
-            // data: { nodes: [{id, content, type}], links: [{source, target, weight}] }
-            const nodes = data.nodes;
-            const links = data.links;
+            width = window.innerWidth || 800;
+            height = window.innerHeight || 600;
+            svg.attr("viewBox", `0 0 ${width} ${height}`);
+            simulation.force("center", d3.forceCenter(width / 2, height / 2));
 
-            link = link.data(links, d => d.source.id + "-" + d.target.id).join("line").attr("class", "link");
-            node = node.data(nodes, d => d.id).join("circle")
-                .attr("class", "node")
-                .attr("r", d => d.type === 'pinned' ? 8 : 5)
-                .attr("fill", "#003b00")
-                .on("click", (e, d) => window.pybridge.onNodeClick(d.id))
-                .on("mouseover", (e, d) => showLabel(d.id))
-                .on("mouseout", (e, d) => hideLabel(d.id));
+            const nodes = data.nodes || [];
+            const nodeIds = new Set(nodes.map(n => n.id));
+            const links = (data.links || []).filter(l => nodeIds.has(l.source) && nodeIds.has(l.target));
+            currentNodes = nodes;
+            console.log('[D3] updateGraph: ' + nodes.length + ' nodes, ' + links.length + ' links');
 
-            label = label.data(nodes, d => d.id).join("text")
-                .attr("class", "label")
-                .text(d => d.content.substring(0, 20))
-                .style("opacity", 0);
+            try {
+                link = link.data(links, d => `${(d.source && d.source.id) || d.source}-${(d.target && d.target.id) || d.target}`)
+                    .join("line")
+                    .attr("stroke", CFG.link_color)
+                    .attr("stroke-opacity", 0.4)
+                    .attr("stroke-width", CFG.link_width);
 
-            simulation.nodes(nodes);
-            simulation.force("link").links(links);
-            simulation.alpha(1).restart();
+                node = node.data(nodes, d => d.id).join("circle")
+                    .attr("r", d => CFG.node_base_radius + (d.degree || 0) * CFG.node_degree_scale)
+                    .attr("fill", d => rainbowColor(d))
+                    .attr("stroke", CFG.node_stroke_color)
+                    .attr("stroke-width", CFG.node_stroke_width)
+                    .style("cursor", "pointer")
+                    .style("filter", d => rainbowGlow(d))
+                    .on("click", (e, d) => { if (window.pybridge) window.pybridge.onNodeClick(d.id); })
+                    .on("mouseover", (e, d) => {
+                        showLabel(d.id);
+                        const text = (d.full_content || d.content || '').substring(0, CFG.tooltip_max_chars);
+                        tooltip.textContent = text;
+                        tooltip.style.display = 'block';
+                        tooltip.style.left = (e.clientX + 12) + 'px';
+                        tooltip.style.top = (e.clientY + 12) + 'px';
+                    })
+                    .on("mousemove", (e) => {
+                        tooltip.style.left = (e.clientX + 12) + 'px';
+                        tooltip.style.top = (e.clientY + 12) + 'px';
+                    })
+                    .on("mouseout", (e, d) => {
+                        hideLabel(d.id);
+                        tooltip.style.display = 'none';
+                    });
+
+                label = label.data(nodes, d => d.id).join("text")
+                    .text(d => d.content.substring(0, CFG.label_max_chars))
+                    .attr("fill", CFG.label_color)
+                    .attr("font-size", CFG.label_font_size + "px")
+                    .style("pointer-events", "none")
+                    .style("opacity", 1);
+
+                simulation.nodes(nodes);
+                simulation.force("link").links(links);
+                simulation.alpha(1).restart();
+
+                if (CFG.twinkle_enabled) startTwinkle();
+                console.log('[D3] updateGraph OK');
+            } catch (err) {
+                console.error('[D3] updateGraph ERROR:', err);
+            }
+        }
+
+        // Twinkling
+        let twinkleInterval = null;
+        function startTwinkle() {
+            if (twinkleInterval) clearInterval(twinkleInterval);
+            twinkleInterval = setInterval(() => {
+                if (!currentNodes.length) return;
+                for (let i = 0; i < 3; i++) {
+                    const rnd = currentNodes[Math.floor(Math.random() * currentNodes.length)];
+                    node.filter(d => d.id === rnd.id)
+                        .transition().duration(400)
+                        .attr("r", d => (CFG.node_base_radius + (d.degree||0) * CFG.node_degree_scale) * 1.8)
+                        .attr("fill", "#fff")
+                        .transition().duration(600)
+                        .attr("r", d => CFG.node_base_radius + (d.degree||0) * CFG.node_degree_scale)
+                        .attr("fill", d => rainbowColor(d));
+                }
+            }, CFG.twinkle_interval_ms);
         }
 
         simulation.on("tick", () => {
             link.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
                 .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
             node.attr("cx", d => d.x).attr("cy", d => d.y);
-            label.attr("x", d => d.x + 8).attr("y", d => d.y + 4);
+            label.attr("x", d => d.x + CFG.node_base_radius + 4).attr("y", d => d.y + 3);
         });
 
-        function showLabel(id) { label.filter(d => d.id === id).style("opacity", 1); }
-        function hideLabel(id) { label.filter(d => d.id === id).style("opacity", 0); }
+        function showLabel(id) {
+            label.filter(d => d.id === id)
+                .attr("fill", CFG.highlight_color)
+                .attr("font-size", CFG.highlight_font_size + "px")
+                .attr("font-weight", "bold");
+        }
+        function hideLabel(id) {
+            label.filter(d => d.id === id)
+                .attr("fill", CFG.label_color)
+                .attr("font-size", CFG.label_font_size + "px")
+                .attr("font-weight", "normal");
+        }
 
         function focusNode(id) {
             const d = node.filter(n => n.id === id).datum();
-            if (d) {
-                const transform = d3.zoomIdentity.translate(width/2 - d.x*1.5, height/2 - d.y*1.5).scale(1.5);
+            if (d && d.x !== undefined && d.y !== undefined && !isNaN(d.x) && !isNaN(d.y)) {
+                const transform = d3.zoomIdentity.translate(width/2 - d.x*1.2, height/2 - d.y*1.2).scale(1.2);
                 svg.transition().duration(750).call(zoom.transform, transform);
-                node.classed("search-highlight", false);
-                node.filter(n => n.id === id).classed("search-highlight", true);
+                node.attr("stroke", CFG.node_stroke_color).attr("stroke-width", CFG.node_stroke_width);
+                node.filter(n => n.id === id)
+                    .attr("stroke", CFG.search_highlight_stroke)
+                    .attr("stroke-width", CFG.search_highlight_width);
                 showLabel(id);
             }
         }
 
-        // Bridge setup
+        function focusQuery(query) {
+            const q = (query || '').trim().toLowerCase();
+            node.attr("stroke", CFG.node_stroke_color).attr("stroke-width", CFG.node_stroke_width);
+            label.attr("fill", CFG.label_color).attr("font-size", CFG.label_font_size + "px").attr("font-weight", "normal");
+            if (!q) return;
+
+            const matches = currentNodes.filter(n =>
+                ((n.full_content || n.content || '').toLowerCase().includes(q))
+            );
+            if (matches.length > 0) {
+                matches.forEach(m => {
+                    node.filter(n => n.id === m.id)
+                        .attr("stroke", CFG.search_highlight_stroke)
+                        .attr("stroke-width", CFG.search_highlight_width);
+                    showLabel(m.id);
+                });
+                matches.sort((a, b) => (b.degree || 0) - (a.degree || 0));
+                setTimeout(() => focusNode(matches[0].id), 50);
+            }
+        }
+
         window.addEventListener('load', () => {
             if (window.qt) {
                 new QWebChannel(qt.webChannelTransport, function (channel) {
