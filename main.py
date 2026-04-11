@@ -118,7 +118,11 @@ def _log_thread_exception(args):
     logger.critical(
         "Unhandled thread exception in %s:\n%s",
         getattr(args.thread, "name", "unknown-thread"),
-        "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)),
+        "".join(
+            traceback.format_exception(
+                args.exc_type, args.exc_value, args.exc_traceback
+            )
+        ),
     )
 
 
@@ -188,6 +192,26 @@ class SearchLineEdit(QLineEdit):
         self.click_timer.setSingleShot(True)
         self.click_timer.timeout.connect(self._reset_click_count)
 
+        # Keyboard navigation handlers (set by ClientApp)
+        self._on_up = None
+        self._on_down = None
+        self._on_left = None
+        self._on_right = None
+        self._on_enter = None
+
+    def set_key_handlers(
+        self, *, on_up=None, on_down=None, on_left=None, on_right=None, on_enter=None
+    ):
+        """Register callbacks for navigation keys.
+
+        Normal text entry/backspace should still be handled by QLineEdit.
+        """
+        self._on_up = on_up
+        self._on_down = on_down
+        self._on_left = on_left
+        self._on_right = on_right
+        self._on_enter = on_enter
+
     def mousePressEvent(self, event):
         self.click_count += 1
         self.click_timer.start(400)  # Reset after 400ms
@@ -201,6 +225,38 @@ class SearchLineEdit(QLineEdit):
 
     def _reset_click_count(self):
         self.click_count = 0
+
+    def keyPressEvent(self, event):
+        k = event.key()
+
+        # Forward only navigation/activation keys to handlers.
+        # Everything else should behave like a normal QLineEdit.
+        # NOTE: Left/Right are intentionally treated as "switch column" (history/pinned)
+        # while this field is focused. This is a tradeoff: caret movement within the
+        # search text is sacrificed in favor of fast two-column navigation, while
+        # keeping keyboard ownership in the search field.
+        if k == Qt.Key.Key_Up and self._on_up:
+            self._on_up()
+            event.accept()
+            return
+        if k == Qt.Key.Key_Down and self._on_down:
+            self._on_down()
+            event.accept()
+            return
+        if k == Qt.Key.Key_Left and self._on_left:
+            self._on_left()
+            event.accept()
+            return
+        if k == Qt.Key.Key_Right and self._on_right:
+            self._on_right()
+            event.accept()
+            return
+        if k in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self._on_enter:
+            self._on_enter()
+            event.accept()
+            return
+
+        super().keyPressEvent(event)
 
 
 # --- Group Header Widget (Collapsible) ---
@@ -575,7 +631,7 @@ class ClipItemWidget(QWidget):
 
 
 class ClientApp(QWidget):
-    def __init__(self):
+    def __init__(self, *, enable_monitor: bool = True, init_data: bool = True):
         super().__init__()
         # SQLite storage - single source of truth
         self.storage = get_storage()
@@ -599,11 +655,15 @@ class ClientApp(QWidget):
         self._is_refreshing = False  # Guard for changeEvent during refresh
         self._paste_in_progress = False
 
+        # Keyboard navigation state
+        self.active_side = "history"  # default to history when UI opens
+
         # Init UI
         self.initUI()
 
         # Load data with disaster recovery
-        self._init_data()
+        if init_data:
+            self._init_data()
 
         # Qt clipboard object — used to READ clipboard content only
         self.clipboard = QApplication.clipboard()
@@ -612,14 +672,16 @@ class ClientApp(QWidget):
         # destroyed. This replaces both Qt's dataChanged signal and the old
         # AddClipboardFormatListener on self.winId().
         # Also handles Ctrl+Alt+V hotkey via RegisterHotKey (no keyboard hooks).
-        self.win32_monitor = Win32ClipboardMonitor()
-        self.win32_monitor.clipboard_changed.connect(
-            self.on_clipboard_change_delayed, Qt.ConnectionType.QueuedConnection
-        )
-        self.win32_monitor.hotkey_toggle.connect(
-            self.toggle_visibility, Qt.ConnectionType.QueuedConnection
-        )
-        self.win32_monitor.start()
+        self.win32_monitor = None
+        if enable_monitor:
+            self.win32_monitor = Win32ClipboardMonitor()
+            self.win32_monitor.clipboard_changed.connect(
+                self.on_clipboard_change_delayed, Qt.ConnectionType.QueuedConnection
+            )
+            self.win32_monitor.hotkey_toggle.connect(
+                self.toggle_visibility, Qt.ConnectionType.QueuedConnection
+            )
+            self.win32_monitor.start()
 
         # Backup scheduling (30s debounce)
         self.backup_scheduler = BackupScheduler(self._perform_backup)
@@ -665,8 +727,10 @@ class ClientApp(QWidget):
         """Cleanup when app exits."""
         logger.info("cleanup_on_exit storage_need_backup=%s", self.storage.need_backup)
         # Stop Win32 monitor thread
-        if hasattr(self, "win32_monitor"):
-            self.win32_monitor.stop()
+        if getattr(self, "win32_monitor", None):
+            monitor = self.win32_monitor
+            if monitor is not None:
+                monitor.stop()
         # Force immediate backup if needed
         if self.storage.need_backup:
             self.backup_scheduler.force_now()
@@ -719,6 +783,13 @@ class ClientApp(QWidget):
         self.search_input.setPlaceholderText("\U0001f50d Search...")
         self.search_input.setFixedHeight(28)
         self.search_input.textChanged.connect(self._on_search_text_changed)
+        self.search_input.set_key_handlers(
+            on_up=self._nav_up,
+            on_down=self._nav_down,
+            on_left=self._nav_left,
+            on_right=self._nav_right,
+            on_enter=self._activate_current,
+        )
         search_row.addWidget(self.search_input, stretch=1)
 
         btn_clear_p = QPushButton("Clear")
@@ -745,7 +816,8 @@ class ClientApp(QWidget):
         # HISTORY column
         col_h = QVBoxLayout()
         self.list_history = SmoothListWidget()
-        self.list_history.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # Keep focus on the search input for keyboard navigation
+        self.list_history.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.list_history.setVerticalScrollMode(
             QAbstractItemView.ScrollMode.ScrollPerPixel
         )
@@ -759,7 +831,8 @@ class ClientApp(QWidget):
         # PINNED column
         col_p = QVBoxLayout()
         self.list_pinned = SmoothListWidget()
-        self.list_pinned.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # Keep focus on the search input for keyboard navigation
+        self.list_pinned.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.list_pinned.setVerticalScrollMode(
             QAbstractItemView.ScrollMode.ScrollPerPixel
         )
@@ -783,6 +856,213 @@ class ClientApp(QWidget):
         outer_layout.addLayout(columns_layout)
         self.setLayout(outer_layout)
 
+    def _on_ui_opened(self):
+        """Initialize keyboard navigation state when the UI becomes visible."""
+        # Default to history when UI opens.
+        self.set_active_side("history")
+        self._ensure_current_item()
+        self.search_input.setFocus()
+
+    def set_active_side(self, side: str) -> bool:
+        """Set the active side for keyboard actions.
+
+        Deterministic behavior: if the target side has no pasteable clip rows
+        (e.g. pinned has only group headers), we keep the previous active side
+        and selection so Enter continues to work.
+
+        Returns:
+            True if the side switch was applied, False if it was a no-op.
+        """
+        if side not in ("history", "pinned"):
+            return False
+        if side == self.active_side:
+            # Still ensure a valid selection on this side.
+            self._ensure_current_item()
+            self.search_input.setFocus()
+            return True
+
+        prev_side = self.active_side
+        prev_widget = self._active_list()
+        prev_row = prev_widget.currentRow() if prev_widget else -1
+
+        target_widget = self.list_history if side == "history" else self.list_pinned
+        target_first = self._first_pasteable_row(target_widget, 0)
+        if target_first is None:
+            # No pasteable clip on target side; keep previous side/selection.
+            self.active_side = prev_side
+            if prev_widget and prev_row >= 0:
+                prev_widget.setCurrentRow(prev_row)
+            self._ensure_current_item()
+            self.search_input.setFocus()
+            return False
+
+        self.active_side = side
+        # Prefer keeping current selection if already pasteable; otherwise first pasteable.
+        if not self._is_pasteable_item(target_widget.currentItem()):
+            target_widget.setCurrentRow(target_first)
+        self._ensure_current_item()
+        self.search_input.setFocus()
+        return True
+
+    def _active_list(self):
+        return self.list_history if self.active_side == "history" else self.list_pinned
+
+    def _is_pasteable_item(self, item) -> bool:
+        if not item:
+            return False
+        data = item.data(Qt.ItemDataRole.UserRole)
+        return bool(data and isinstance(data, dict) and "content" in data)
+
+    def _first_pasteable_row(self, widget, start_row: int = 0):
+        if widget.count() == 0:
+            return None
+        start_row = max(0, start_row)
+        for r in range(start_row, widget.count()):
+            if self._is_pasteable_item(widget.item(r)):
+                return r
+        return None
+
+    def _next_pasteable_row(self, widget, from_row: int, direction: int):
+        if widget.count() == 0:
+            return None
+        if direction == 0:
+            return None
+        step = 1 if direction > 0 else -1
+        r = from_row
+        if r < 0:
+            r = 0 if step > 0 else widget.count() - 1
+        else:
+            r = r + step
+
+        while 0 <= r < widget.count():
+            if self._is_pasteable_item(widget.item(r)):
+                return r
+            r += step
+        return None
+
+    def _select_with_fallback_rules(self, widget, prev_clip_id, prev_row: int) -> bool:
+        """Apply selection fallback rules after a list refresh/filter.
+
+        Rules:
+            1) If previously active clip still exists, keep it.
+            2) Else choose next selectable after previous row position.
+            3) Else choose previous selectable.
+            4) Else choose first selectable.
+
+        Returns True if a selection was applied.
+        """
+        if widget.count() == 0:
+            return False
+
+        # 1) Keep same clip if it still exists
+        if prev_clip_id is not None:
+            for r in range(widget.count()):
+                it = widget.item(r)
+                if not self._is_pasteable_item(it):
+                    continue
+                data = it.data(Qt.ItemDataRole.UserRole)
+                if isinstance(data, dict) and data.get("id") == prev_clip_id:
+                    widget.setCurrentRow(r)
+                    widget.scrollToItem(it)
+                    return True
+
+        # Normalize previous row hint relative to new widget.
+        hint = prev_row
+        if hint < 0:
+            hint = -1
+        if hint >= widget.count():
+            hint = widget.count() - 1
+
+        # 2) Next selectable after previous row position.
+        # If previous selection was at row 0, we also allow re-selecting row 0
+        # (since "after 0" in a 1-row list still needs to land on 0).
+        start_next = hint + 1
+        if hint == 0:
+            start_next = 0
+        if start_next < 0:
+            start_next = 0
+        for r in range(start_next, widget.count()):
+            it = widget.item(r)
+            if self._is_pasteable_item(it):
+                widget.setCurrentRow(r)
+                widget.scrollToItem(it)
+                return True
+
+        # 3) Previous selectable before previous row position
+        start_prev = min(hint - 1, widget.count() - 1)
+        for r in range(start_prev, -1, -1):
+            it = widget.item(r)
+            if self._is_pasteable_item(it):
+                widget.setCurrentRow(r)
+                widget.scrollToItem(it)
+                return True
+
+        # 4) First selectable
+        first = self._first_pasteable_row(widget, 0)
+        if first is not None:
+            it = widget.item(first)
+            widget.setCurrentRow(first)
+            if it is not None:
+                widget.scrollToItem(it)
+            return True
+        return False
+
+    def _ensure_current_item(self):
+        w = self._active_list()
+        if w.count() == 0:
+            return
+        r = w.currentRow()
+        if r < 0 or not self._is_pasteable_item(w.currentItem()):
+            first = self._first_pasteable_row(w, 0)
+            if first is not None:
+                w.setCurrentRow(first)
+
+    def _nav_up(self):
+        w = self._active_list()
+        if w.count() == 0:
+            return
+        self._ensure_current_item()
+        r = self._next_pasteable_row(w, w.currentRow(), -1)
+        if r is not None:
+            w.setCurrentRow(r)
+        self.search_input.setFocus()
+
+    def _nav_down(self):
+        w = self._active_list()
+        if w.count() == 0:
+            return
+        self._ensure_current_item()
+        r = self._next_pasteable_row(w, w.currentRow(), 1)
+        if r is not None:
+            w.setCurrentRow(r)
+        self.search_input.setFocus()
+
+    def _nav_left(self):
+        # Left/Right in the search field switch between columns (history/pinned).
+        # This is an explicit tradeoff vs caret movement within the search text.
+        self.set_active_side("history")
+
+    def _nav_right(self):
+        # Left/Right in the search field switch between columns (history/pinned).
+        # This is an explicit tradeoff vs caret movement within the search text.
+        self.set_active_side("pinned")
+
+    def _activate_current(self):
+        """Paste the currently active item (not based on focus widget)."""
+        w = self._active_list()
+        if not w:
+            return
+
+        # Ensure we don't stop on non-clip rows (eg. pinned group headers)
+        self._ensure_current_item()
+        ci = w.currentItem()
+        if not self._is_pasteable_item(ci):
+            return
+
+        data = ci.data(Qt.ItemDataRole.UserRole)
+        self.handle_paste(data)
+        self.search_input.setFocus()
+
     def _on_search_text_changed(self, text):
         """Debounced search - waits 300ms after typing stops."""
         self.current_search_query = text.strip()
@@ -790,6 +1070,15 @@ class ClientApp(QWidget):
 
     def _do_search(self):
         """Execute the actual search after debounce — filters both lists."""
+        # Capture active selection before filtering so we can preserve it.
+        active_widget = self._active_list()
+        prev_row = active_widget.currentRow() if active_widget else -1
+        prev_clip_id = None
+        if active_widget and self._is_pasteable_item(active_widget.currentItem()):
+            d = active_widget.currentItem().data(Qt.ItemDataRole.UserRole)
+            if isinstance(d, dict):
+                prev_clip_id = d.get("id")
+
         self._is_refreshing = True
         try:
             self.setUpdatesEnabled(False)
@@ -819,6 +1108,13 @@ class ClientApp(QWidget):
             self.list_pinned.blockSignals(False)
 
             self.setUpdatesEnabled(True)
+
+            # Re-apply selection fallback rules on the active side after filtering.
+            # (Keep focus in the search input so typing can continue uninterrupted.)
+            active_widget = self._active_list()
+            if active_widget is not None:
+                self._select_with_fallback_rules(active_widget, prev_clip_id, prev_row)
+            self.search_input.setFocus()
         finally:
             self._is_refreshing = False
 
@@ -960,9 +1256,12 @@ class ClientApp(QWidget):
                 )
             except:
                 pass
-        if self.is_ui_dirty:
-            self.refresh_lists()
-            self.is_ui_dirty = False
+
+        # Always start on history side and reset selection to newest item
+        self.active_side = "history"
+        self.refresh_lists(force_reset_selection=True)
+        self.is_ui_dirty = False
+
         cp = QCursor.pos()
         w, h = self.width(), self.height()
         sc = QGuiApplication.screenAt(cp) or QGuiApplication.primaryScreen()
@@ -991,7 +1290,8 @@ class ClientApp(QWidget):
         self.raise_()
         self.activateWindow()
         self.search_input.setFocus()
-        self.search_input.selectAll()
+        self.search_input.setCursorPosition(len(self.search_input.text()))
+        self._on_ui_opened()
 
     def on_item_clicked(self, item):
         if self.input_locked:
@@ -1080,12 +1380,20 @@ class ClientApp(QWidget):
 
             p = os.path.join(IMAGE_DIR, data["content"])
             if not os.path.exists(p):
-                logger.error("write_clipboard_image_missing clip_id=%s path=%s", data.get("id"), p)
+                logger.error(
+                    "write_clipboard_image_missing clip_id=%s path=%s",
+                    data.get("id"),
+                    p,
+                )
                 return False
 
             pixmap = QPixmap(p)
             if pixmap.isNull():
-                logger.error("write_clipboard_image_invalid clip_id=%s path=%s", data.get("id"), p)
+                logger.error(
+                    "write_clipboard_image_invalid clip_id=%s path=%s",
+                    data.get("id"),
+                    p,
+                )
                 return False
 
             self.clipboard.setPixmap(pixmap)
@@ -1096,67 +1404,20 @@ class ClientApp(QWidget):
 
             img = QImage(mime.imageData())
             ok = not img.isNull() and self._image_storage_name(img) == data["content"]
-            logger.info("write_clipboard_image clip_id=%s success=%s", data.get("id"), ok)
+            logger.info(
+                "write_clipboard_image clip_id=%s success=%s", data.get("id"), ok
+            )
             return ok
-        except Exception:
-            logger.exception("write_clipboard_payload_exception clip_id=%s", data.get("id"))
+        except Exception as e:
+            logger.error("write_clipboard_failed: %s", e)
             return False
 
-    def _perform_keyboard_paste(self):
-        """Simulate Ctrl+V using pure Win32 keybd_event (no pynput)."""
-        try:
-            logger.info("perform_keyboard_paste_start target_hwnd=%s", self.last_active_window_handle)
-            simulate_paste()
-        except Exception:
-            logger.exception("perform_keyboard_paste_exception")
-        finally:
-            logger.info("perform_keyboard_paste_end")
-            self._finish_paste_attempt()
-
-    def _reset_ui_after_paste_request(self):
-        self.search_input.clear()
-        self.current_search_query = ""
-        self.list_history.verticalScrollBar().setValue(0)
-        self.list_pinned.verticalScrollBar().setValue(0)
-
-    def _finish_paste_attempt(self, clear_guard=False):
-        if clear_guard:
-            self.pending_clipboard_guard = None
-        logger.info(
-            "finish_paste_attempt clear_guard=%s target_hwnd=%s",
-            clear_guard,
-            self.last_active_window_handle,
-        )
-        self._paste_in_progress = False
-        self.input_locked = False
-
     def _restore_focus_and_paste(self, attempts_remaining):
-        target_hwnd = self.last_active_window_handle if sys.platform == "win32" else None
-        if sys.platform == "win32" and target_hwnd:
-            user32 = ctypes.windll.user32
-            foreground_hwnd = user32.GetForegroundWindow()
-            if foreground_hwnd != target_hwnd:
-                try:
-                    ft = user32.GetWindowThreadProcessId(foreground_hwnd, None)
-                    tt = user32.GetWindowThreadProcessId(target_hwnd, None)
-                    user32.AttachThreadInput(ft, tt, True)
-                    user32.SetForegroundWindow(target_hwnd)
-                    user32.SetFocus(target_hwnd)
-                    user32.AttachThreadInput(ft, tt, False)
-                except Exception:
-                    logger.exception(
-                        "restore_focus_exception target_hwnd=%s foreground_hwnd=%s",
-                        target_hwnd,
-                        foreground_hwnd,
-                    )
-
         ready = self._ready_to_paste()
         logger.info(
-            "restore_focus_check attempts_remaining=%s ready=%s target_hwnd=%s foreground_hwnd=%s",
+            "restore_focus attempts_remaining=%s ready=%s",
             attempts_remaining,
             ready,
-            target_hwnd,
-            ctypes.windll.user32.GetForegroundWindow() if sys.platform == "win32" else None,
         )
         if attempts_remaining > 0 and not ready:
             QTimer.singleShot(
@@ -1181,107 +1442,22 @@ class ClientApp(QWidget):
             return user32.GetForegroundWindow() == target_hwnd
         return True
 
-    def handle_move(self, clip_id, direction, is_pinned):
-        """Move clip up/down."""
-        self.storage.move_clip(clip_id, direction, is_pinned)
-        self.refresh_lists()
+    def _perform_keyboard_paste(self):
+        logger.info(
+            "perform_keyboard_paste target_hwnd=%s", self.last_active_window_handle
+        )
+        simulate_paste()
+        self._finish_paste_attempt()
 
-    def clear_all_list(self, is_pinned):
-        if is_pinned:
-            count = self.storage.get_pinned_count()
-            if count == 0:
-                return
-            if (
-                QMessageBox.question(
-                    self,
-                    "Xác nhận",
-                    "Xóa tất cả mục đã GHIM?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                )
-                != QMessageBox.StandardButton.Yes
-            ):
-                return
-            self.storage.clear_pinned()
-        else:
-            self.storage.clear_history()
-        self.refresh_lists()
+    def _finish_paste_attempt(self, clear_guard=False):
+        self._paste_in_progress = False
+        self.input_locked = False
+        if clear_guard:
+            self.pending_clipboard_guard = None
 
-    def on_clipboard_change_delayed(self):
-        """Delay reading clipboard slightly so source apps can finish publishing data."""
-        QTimer.singleShot(15, lambda: self._process_clipboard_data_retry(0))
-
-    def _process_clipboard_data(self):
-        self._process_clipboard_data_retry(0)
-
-    def _process_clipboard_data_retry(self, attempt_index):
-        retry_delays = (15, 35, 75, 120)
-
-        mime = None
-        has_content = False
-
-        # QClipboard is sometimes unreliable immediately after WM_CLIPBOARDUPDATE
-        mime = self.clipboard.mimeData()
-        if self._should_ignore_clipboard_update(mime):
-            return
-
-        # Check if it has actual content (sometimes hasText is true but text is empty)
-        if mime:
-            if mime.hasImage() and not mime.imageData().isNull():
-                has_content = True
-            elif mime.hasText() and mime.text().strip():
-                has_content = True
-
-        if not has_content:
-            next_attempt = attempt_index + 1
-            if next_attempt < len(retry_delays):
-                QTimer.singleShot(
-                    retry_delays[next_attempt],
-                    lambda: self._process_clipboard_data_retry(next_attempt),
-                )
-            else:
-                print(
-                    "[Win32Monitor] Warning: Received clipboard event but content is empty or unreadable after retries."
-                )
-            return
-
-        if not has_content or not mime:
-            print(
-                "[Win32Monitor] Warning: Received clipboard event but content is empty or unreadable after retries."
-            )
-            return
-
-        clip_type = None
-        content = None
-
-        if mime.hasImage():
-            img = QImage(mime.imageData())
-            if not img.isNull():
-                clip_type = "image"
-                content = self.save_image_if_new(img)
-        elif mime.hasText():
-            t = mime.text()
-            if t and t.strip():
-                clip_type = "text"
-                content = t
-
-        if not clip_type or not content:
-            return
-
-        # Add to SQLite (handles dedup internally)
-        clip_id, is_new = self.storage.add_clip(clip_type, content)
-
-        # Update UI
-        if self.isVisible():
-            self.refresh_lists()
-        else:
-            self.is_ui_dirty = True
-
-    def save_image_if_new(self, img):
-        fn = self._image_storage_name(img)
-        fp = os.path.join(IMAGE_DIR, fn)
-        if not os.path.exists(fp):
-            img.save(fp, "PNG")
-        return fn
+    def _reset_ui_after_paste_request(self):
+        self.search_input.clear()
+        self.current_search_query = ""
 
     def _image_storage_name(self, img):
         ba = QByteArray()
@@ -1324,8 +1500,25 @@ class ClientApp(QWidget):
         self.pending_clipboard_guard = None
         return False
 
-    def refresh_lists(self):
+    def _get_current_selection_info(self, widget: QListWidget):
+        row = widget.currentRow() if widget else -1
+        clip_id = None
+        if widget and self._is_pasteable_item(widget.currentItem()):
+            d = widget.currentItem().data(Qt.ItemDataRole.UserRole)
+            if isinstance(d, dict):
+                clip_id = d.get("id")
+        return clip_id, row
+
+    def refresh_lists(self, force_reset_selection=False):
         """Refresh both lists from SQLite with pagination reset."""
+        active_widget = (
+            self.list_history if self.active_side == "history" else self.list_pinned
+        )
+        if force_reset_selection:
+            prev_clip_id, prev_row = None, -1
+        else:
+            prev_clip_id, prev_row = self._get_current_selection_info(active_widget)
+
         h_s, p_s = (
             self.list_history.verticalScrollBar().value(),
             self.list_pinned.verticalScrollBar().value(),
@@ -1355,6 +1548,9 @@ class ClientApp(QWidget):
 
             # Refresh pinned with grouping
             self.refresh_pinned_list()
+
+            # Restore selection
+            self._select_with_fallback_rules(active_widget, prev_clip_id, prev_row)
 
             self.list_history.verticalScrollBar().setValue(h_s)
             self.list_pinned.verticalScrollBar().setValue(p_s)
@@ -1462,15 +1658,114 @@ class ClientApp(QWidget):
     def keyPressEvent(self, e):
         if e.key() == Qt.Key.Key_Escape:
             self.hide()
-        elif e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            fw = QApplication.focusWidget()
-            if isinstance(fw, QListWidget):
-                ci = fw.currentItem()
-                if ci:
-                    data = ci.data(Qt.ItemDataRole.UserRole)
-                    if data and isinstance(data, dict) and "content" in data:
-                        self.handle_paste(data)
         super().keyPressEvent(e)
+
+    def on_clipboard_change_delayed(self):
+        """Delay reading clipboard slightly so source apps can finish publishing data."""
+        QTimer.singleShot(15, lambda: self._process_clipboard_data_retry(0))
+
+    def _process_clipboard_data(self):
+        self._process_clipboard_data_retry(0)
+
+    def _process_clipboard_data_retry(self, attempt_index):
+        retry_delays = (15, 35, 75, 120)
+
+        mime = None
+        has_content = False
+
+        # QClipboard is sometimes unreliable immediately after WM_CLIPBOARDUPDATE
+        mime = self.clipboard.mimeData()
+        if self._should_ignore_clipboard_update(mime):
+            return
+
+        # Check if it has actual content (sometimes hasText is true but text is empty)
+        if mime:
+            if mime.hasImage() and not mime.imageData().isNull():
+                has_content = True
+            elif mime.hasText() and mime.text().strip():
+                has_content = True
+
+        if not has_content:
+            next_attempt = attempt_index + 1
+            if next_attempt < len(retry_delays):
+                QTimer.singleShot(
+                    retry_delays[next_attempt],
+                    lambda: self._process_clipboard_data_retry(next_attempt),
+                )
+            else:
+                print(
+                    "[Win32Monitor] Warning: Received clipboard event but content is empty or unreadable after retries."
+                )
+            return
+
+        if not has_content or not mime:
+            print(
+                "[Win32Monitor] Warning: Received clipboard event but content is empty or unreadable after retries."
+            )
+            return
+
+        clip_type = None
+        content = None
+
+        if mime.hasImage():
+            img = QImage(mime.imageData())
+            if not img.isNull():
+                clip_type = "image"
+                content = self.save_image_if_new(img)
+        elif mime.hasText():
+            t = mime.text()
+            if t and t.strip():
+                clip_type = "text"
+                content = t
+
+        if not clip_type or not content:
+            return
+
+        # Add to SQLite (handles dedup internally)
+        clip_id, is_new = self.storage.add_clip(clip_type, content)
+
+        # Update UI
+        if self.isVisible():
+            self.refresh_lists()
+        else:
+            self.is_ui_dirty = True
+
+    def save_image_if_new(self, img):
+        fn = self._image_storage_name(img)
+        fp = os.path.join(IMAGE_DIR, fn)
+        if not os.path.exists(fp):
+            img.save(fp, "PNG")
+        return fn
+
+    def on_search_changed(self, text):
+        """Handle search input change (legacy, not used with debounce)."""
+        self.current_search_query = text.strip()
+        self.refresh_pinned_list()
+
+    def clear_all_list(self, is_pinned):
+        if is_pinned:
+            count = self.storage.get_pinned_count()
+            if count == 0:
+                return
+            if (
+                QMessageBox.question(
+                    self,
+                    "Xác nhận",
+                    "Xóa tất cả mục đã GHIM?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                != QMessageBox.StandardButton.Yes
+            ):
+                return
+            self.storage.clear_pinned()
+        else:
+            self.storage.clear_history()
+        self.refresh_lists()
+
+    def handle_move(self, clip_id, direction, is_pinned):
+        """Move clip up/down."""
+        self.storage.move_clip(clip_id, direction, is_pinned)
+        self.refresh_lists()
 
 
 def main():
