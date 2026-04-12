@@ -6,6 +6,12 @@ import random
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT_DIR)
 
+# Fix Unicode print for Windows console
+import io
+
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
 from PyQt6.QtWebEngineWidgets import QWebEngineView  # noqa: F401
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import QTimer

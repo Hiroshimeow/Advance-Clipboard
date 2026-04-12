@@ -3,10 +3,12 @@ import os
 import threading
 from contextlib import contextmanager
 
-DB_FILE = os.path.join(os.path.dirname(__file__), "clipboard.db")
+# DB_FILE is now located inside the storage/ directory
+DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clipboard.db")
 
 # Thread-local storage for connections
 _local = threading.local()
+
 
 def get_connection() -> sqlite3.Connection:
     """Get thread-local database connection."""
@@ -16,6 +18,7 @@ def get_connection() -> sqlite3.Connection:
         _local.conn.execute("PRAGMA journal_mode=WAL")
         _local.conn.execute("PRAGMA synchronous=NORMAL")
     return _local.conn
+
 
 @contextmanager
 def transaction():
@@ -27,6 +30,7 @@ def transaction():
     except Exception:
         conn.rollback()
         raise
+
 
 def init_db():
     """Initialize database schema if not exists."""
@@ -57,6 +61,7 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pinned ON clips(is_pinned)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_updated ON clips(updated_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_group ON clips(group_name)")
+
 
 def init_neural_tables():
     """Initialize neural search tables."""

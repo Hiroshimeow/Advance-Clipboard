@@ -5,7 +5,7 @@ import threading
 from datetime import date
 from typing import List, Dict, Any, Optional
 from .db import get_connection, transaction
-from rag_search import LightRAGRetriever
+from .rag_search import LightRAGRetriever
 
 
 class SearchService:

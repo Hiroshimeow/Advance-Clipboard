@@ -17,7 +17,10 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-IMAGE_DIR = os.path.join(os.path.dirname(__file__), "images")
+# Base directory is one level up from this file (ui/ directory)
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+IMAGE_DIR = os.path.join(BASE_DIR, "images")
+
 MAX_DISPLAY_CHARS = 300
 THUMB_SIZE = QSize(80, 60)
 PAGE_SIZE_HISTORY = 20
@@ -270,7 +273,9 @@ class ClipItemWidget(QWidget):
 
         tag_text = self.item_data.get("tag", "")
         group_name = self.item_data.get("group_name", "")
-        badge_text = tag_text or (f"[{group_name}]" if group_name and not is_grouped else "")
+        badge_text = tag_text or (
+            f"[{group_name}]" if group_name and not is_grouped else ""
+        )
         self.has_tag = bool(badge_text)
         self.tag_height = 0
         if self.has_tag:
@@ -325,8 +330,12 @@ class ClipItemWidget(QWidget):
             style_lines,
             self.show_line_info,
         )
-        self.btn_up = create_badge_btn("▲", "Di chuyển lên", style_arrow, self.on_up_clicked, 14)
-        self.btn_down = create_badge_btn("▼", "Di chuyển xuống", style_arrow, self.on_down_clicked, 14)
+        self.btn_up = create_badge_btn(
+            "▲", "Di chuyển lên", style_arrow, self.on_up_clicked, 14
+        )
+        self.btn_down = create_badge_btn(
+            "▼", "Di chuyển xuống", style_arrow, self.on_down_clicked, 14
+        )
 
         self.btn_v_layout.addWidget(self.btn_lines)
         self.btn_v_layout.addWidget(self.btn_up)
@@ -358,15 +367,21 @@ class ClipItemWidget(QWidget):
             btn.clicked.connect(func)
             return btn
 
-        btn_layout.addWidget(create_act_btn("❐", "Copy", "#2b5c75", "#3daee9", self.on_copy_clicked))
+        btn_layout.addWidget(
+            create_act_btn("❐", "Copy", "#2b5c75", "#3daee9", self.on_copy_clicked)
+        )
         star_char = "★" if is_pinned else "☆"
         star_bg = "#7a5c20" if is_pinned else "#3a3a3a"
         star_hover = "#aa8030" if is_pinned else "#555"
-        self.btn_star = create_act_btn(star_char, "Pin/Unpin", star_bg, star_hover, self.on_star_clicked)
+        self.btn_star = create_act_btn(
+            star_char, "Pin/Unpin", star_bg, star_hover, self.on_star_clicked
+        )
         if is_pinned:
             self.btn_star.setStyleSheet(self.btn_star.styleSheet() + "color: #ffd700;")
         btn_layout.addWidget(self.btn_star)
-        btn_layout.addWidget(create_act_btn("✕", "Delete", "#752b2b", "#e93d3d", self.on_delete_clicked))
+        btn_layout.addWidget(
+            create_act_btn("✕", "Delete", "#752b2b", "#e93d3d", self.on_delete_clicked)
+        )
 
         layout.addWidget(self.btn_container, stretch=0)
         self.setLayout(layout)
@@ -442,7 +457,9 @@ class ClipItemWidget(QWidget):
 
     def on_add_tag(self):
         current_tag = self.item_data.get("tag", "")
-        tag, ok = QInputDialog.getText(self, "Add Tag", "Enter tag name:", text=current_tag)
+        tag, ok = QInputDialog.getText(
+            self, "Add Tag", "Enter tag name:", text=current_tag
+        )
         if ok and self.clip_id and self.parent_list:
             self.parent_list.handle_add_tag(self.clip_id, tag)
 

@@ -56,12 +56,17 @@ from PyQt6.QtGui import (
     QImage,
 )
 
-# Pure Win32 clipboard monitor & hotkey (no pynput, no keyboard hooks)
-from win32_monitor import Win32ClipboardMonitor, VK_CONTROL, VK_MENU, simulate_paste
+# Pure Win32 clipboard monitor & hotkey
+from core.clipboard_monitor import (
+    Win32ClipboardMonitor,
+    VK_CONTROL,
+    VK_MENU,
+    simulate_paste,
+)
 
 # Import storage and backup modules
 from storage import get_storage
-from backup_manager import (
+from storage.backup import (
     create_backup,
     find_valid_backup,
     import_legacy_json,

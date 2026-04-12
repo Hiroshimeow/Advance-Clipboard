@@ -17,6 +17,7 @@ def run_test():
     store.clear_history()
     store.clear_pinned()
 
+    # Re-export internal helper from facade
     from storage import _get_connection
 
     conn = _get_connection()

@@ -1,6 +1,5 @@
 """
 test_restore_db.py — Restore clipboard.db from the latest valid backup JSON.
-Safe: does NOT delete any existing data. Uses import_clips which is INSERT OR IGNORE.
 """
 
 import os
@@ -12,7 +11,7 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT_DIR)
 
 from storage import get_storage
-from backup_manager import find_valid_backup, get_backup_files, validate_backup
+from storage.backup import find_valid_backup, get_backup_files, validate_backup
 
 
 def main():
@@ -24,7 +23,7 @@ def main():
 
     if clip_count > 0:
         print("[DB] Database already has data. Restore not needed.")
-        print("     (To force restore, delete clipboard.db first)")
+        print("     (To force restore, delete storage/clipboard.db first)")
         return
 
     # List all backups and their sizes
@@ -34,7 +33,6 @@ def main():
         size_mb = os.path.getsize(f) / (1024 * 1024)
         print(f"  {os.path.basename(f)}  ({size_mb:.1f} MB)")
 
-    # Try the largest backup (most likely the real one), not just the newest
     # Sort by file size descending to find the real backup
     backups_by_size = sorted(
         backup_files, key=lambda f: os.path.getsize(f), reverse=True

@@ -10,18 +10,18 @@ sys.path.insert(0, ROOT_DIR)
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import QTimer
 
-# Import our new Win32 monitor
+# Import our Win32 monitor from core/
 try:
-    from win32_monitor import Win32ClipboardMonitor
+    from core.clipboard_monitor import Win32ClipboardMonitor
 except ImportError as e:
     print(f"Error importing: {e}")
     sys.exit(1)
 
 
 def get_db_count():
-    db_path = os.path.join(ROOT_DIR, "clipboard.db")
+    db_path = os.path.join(ROOT_DIR, "storage", "clipboard.db")
     if not os.path.exists(db_path):
-        return -1
+        return -1, None
     try:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
@@ -43,9 +43,7 @@ def get_db_count():
 
 
 def on_change():
-    print(
-        f"[{time.strftime('%H:%M:%S')}] 🔔 SIGNAL RECEIVED: clipboard_changed (from Win32 message loop)"
-    )
+    print(f"[{time.strftime('%H:%M:%S')}] 🔔 SIGNAL RECEIVED: clipboard_changed")
     # Print the current clipboard content according to Qt
     clipboard = QApplication.clipboard()
     mime = clipboard.mimeData()
@@ -69,7 +67,7 @@ def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
-    # Start our new Win32 monitor
+    # Start our monitor
     monitor = Win32ClipboardMonitor()
     monitor.clipboard_changed.connect(on_change)
     monitor.hotkey_toggle.connect(on_hotkey)

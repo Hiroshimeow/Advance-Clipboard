@@ -20,8 +20,14 @@ def mock_data():
     ids = store.get_all_clip_ids_with_vectors(limit=50)
     print(f"Loading data for IDs: {ids}")
     nodes, links = store.get_neural_data(ids)
+    # get_links returns a list of dicts now
     formatted_links = [
-        {"source": s, "target": t, "weight": float(w)} for s, t, w in links
+        {
+            "source": l["source_id"],
+            "target": l["target_id"],
+            "weight": float(l["weight"]),
+        }
+        for l in links
     ]
     sidecar.update_data(nodes, formatted_links)
     if ids:
