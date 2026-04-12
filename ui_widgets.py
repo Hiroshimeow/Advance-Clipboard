@@ -20,6 +20,8 @@ from PyQt6.QtWidgets import (
 IMAGE_DIR = os.path.join(os.path.dirname(__file__), "images")
 MAX_DISPLAY_CHARS = 300
 THUMB_SIZE = QSize(80, 60)
+PAGE_SIZE_HISTORY = 20
+PAGE_SIZE_PINNED = 50
 
 
 class SmoothListWidget(QListWidget):

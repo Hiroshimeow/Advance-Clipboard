@@ -68,6 +68,9 @@ class _StubSidecar:
     def focus_node(self, *a):
         pass
 
+    def focus_query(self, *a):
+        pass
+
 
 _neural_ui_mod.SidecarWindow = _StubSidecar
 sys.modules["neural.ui"] = _neural_ui_mod
