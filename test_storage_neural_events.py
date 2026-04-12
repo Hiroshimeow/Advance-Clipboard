@@ -7,26 +7,27 @@ from unittest.mock import MagicMock
 sys.path.insert(0, os.path.dirname(__file__))
 
 import storage as storage_module
+import storage_db
 
 
 class StorageNeuralEventTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.old_db = storage_module.DB_FILE
-        self.old_local = storage_module._local
-        storage_module.DB_FILE = os.path.join(self.tmp.name, "test_clipboard.db")
-        storage_module._local = type("Local", (), {})()
+        self.old_db = storage_db.DB_FILE
+        self.old_local = storage_db._local
+        storage_db.DB_FILE = os.path.join(self.tmp.name, "test_clipboard.db")
+        storage_db._local = type("Local", (), {})()
         self.storage = storage_module.ClipboardStorage()
         self.callback = MagicMock()
         self.storage.set_neural_event_callback(self.callback)
 
     def tearDown(self):
-        conn = getattr(storage_module._local, "conn", None)
+        conn = getattr(storage_db._local, "conn", None)
         if conn is not None:
             conn.close()
-            storage_module._local.conn = None
-        storage_module.DB_FILE = self.old_db
-        storage_module._local = self.old_local
+            storage_db._local.conn = None
+        storage_db.DB_FILE = self.old_db
+        storage_db._local = self.old_local
         self.tmp.cleanup()
 
     def test_add_clip_emits_new_clip_event_only_for_new_insert(self):
