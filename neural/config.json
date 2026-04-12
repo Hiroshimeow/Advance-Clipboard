@@ -4,7 +4,7 @@
     "max_legacy_index": 500,
     "_doc_max_legacy_index": "Tương thích ngược. Tên cũ của max_recent_index.",
 
-    "max_recent_index": 300,
+    "max_recent_index": 3000,
     "_doc_max_recent_index": "Số lượng clip gần nhất (không được ghim) được đưa vào cửa sổ index neural.",
 
     "index_pinned_always": true,
@@ -21,6 +21,12 @@
 
     "lexical_word_boost": 0.15,
     "_doc_lexical_word_boost": "Điểm thưởng khi hai clip có chung một từ dài (>6 ký tự).",
+
+    "new_clip_batch_size": 4,
+    "_doc_new_clip_batch_size": "Số clip mới cần gom trước khi neural worker index theo batch background.",
+
+    "pending_flush_interval_seconds": 14400,
+    "_doc_pending_flush_interval_seconds": "Nếu clip mới chưa đủ batch size, worker sẽ flush tối đa 1 batch sau khoảng thời gian này để tránh pending vô hạn.",
 
     "graph": {
         "_doc": "Cài đặt hiển thị cho bản đồ galaxy D3.js. Áp dụng khi mở lại bản đồ.",

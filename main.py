@@ -791,6 +791,7 @@ class ClientApp(QWidget):
         # Backup scheduling (30s debounce)
         self.backup_scheduler = BackupScheduler(self._perform_backup)
         self.storage.set_backup_callback(self.backup_scheduler.schedule)
+        self.storage.set_neural_event_callback(self._on_neural_storage_event)
 
         # Register cleanup on exit
         atexit.register(self._cleanup_on_exit)
@@ -827,6 +828,14 @@ class ClientApp(QWidget):
         clips = self.storage.get_all_clips()
         create_backup(clips)
         self.storage.clear_backup_flag()
+
+    def _on_neural_storage_event(self, event_type, clip_id):
+        if not getattr(self, "neural_engine", None):
+            return
+        if event_type == "new_clip":
+            self.neural_engine.enqueue_new_clip(clip_id)
+        elif event_type == "pin_state_changed":
+            self.neural_engine.enqueue_priority_reindex(clip_id)
 
     def _cleanup_on_exit(self):
         """Cleanup when app exits."""
@@ -1186,7 +1195,11 @@ class ClientApp(QWidget):
 
     def _sync_selection_to_map(self):
         """Sync the currently selected clip to the neural map (focus node)."""
-        if not self.sidecar or not self.sidecar.isVisible():
+        if (
+            not self.sidecar
+            or not hasattr(self.sidecar, "isVisible")
+            or not self.sidecar.isVisible()
+        ):
             return
         w = self._active_list()
         if not w:
@@ -1393,7 +1406,11 @@ class ClientApp(QWidget):
 
     def hideEvent(self, event):
         """When Main UI hides, hide the Map too (only if docked)."""
-        if hasattr(self, "sidecar") and self.sidecar and self.sidecar._docked_mode:
+        if (
+            hasattr(self, "sidecar")
+            and self.sidecar
+            and getattr(self.sidecar, "_docked_mode", False)
+        ):
             self.sidecar.hide()
         super().hideEvent(event)
 
@@ -1407,6 +1424,7 @@ class ClientApp(QWidget):
             sidecar_has_focus = (
                 hasattr(self, "sidecar")
                 and self.sidecar is not None
+                and hasattr(self.sidecar, "isActiveWindow")
                 and self.sidecar.isActiveWindow()
             )
             if not sidecar_has_focus:

@@ -54,6 +54,7 @@ class ClipboardStorage:
     def __init__(self):
         self._search_revision = 0
         self._retriever = LightRAGRetriever()
+        self._neural_event_callback = None
         self._init_db()
         self._init_neural_tables()
 
@@ -116,6 +117,10 @@ class ClipboardStorage:
         """Set callback to trigger backup when data changes."""
         self._backup_callback = callback
 
+    def set_neural_event_callback(self, callback):
+        """Set callback for lightweight neural enqueue events."""
+        self._neural_event_callback = callback
+
     def _mark_dirty(self):
         """Mark that backup is needed. Does NOT invalidate search index."""
         ClipboardStorage._need_backup = True
@@ -130,6 +135,13 @@ class ClipboardStorage:
             is_pinned = clip.get("is_pinned", False)
             ns = "pinned" if is_pinned else "history"
             self._retriever.add_record(ns, clip)
+
+    def _emit_neural_event(self, event_type: str, clip_id: int):
+        if self._neural_event_callback:
+            try:
+                self._neural_event_callback(event_type, clip_id)
+            except Exception:
+                pass
 
     def trigger_daily_rebuild(self):
         """Trigger a background RAG index rebuild if not done today.
@@ -224,6 +236,7 @@ class ClipboardStorage:
             self._mark_dirty()
             # Incrementally add to search index (no full rebuild)
             self._incremental_index_clip(new_id)
+            self._emit_neural_event("new_clip", new_id)
             return new_id, True
 
     def pin_clip(self, clip_id: int) -> bool:
@@ -240,6 +253,7 @@ class ClipboardStorage:
                 (max_order + 1, now, clip_id),
             )
             self._mark_dirty()
+            self._emit_neural_event("pin_state_changed", clip_id)
             return True
 
     def unpin_clip(self, clip_id: int) -> bool:
@@ -251,6 +265,7 @@ class ClipboardStorage:
                 (now, clip_id),
             )
             self._mark_dirty()
+            self._emit_neural_event("pin_state_changed", clip_id)
             return True
 
     def delete_clip(self, clip_id: int) -> bool:
