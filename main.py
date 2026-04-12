@@ -16,7 +16,6 @@ os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
 # ]
 # ///
 import sys
-import os
 import hashlib
 import ctypes
 import ctypes.wintypes
@@ -68,7 +67,7 @@ from backup_manager import (
     import_legacy_json,
     BackupScheduler,
 )
-from ui_widgets import (
+from ui.widgets import (
     SmoothListWidget,
     LineInfoPopup,
     SearchLineEdit,
@@ -77,7 +76,7 @@ from ui_widgets import (
     PAGE_SIZE_HISTORY,
     PAGE_SIZE_PINNED,
 )
-from clipboard_browser_controller import ClipboardBrowserController
+from ui.clipboard_browser_controller import ClipboardBrowserController
 
 # Neural Memory modules — QtWebEngineWidgets MUST be imported before QApplication
 try:
@@ -1044,10 +1043,6 @@ class ClientApp(QWidget):
         self.pending_clipboard_guard = None
         return False
 
-    def hide_if_visible(self):
-        if self.isVisible():
-            self.hide()
-
     def handle_copy_only(self, data):
         self._set_pending_clipboard_guard(data)
         if data["type"] == "text":
@@ -1158,10 +1153,7 @@ class ClientApp(QWidget):
         super().hideEvent(event)
 
     def changeEvent(self, e):
-        if (
-            e.type() == QEvent.Type.ActivationChange and not self.isActiveWindow()
-            # and not self._is_refreshing  # controller owns this now
-        ):
+        if e.type() == QEvent.Type.ActivationChange and not self.isActiveWindow():
             # Only skip hide if user genuinely clicked INTO the sidecar
             sidecar_has_focus = (
                 hasattr(self, "sidecar")
