@@ -2,6 +2,9 @@
 *.db
 *.db-wal
 *.db-shm
+storage/*.db
+storage/*.db-wal
+storage/*.db-shm
 
 # Backup files
 backups/

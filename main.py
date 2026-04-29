@@ -41,6 +41,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import (
     Qt,
     QTimer,
+    pyqtSignal,
     QSize,
     QEvent,
     QByteArray,
@@ -83,58 +84,11 @@ from ui.widgets import (
 )
 from ui.clipboard_browser_controller import ClipboardBrowserController
 
-# Neural Memory modules — QtWebEngineWidgets MUST be imported before QApplication
-try:
-    from PyQt6.QtWebEngineWidgets import QWebEngineView  # noqa: F401 (must come first)
-    from neural.engine import NeuralEngine
-    from neural.ui import SidecarWindow
-
-    HAS_NEURAL_SUPPORT = True
-except Exception as _neural_err:
-    HAS_NEURAL_SUPPORT = False
-    print(f"[Neural] Import failed: {_neural_err}", file=sys.stderr)
-
-    class QWebEngineView:
-        pass
-
-    class NeuralEngine:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def start(self):
-            pass
-
-        def stop(self):
-            pass
-
-    class SidecarWindow:
-        class MockBridge:
-            node_clicked = type("MockSignal", (), {"connect": lambda self, x: None})()
-
-        class MockSearchBar:
-            textChanged = type("MockSignal", (), {"connect": lambda self, x: None})()
-
-        def __init__(self, *args, **kwargs):
-            self.bridge = self.MockBridge()
-            self.search_bar = self.MockSearchBar()
-
-        def show(self):
-            pass
-
-        def hide(self):
-            pass
-
-        def close(self):
-            pass
-
-        def move(self, *args):
-            pass
-
-        def update_data(self, *args):
-            pass
-
-        def focus_node(self, *args):
-            pass
+# Neural modules are imported only after the user explicitly opens Neural Map.
+HAS_NEURAL_SUPPORT = True
+NEURAL_SUPPORT_ERROR = None
+NeuralEngine = None
+SidecarWindow = None
 
 
 # --- Cấu hình ---
@@ -145,6 +99,7 @@ DEBUG_LOG_FILE = os.path.join(LOG_DIR, "Advance Clipboard.debug.log")
 FAULT_LOG_FILE = os.path.join(LOG_DIR, "Advance Clipboard.fault.log")
 
 UI_EDGE_MARGIN = 150  # Minimum distance from screen edges
+SW_RESTORE = 9
 
 # Ensure image directory exists
 if not os.path.exists(IMAGE_DIR):
@@ -193,6 +148,9 @@ threading.excepthook = _log_thread_exception
 
 
 class ClientApp(QWidget):
+    _neural_graph_loaded = pyqtSignal(int, list, list)
+    _neural_graph_failed = pyqtSignal(int, str)
+
     def __init__(self, *, enable_monitor: bool = True, init_data: bool = True):
         super().__init__()
         # SQLite storage - single source of truth
@@ -210,6 +168,10 @@ class ClientApp(QWidget):
 
         # Neural Memory state
         self.neural_enabled = False
+        self._neural_engine_started = False
+        self._neural_map_loading = False
+        self._neural_map_state = "not_started"
+        self._neural_load_request_id = 0
         self._galaxy_loaded = False  # True after first full galaxy load into sidecar
 
         # Prevent PyTorch from taking over all threads to avoid lagging the host UI and system
@@ -219,33 +181,22 @@ class ClientApp(QWidget):
         os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
         os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
-        self.neural_engine = NeuralEngine(
-            self.storage,
-            os.path.join(os.path.dirname(__file__), "neural", "config.json"),
-        )
-        if HAS_NEURAL_SUPPORT:
-            # Delay the start of the neural engine slightly to let UI initialize first
-            QTimer.singleShot(2000, self.neural_engine.start)
-            # NO parent — sidecar manages its own lifecycle to avoid hide-loop
-            self.sidecar = SidecarWindow(self.storage, main_window=self)
-        else:
-            self.sidecar = None
-
-        # Connect neural signals
-        if self.sidecar:
-            self.sidecar.bridge.node_clicked.connect(self._on_node_clicked)
-            self.sidecar.search_bar.textChanged.connect(self._on_sidecar_search_changed)
+        self.neural_engine = None
+        self.sidecar = None
+        self._neural_graph_loaded.connect(self._on_neural_graph_loaded)
+        self._neural_graph_failed.connect(self._on_neural_graph_failed)
 
         # Init UI
         self.initUI()
 
         self.neural_status_timer = QTimer(self)
         self.neural_status_timer.timeout.connect(self._refresh_neural_status)
-        self.neural_status_timer.start(500)
+        self.neural_status_timer.start(5000)
 
         # Load data with disaster recovery
         if init_data:
             self._init_data()
+            self.is_ui_dirty = False
 
         # Trigger daily RAG index rebuild in background (non-blocking)
         # If already rebuilt today, skips instantly. Otherwise builds in ~10s background.
@@ -569,8 +520,6 @@ class ClientApp(QWidget):
             except:
                 pass
         self.browser.active_side = "history"
-        self.browser.refresh_lists(maintain_selection=False)
-        self.is_ui_dirty = False
         cp = QCursor.pos()
         w, h = self.width(), self.height()
         sc = QGuiApplication.screenAt(cp) or QGuiApplication.primaryScreen()
@@ -601,25 +550,163 @@ class ClientApp(QWidget):
         self.search_input.setFocus()
         self.search_input.setCursorPosition(len(self.search_input.text()))
         self._on_ui_opened()
+        if self.is_ui_dirty:
+            QTimer.singleShot(25, self._refresh_after_show)
+
+    def _refresh_after_show(self):
+        if not self.isVisible() or not self.is_ui_dirty:
+            return
+        self.browser.active_side = "history"
+        self.browser.refresh_lists(maintain_selection=False)
+        self.is_ui_dirty = False
+        self._on_ui_opened()
 
     def closeEvent(self, event):
         """Clean up background threads on close."""
-        if hasattr(self, "neural_engine"):
+        if getattr(self, "neural_engine", None):
             self.neural_engine.stop()
         if hasattr(self, "sidecar") and self.sidecar is not None:
             self.sidecar.close()
         super().closeEvent(event)
 
+    def _set_neural_unavailable(self, message):
+        global HAS_NEURAL_SUPPORT, NEURAL_SUPPORT_ERROR
+        HAS_NEURAL_SUPPORT = False
+        NEURAL_SUPPORT_ERROR = message
+        if hasattr(self, "btn_neural"):
+            self.btn_neural.setEnabled(False)
+            self.btn_neural.setToolTip(message)
+        if hasattr(self, "chk_map"):
+            self.chk_map.setChecked(False)
+            self.chk_map.setEnabled(False)
+            self.chk_map.setToolTip(message)
+            self.chk_map.setText("Map OFF")
+
+    def _ensure_neural_components_loaded(self):
+        """Import and create Neural objects only after explicit user action."""
+        global NeuralEngine, SidecarWindow
+        if not HAS_NEURAL_SUPPORT:
+            return False
+
+        if NeuralEngine is None or SidecarWindow is None:
+            try:
+                from PyQt6.QtWebEngineWidgets import QWebEngineView  # noqa: F401
+                from neural.engine import NeuralEngine as LoadedNeuralEngine
+                from neural.ui import SidecarWindow as LoadedSidecarWindow
+
+                NeuralEngine = LoadedNeuralEngine
+                SidecarWindow = LoadedSidecarWindow
+            except Exception as exc:
+                message = f"Neural support unavailable: {exc}"
+                print(f"[Neural] Import failed on demand: {exc}", file=sys.stderr)
+                self._set_neural_unavailable(message)
+                return False
+
+        if self.neural_engine is None:
+            self.neural_engine = NeuralEngine(
+                self.storage,
+                os.path.join(os.path.dirname(__file__), "neural", "config.json"),
+            )
+
+        if self.sidecar is None:
+            self.sidecar = SidecarWindow(self.storage, main_window=self)
+            self.sidecar.bridge.node_clicked.connect(self._on_node_clicked)
+            self.sidecar.search_bar.textChanged.connect(
+                self._on_sidecar_search_changed
+            )
+
+        return True
+
+    def _ensure_neural_engine_started(self):
+        """Start the neural engine on first Neural Map use."""
+        if not HAS_NEURAL_SUPPORT:
+            return False
+        if not self._ensure_neural_components_loaded():
+            return False
+        if self._neural_engine_started:
+            return True
+        self.neural_engine.start()
+        self._neural_engine_started = True
+        return True
+
+    def _focus_sidecar_from_search(self):
+        if self.sidecar and self.browser.current_search_query:
+            self.sidecar.focus_query(self.browser.current_search_query)
+
+    def _ensure_galaxy_loaded(self, force=False):
+        """Load graph data into the persistent sidecar once per app session."""
+        if not self._ensure_neural_components_loaded():
+            return
+        if self._neural_map_loading:
+            return
+        if self._galaxy_loaded and not force:
+            self._focus_sidecar_from_search()
+            return
+
+        self._neural_map_loading = True
+        self._neural_map_state = "loading"
+        self._ensure_neural_engine_started()
+        self._neural_load_request_id += 1
+        request_id = self._neural_load_request_id
+        threading.Thread(
+            target=self._load_neural_graph_in_background,
+            args=(request_id,),
+            daemon=True,
+            name="NeuralGraphLoader",
+        ).start()
+
+    def _load_neural_graph_in_background(self, request_id):
+        try:
+            indexed_ids = self.storage.get_all_clip_ids_with_vectors(limit=500)
+            nodes, links = (
+                self.storage.get_neural_data(indexed_ids) if indexed_ids else ([], [])
+            )
+            formatted_links = [
+                {
+                    "source": l["source_id"],
+                    "target": l["target_id"],
+                    "weight": float(l["weight"]),
+                }
+                for l in links
+            ]
+            self._neural_graph_loaded.emit(request_id, nodes, formatted_links)
+        except Exception as exc:
+            self._neural_graph_failed.emit(request_id, str(exc))
+
+    def _on_neural_graph_loaded(self, request_id, nodes, links):
+        if request_id != self._neural_load_request_id or not self.sidecar:
+            return
+        self.sidecar.update_data(nodes, links)
+        self._galaxy_loaded = True
+        self._neural_map_state = "ready"
+        self._neural_map_loading = False
+        self._focus_sidecar_from_search()
+        self._refresh_neural_status()
+        if hasattr(self, "neural_status_timer"):
+            self.neural_status_timer.stop()
+
+    def _on_neural_graph_failed(self, request_id, message):
+        if request_id != self._neural_load_request_id:
+            return
+        self._neural_map_loading = False
+        self._neural_map_state = "error"
+        print(f"[Neural] Graph load failed: {message}", file=sys.stderr)
+
+    def _show_sidecar_fast(self, docked: bool):
+        if not self.sidecar:
+            return
+        self.sidecar._docked_mode = docked
+        self.sidecar.show()
+        self.sidecar.activateWindow()
+        self.sidecar.raise_()
+        self._focus_sidecar_from_search()
+
     def _show_map_docked(self):
         """Show the map docked near the main UI without overlapping it."""
         print(f"[MainUI] _show_map_docked called, sidecar={self.sidecar is not None}")
-        if not self.sidecar:
+        if not self._ensure_neural_components_loaded():
             return
         self.sidecar._docked_mode = True
-
-        # Reload config + force reload nodes every time docked map opens
-        self.sidecar.reload_config()
-        self._galaxy_loaded = False
         geo = self.geometry()
         map_w = geo.width()
         map_h = int(geo.height() * 2 / 3)
@@ -667,15 +754,14 @@ class ClientApp(QWidget):
         # ignored when the window was previously shown at a different size.
         self.sidecar.move(target_x, target_y)
         self.sidecar.resize(map_w, map_h)
-        # Delay galaxy load to give QWebEngineView time to acquire real dimensions
-        QTimer.singleShot(500, self._load_full_galaxy_into_sidecar)
+        self._ensure_galaxy_loaded()
 
     def _show_neural_floating(self):
         """Open Neural Map as independent floating window at cursor (like test_neural_show.py)."""
         print(
             f"[MainUI] _show_neural_floating called, sidecar={self.sidecar is not None}"
         )
-        if not self.sidecar:
+        if not self._ensure_neural_components_loaded():
             return
         self.sidecar._docked_mode = False  # Independent — never auto-hide
 
@@ -683,11 +769,8 @@ class ClientApp(QWidget):
         if self.sidecar.isVisible():
             self.sidecar.activateWindow()
             self.sidecar.raise_()
+            self._ensure_galaxy_loaded()
             return
-
-        # Reload config every time map opens
-        self.sidecar.reload_config()
-        self._galaxy_loaded = False  # Force reload nodes (may have new clips)
 
         cursor_pos = QCursor.pos()
         map_w = 700
@@ -713,8 +796,7 @@ class ClientApp(QWidget):
 
         self.sidecar.setGeometry(target_x, target_y, map_w, map_h)
         self.sidecar.show()
-        # Delay galaxy load to give QWebEngineView time to acquire real dimensions
-        QTimer.singleShot(500, self._load_full_galaxy_into_sidecar)
+        self._ensure_galaxy_loaded()
 
     def _load_full_galaxy_into_sidecar(self, force=False):
         """Load the full neural galaxy (all indexed nodes) into sidecar — like test_neural_show.py does.
@@ -722,39 +804,18 @@ class ClientApp(QWidget):
         print(
             f"[MainUI] _load_full_galaxy: force={force}, _galaxy_loaded={self._galaxy_loaded}"
         )
-        if not self.sidecar:
-            return
-        if self._galaxy_loaded and not force:
-            # Already loaded, just do focus if needed
-            if self.browser.current_search_query:
-                self.sidecar.focus_query(self.browser.current_search_query)
-            return
-        indexed_ids = self.storage.get_all_clip_ids_with_vectors(limit=500)
-        if not indexed_ids:
-            return
-        nodes, links = self.storage.get_neural_data(indexed_ids)
-        formatted_links = [
-            {
-                "source": l["source_id"],
-                "target": l["target_id"],
-                "weight": float(l["weight"]),
-            }
-            for l in links
-        ]
-        self.sidecar.update_data(nodes, formatted_links)
-        self._galaxy_loaded = True
-        if self.browser.current_search_query:
-            self.sidecar.focus_query(self.browser.current_search_query)
+        self._ensure_galaxy_loaded(force=force)
 
     def _toggle_neural(self, checked):
         self.neural_enabled = checked
         print(
             f"[MainUI] _toggle_neural: checked={checked}, sidecar={self.sidecar is not None}"
         )
-        if checked and self.sidecar:
+        if checked:
             self._show_map_docked()
         elif self.sidecar:
             self.sidecar.hide()
+        self._refresh_neural_status()
 
     def _refresh_neural_status(self):
         if not HAS_NEURAL_SUPPORT:
@@ -989,8 +1050,59 @@ class ClientApp(QWidget):
             return False
         target_hwnd = self.last_active_window_handle
         if target_hwnd:
+            self._restore_target_focus(target_hwnd)
             return user32.GetForegroundWindow() == target_hwnd
         return True
+
+    def _restore_target_focus(self, target_hwnd):
+        if sys.platform != "win32" or not target_hwnd:
+            return True
+        user32 = ctypes.windll.user32
+        try:
+            if hasattr(user32, "IsWindow") and not user32.IsWindow(target_hwnd):
+                logger.warning("restore_target_focus_invalid hwnd=%s", target_hwnd)
+                return False
+
+            current_foreground = user32.GetForegroundWindow()
+            if current_foreground == target_hwnd:
+                return True
+
+            if hasattr(user32, "IsIconic") and user32.IsIconic(target_hwnd):
+                user32.ShowWindow(target_hwnd, SW_RESTORE)
+
+            kernel32 = ctypes.windll.kernel32
+            current_thread = kernel32.GetCurrentThreadId()
+            target_thread = user32.GetWindowThreadProcessId(target_hwnd, None)
+            foreground_thread = (
+                user32.GetWindowThreadProcessId(current_foreground, None)
+                if current_foreground
+                else 0
+            )
+            attached = []
+
+            def attach(thread_id):
+                if thread_id and thread_id != current_thread:
+                    user32.AttachThreadInput(current_thread, thread_id, True)
+                    attached.append(thread_id)
+
+            attach(foreground_thread)
+            attach(target_thread)
+            try:
+                if hasattr(user32, "BringWindowToTop"):
+                    user32.BringWindowToTop(target_hwnd)
+                user32.SetForegroundWindow(target_hwnd)
+                if hasattr(user32, "SetFocus"):
+                    user32.SetFocus(target_hwnd)
+            finally:
+                for thread_id in reversed(attached):
+                    user32.AttachThreadInput(current_thread, thread_id, False)
+
+            return user32.GetForegroundWindow() == target_hwnd
+        except Exception as exc:
+            logger.warning(
+                "restore_target_focus_failed hwnd=%s error=%s", target_hwnd, exc
+            )
+            return False
 
     def _perform_keyboard_paste(self):
         logger.info(
