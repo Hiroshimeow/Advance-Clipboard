@@ -1,5 +1,4 @@
 import sqlite3
-import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
 from .db import get_connection, transaction
 

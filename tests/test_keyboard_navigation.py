@@ -202,10 +202,27 @@ class _FakeStorage:
         pass
 
 
+    def delete_clip(self, clip_id):
+        self._history = [c for c in self._history if c.get("id") != clip_id]
+        self._pinned = [c for c in self._pinned if c.get("id") != clip_id]
+        return True
+
+
 class _SlowFakeStorage(_FakeStorage):
     def get_history(self, limit=20, offset=0):
         time.sleep(0.25)
         return super().get_history(limit, offset)
+
+
+class _DeleteObservingStorage(_FakeStorage):
+    def __init__(self, app, history=None, pinned=None):
+        super().__init__(history=history, pinned=pinned)
+        self.app = app
+        self.history_count_seen_during_delete = None
+
+    def delete_clip(self, clip_id):
+        self.history_count_seen_during_delete = self.app.list_history.count()
+        return super().delete_clip(clip_id)
 
 
 class _SpyClientApp(_TestClientApp):
@@ -281,7 +298,7 @@ class KeyboardNavigationTests(unittest.TestCase):
     def setUpClass(cls):
         _get_qapp()
 
-    def test_search_line_edit_forwards_nav_keys_but_allows_text_and_backspace(self):
+    def test_search_line_edit_forwards_vertical_nav_but_keeps_horizontal_text_navigation(self):
         _get_qapp()
         calls = {"up": 0, "down": 0, "left": 0, "right": 0, "enter": 0}
         w = SearchLineEdit()
@@ -296,12 +313,18 @@ class KeyboardNavigationTests(unittest.TestCase):
         w.setFocus()
         QApplication.processEvents()
         _send_key(w, Qt.Key.Key_A, text="a")
-        self.assertEqual(w.text(), "a")
-        _send_key(w, Qt.Key.Key_Up)
+        _send_key(w, Qt.Key.Key_B, text="b")
+        w.setCursorPosition(2)
         _send_key(w, Qt.Key.Key_Left)
+        self.assertEqual(w.cursorPosition(), 1)
+        _send_key(w, Qt.Key.Key_Right)
+        self.assertEqual(w.cursorPosition(), 2)
+        self.assertEqual(w.text(), "ab")
+        _send_key(w, Qt.Key.Key_Up)
         _send_key(w, Qt.Key.Key_Return)
         self.assertEqual(calls["up"], 1)
-        self.assertEqual(calls["left"], 1)
+        self.assertEqual(calls["left"], 0)
+        self.assertEqual(calls["right"], 0)
         self.assertEqual(calls["enter"], 1)
         w.close()
         QApplication.processEvents()
@@ -459,6 +482,22 @@ class KeyboardNavigationTests(unittest.TestCase):
         cur = app.list_history.currentItem()
         self.assertIsNotNone(cur)
         self.assertEqual(cur.data(Qt.ItemDataRole.UserRole).get("id"), 1)
+        app.backup_scheduler.cancel()
+        app.close()
+        QApplication.processEvents()
+
+    def test_delete_removes_visible_clip_before_storage_delete_finishes(self):
+        _get_qapp()
+        app = _TestClientApp()
+        history = [{"id": 1, "type": "text", "content": "delete me"}]
+        app.storage = _DeleteObservingStorage(app, history=history)
+        app.refresh_lists()
+        self.assertEqual(app.list_history.count(), 1)
+
+        app.handle_delete(1)
+
+        self.assertEqual(app.storage.history_count_seen_during_delete, 0)
+        self.assertEqual(app.list_history.count(), 0)
         app.backup_scheduler.cancel()
         app.close()
         QApplication.processEvents()

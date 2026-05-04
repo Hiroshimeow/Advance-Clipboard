@@ -85,8 +85,6 @@ class SearchLineEdit(QLineEdit):
         self.click_timer.timeout.connect(self._reset_click_count)
         self._on_up = None
         self._on_down = None
-        self._on_left = None
-        self._on_right = None
         self._on_enter = None
 
     def set_key_handlers(
@@ -94,8 +92,6 @@ class SearchLineEdit(QLineEdit):
     ):
         self._on_up = on_up
         self._on_down = on_down
-        self._on_left = on_left
-        self._on_right = on_right
         self._on_enter = on_enter
 
     def mousePressEvent(self, event):
@@ -118,14 +114,6 @@ class SearchLineEdit(QLineEdit):
             return
         if k == Qt.Key.Key_Down and self._on_down:
             self._on_down()
-            event.accept()
-            return
-        if k == Qt.Key.Key_Left and self._on_left:
-            self._on_left()
-            event.accept()
-            return
-        if k == Qt.Key.Key_Right and self._on_right:
-            self._on_right()
             event.accept()
             return
         if k in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self._on_enter:
@@ -253,7 +241,8 @@ class ClipItemWidget(QWidget):
         else:
             self.lbl_content = QLabel()
             self.lbl_content.setFixedSize(THUMB_SIZE)
-            self.lbl_content.setScaledContents(True)
+            self.lbl_content.setScaledContents(False)
+            self.lbl_content.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.lbl_content.setStyleSheet(
                 "border: 1px solid #444; background-color: #000; border-radius: 4px;"
             )

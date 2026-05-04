@@ -7,7 +7,7 @@ os.environ["HF_HUB_OFFLINE"] = "0"
 os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
 
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.11,<3.14"
 # dependencies = [
 #     "PyQt6",
 #     "PyQt6-WebEngine",
@@ -66,7 +66,7 @@ from core.clipboard_monitor import (
 )
 
 # Import storage and backup modules
-from storage import get_storage
+from storage import get_neural_support_error, get_storage
 from storage.backup import (
     create_backup,
     find_valid_backup,
@@ -155,6 +155,13 @@ class ClientApp(QWidget):
         super().__init__()
         # SQLite storage - single source of truth
         self.storage = get_storage()
+        storage_neural_error = get_neural_support_error()
+        if storage_neural_error is not None:
+            global HAS_NEURAL_SUPPORT, NEURAL_SUPPORT_ERROR
+            HAS_NEURAL_SUPPORT = False
+            NEURAL_SUPPORT_ERROR = (
+                f"Neural support unavailable: {storage_neural_error}"
+            )
 
         # UI state
         self.pending_clipboard_guard = None
@@ -162,6 +169,9 @@ class ClientApp(QWidget):
         self.input_locked = False
         self.last_active_window_handle = None
         self._paste_in_progress = False
+        self._hidden_refresh_timer = QTimer(self)
+        self._hidden_refresh_timer.setSingleShot(True)
+        self._hidden_refresh_timer.timeout.connect(self._refresh_hidden_ui_cache)
 
         # Browser Controller (Search, Nav, Pagination)
         self.browser = ClipboardBrowserController(self)
@@ -188,6 +198,8 @@ class ClientApp(QWidget):
 
         # Init UI
         self.initUI()
+        if storage_neural_error is not None and NEURAL_SUPPORT_ERROR:
+            self._set_neural_unavailable(NEURAL_SUPPORT_ERROR)
 
         self.neural_status_timer = QTimer(self)
         self.neural_status_timer.timeout.connect(self._refresh_neural_status)
@@ -333,8 +345,6 @@ class ClientApp(QWidget):
         self.search_input.set_key_handlers(
             on_up=self.browser.nav_up,
             on_down=self.browser.nav_down,
-            on_left=self.browser.nav_left,
-            on_right=self.browser.nav_right,
             on_enter=self.browser.activate_current,
         )
         search_row.addWidget(self.search_input, stretch=1)
@@ -560,6 +570,17 @@ class ClientApp(QWidget):
         self.browser.refresh_lists(maintain_selection=False)
         self.is_ui_dirty = False
         self._on_ui_opened()
+
+    def _schedule_hidden_ui_refresh(self):
+        self.is_ui_dirty = True
+        self._hidden_refresh_timer.start(20)
+
+    def _refresh_hidden_ui_cache(self):
+        if self.isVisible() or not self.is_ui_dirty:
+            return
+        self.browser.active_side = "history"
+        self.refresh_lists()
+        self.is_ui_dirty = False
 
     def closeEvent(self, event):
         """Clean up background threads on close."""
@@ -1189,6 +1210,7 @@ class ClientApp(QWidget):
 
     def handle_delete(self, clip_id):
         """Delete a clip."""
+        self.browser.remove_clip_from_ui(clip_id)
         self.storage.delete_clip(clip_id)
         self.refresh_lists()
 
@@ -1245,7 +1267,7 @@ class ClientApp(QWidget):
         if self.isVisible():
             self.refresh_lists()
         else:
-            self.is_ui_dirty = True
+            self._schedule_hidden_ui_refresh()
 
     def save_image_if_new(self, img):
         fn = self._image_storage_name(img)

@@ -43,6 +43,19 @@ class StorageNeuralEventTests(unittest.TestCase):
         self.assertEqual(clip_id, same_id)
         self.callback.assert_not_called()
 
+    def test_recopied_pinned_clip_still_appears_in_recent_history(self):
+        clip_id, _ = self.storage.add_clip("text", "reused pinned")
+        self.storage.pin_clip(clip_id)
+
+        same_id, is_new = self.storage.add_clip("text", "reused pinned")
+
+        self.assertEqual(clip_id, same_id)
+        self.assertFalse(is_new)
+        history_ids = [clip["id"] for clip in self.storage.get_history()]
+        pinned_ids = [clip["id"] for clip in self.storage.get_pinned()]
+        self.assertIn(clip_id, history_ids)
+        self.assertIn(clip_id, pinned_ids)
+
     def test_pin_and_unpin_emit_priority_event(self):
         clip_id, _ = self.storage.add_clip("text", "pin me")
         self.callback.reset_mock()

@@ -21,7 +21,55 @@ _transaction = transaction
 
 from .clips import ClipRepository, compute_hash
 from .search import SearchService
-from .neural import NeuralRepository
+
+_NEURAL_REPOSITORY_IMPORT_ERROR: Exception | None = None
+
+try:
+    from .neural import NeuralRepository
+except Exception as exc:
+    _NEURAL_REPOSITORY_IMPORT_ERROR = exc
+
+    class NeuralRepository:
+        """No-op fallback so clipboard core can boot without neural extras."""
+
+        def save_vector(self, clip_id: int, vector_bytes: bytes):
+            return None
+
+        def get_vector(self, clip_id: int) -> Optional[bytes]:
+            return None
+
+        def save_links(self, links_list: List[Tuple[int, int, float]]):
+            return None
+
+        def get_links(self, clip_id_list: List[int]) -> List[Dict[str, Any]]:
+            return []
+
+        def get_unindexed_clip_ids(self, limit: int = 100) -> List[int]:
+            return []
+
+        def get_recent_history_ids(self, limit: int = 200) -> List[int]:
+            return []
+
+        def get_all_pinned_ids(self) -> List[int]:
+            return []
+
+        def get_unindexed_ids_within_window(
+            self, recent_limit: int = 200, include_pinned: bool = True, limit: int = 100
+        ) -> List[int]:
+            return []
+
+        def get_neural_window_totals(
+            self, recent_limit: int = 200, include_pinned: bool = True
+        ) -> Tuple[int, int]:
+            return 0, 0
+
+        def get_all_clip_ids_with_vectors(self, limit: int = 500) -> List[int]:
+            return []
+
+        def get_neural_data(
+            self, clip_ids: List[int]
+        ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+            return [], []
 
 
 class ClipboardStorage:
@@ -263,7 +311,7 @@ class ClipboardStorage:
             where_clauses.append("content LIKE ?")
             params.append(f"%{term}%")
         rows = conn.execute(
-            f"SELECT * FROM clips WHERE is_pinned = 0 AND ({' AND '.join(where_clauses)}) ORDER BY updated_at DESC LIMIT ?",
+            f"SELECT * FROM clips WHERE {' AND '.join(where_clauses)} ORDER BY updated_at DESC LIMIT ?",
             params + [limit],
         ).fetchall()
         return [dict(r) for r in rows]
@@ -328,6 +376,10 @@ class ClipboardStorage:
 
 # Global instance
 _storage: Optional[ClipboardStorage] = None
+
+
+def get_neural_support_error() -> Exception | None:
+    return _NEURAL_REPOSITORY_IMPORT_ERROR
 
 
 def get_storage() -> ClipboardStorage:

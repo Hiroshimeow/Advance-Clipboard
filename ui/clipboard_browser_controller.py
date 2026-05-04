@@ -384,6 +384,19 @@ class ClipboardBrowserController:
             self._append_items(self.app.list_pinned, ungrouped, is_pinned=True)
             self.pinned_has_more = False
 
+    def remove_clip_from_ui(self, clip_id):
+        """Optimistically remove a clip so delete feels instant."""
+        for list_widget in (self.app.list_history, self.app.list_pinned):
+            for row in range(list_widget.count() - 1, -1, -1):
+                item = list_widget.item(row)
+                if not self._is_pasteable_item(item):
+                    continue
+                data = item.data(Qt.ItemDataRole.UserRole)
+                if isinstance(data, dict) and data.get("id") == clip_id:
+                    removed = list_widget.takeItem(row)
+                    if removed is not None:
+                        del removed
+
     def _append_items(self, list_widget, clips, is_pinned):
         width = list_widget.viewport().width() or ((self.app.width() // 2) - 25)
         for clip in clips:

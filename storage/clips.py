@@ -198,7 +198,7 @@ class ClipRepository:
         conn = get_connection()
         rows = conn.execute(
             """SELECT id, type, content, hash, tag, created_at, updated_at
-               FROM clips WHERE is_pinned = 0
+               FROM clips
                ORDER BY updated_at DESC
                LIMIT ? OFFSET ?""",
             (limit, offset),
