@@ -1211,6 +1211,9 @@ class ClientApp(QWidget):
     def handle_delete(self, clip_id):
         """Delete a clip."""
         self.browser.remove_clip_from_ui(clip_id)
+        QTimer.singleShot(25, lambda: self._delete_clip_backend(clip_id))
+
+    def _delete_clip_backend(self, clip_id):
         self.storage.delete_clip(clip_id)
         self.refresh_lists()
 

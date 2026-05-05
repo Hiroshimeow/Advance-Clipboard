@@ -225,6 +225,17 @@ class _DeleteObservingStorage(_FakeStorage):
         return super().delete_clip(clip_id)
 
 
+class _SlowDeleteStorage(_FakeStorage):
+    def __init__(self, history=None, pinned=None):
+        super().__init__(history=history, pinned=pinned)
+        self.delete_calls = []
+
+    def delete_clip(self, clip_id):
+        self.delete_calls.append(clip_id)
+        time.sleep(0.25)
+        return super().delete_clip(clip_id)
+
+
 class _SpyClientApp(_TestClientApp):
     def __init__(self):
         super().__init__()
@@ -496,8 +507,31 @@ class KeyboardNavigationTests(unittest.TestCase):
 
         app.handle_delete(1)
 
+        self.assertEqual(app.list_history.count(), 0)
+        self.assertTrue(
+            _wait_until(lambda: app.storage.history_count_seen_during_delete == 0)
+        )
         self.assertEqual(app.storage.history_count_seen_during_delete, 0)
         self.assertEqual(app.list_history.count(), 0)
+        app.backup_scheduler.cancel()
+        app.close()
+        QApplication.processEvents()
+
+    def test_delete_returns_before_slow_storage_delete_runs(self):
+        _get_qapp()
+        app = _TestClientApp()
+        history = [{"id": 1, "type": "text", "content": "slow delete"}]
+        app.storage = _SlowDeleteStorage(history=history)
+        app.refresh_lists()
+
+        start = time.monotonic()
+        app.handle_delete(1)
+        elapsed = time.monotonic() - start
+
+        self.assertLess(elapsed, 0.05)
+        self.assertEqual(app.list_history.count(), 0)
+        self.assertEqual(app.storage.delete_calls, [])
+        self.assertTrue(_wait_until(lambda: app.storage.delete_calls == [1]))
         app.backup_scheduler.cancel()
         app.close()
         QApplication.processEvents()
