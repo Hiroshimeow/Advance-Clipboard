@@ -168,8 +168,8 @@ class _TestClientApp(ClientApp):
 
 class _FakeStorage:
     def __init__(self, history=None, pinned=None):
-        self._history = history or []
-        self._pinned = pinned or []
+        self._history = [dict(c) for c in (history or [])]
+        self._pinned = [dict(c) for c in (pinned or [])]
         self.need_backup = False
 
     def set_backup_callback(self, callback):
@@ -193,10 +193,74 @@ class _FakeStorage:
         return list(self._history)[offset : offset + limit]
 
     def get_groups(self):
-        return []
+        names = {
+            str(c.get("group_name", ""))
+            for c in self._pinned
+            if str(c.get("group_name", "")).strip()
+        }
+        return sorted(names)
+
+    def get_clips_by_group(self, group_name):
+        return [c for c in self._pinned if c.get("group_name") == group_name]
 
     def get_ungrouped_pinned(self, limit=50, offset=0):
-        return list(self._pinned)[offset : offset + limit]
+        rows = [
+            c
+            for c in self._pinned
+            if not str(c.get("group_name", "")).strip()
+        ]
+        return rows[offset : offset + limit]
+
+    def get_clip_by_id(self, clip_id):
+        for clip in self._history + self._pinned:
+            if clip.get("id") == clip_id:
+                return dict(clip)
+        return None
+
+    def pin_clip(self, clip_id):
+        for idx, clip in enumerate(list(self._history)):
+            if clip.get("id") == clip_id:
+                pinned = dict(clip)
+                pinned["is_pinned"] = 1
+                self._history.pop(idx)
+                self._pinned.insert(0, pinned)
+                return True
+        return True
+
+    def unpin_clip(self, clip_id):
+        for idx, clip in enumerate(list(self._pinned)):
+            if clip.get("id") == clip_id:
+                history = dict(clip)
+                history["is_pinned"] = 0
+                history["group_name"] = ""
+                self._pinned.pop(idx)
+                self._history.insert(0, history)
+                return True
+        return True
+
+    def update_tag(self, clip_id, tag):
+        for clip in self._history + self._pinned:
+            if clip.get("id") == clip_id:
+                clip["tag"] = tag
+                return True
+        return False
+
+    def update_group(self, clip_id, group_name):
+        for clip in self._pinned:
+            if clip.get("id") == clip_id:
+                clip["group_name"] = group_name
+                return True
+        return False
+
+    def update_clip_content(self, clip_id, new_content):
+        for clip in self._history + self._pinned:
+            if clip.get("id") != clip_id and clip.get("content") == new_content:
+                raise ValueError("Clip content already exists.")
+        for clip in self._history + self._pinned:
+            if clip.get("id") == clip_id:
+                clip["content"] = new_content
+                return True
+        return False
 
     def trigger_daily_rebuild(self):
         pass
@@ -577,6 +641,112 @@ class KeyboardNavigationTests(unittest.TestCase):
         self.assertEqual(app.list_history.currentRow(), 0)
         cur_data = app.list_history.currentItem().data(Qt.ItemDataRole.UserRole)
         self.assertEqual(cur_data["id"], 99)
+        self.assertEqual(app.active_side, "history")
+
+        app.backup_scheduler.cancel()
+        app.close()
+        QApplication.processEvents()
+
+    def test_ui_open_resets_from_pinned_back_to_history(self):
+        _get_qapp()
+        app = _TestClientApp()
+        app.storage = _FakeStorage(
+            history=[{"id": 1, "type": "text", "content": "newest"}],
+            pinned=[{"id": 2, "type": "text", "content": "older pinned"}],
+        )
+        app.refresh_lists()
+        app.set_active_side("pinned")
+        app.list_pinned.setCurrentRow(0)
+
+        app.show_at_cursor()
+
+        self.assertEqual(app.active_side, "history")
+        self.assertEqual(app.list_history.currentRow(), 0)
+        app.backup_scheduler.cancel()
+        app.close()
+        QApplication.processEvents()
+
+    def test_history_group_action_auto_pins_clip(self):
+        _get_qapp()
+        app = _TestClientApp()
+        app.storage = _FakeStorage(
+            history=[{"id": 1, "type": "text", "content": "group me", "group_name": ""}],
+            pinned=[],
+        )
+        app.refresh_lists()
+
+        app.handle_set_group(1, "Work")
+
+        self.assertEqual(len(app.storage._history), 0)
+        self.assertEqual(app.storage._pinned[0]["group_name"], "Work")
+        self.assertEqual(app.active_side, "pinned")
+        app.backup_scheduler.cancel()
+        app.close()
+        QApplication.processEvents()
+
+    def test_history_tag_action_does_not_pin_clip(self):
+        _get_qapp()
+        app = _TestClientApp()
+        app.storage = _FakeStorage(
+            history=[{"id": 1, "type": "text", "content": "tag me", "tag": ""}],
+            pinned=[],
+        )
+        app.refresh_lists()
+
+        app.handle_add_tag(1, "todo")
+
+        self.assertEqual(app.storage._history[0]["tag"], "todo")
+        self.assertEqual(len(app.storage._pinned), 0)
+        app.backup_scheduler.cancel()
+        app.close()
+        QApplication.processEvents()
+
+    def test_expand_toggle_updates_row_widget_state(self):
+        _get_qapp()
+        app = _TestClientApp()
+        long_text = "\n".join([f"line {i}" for i in range(12)])
+        app.storage = _FakeStorage(
+            history=[{"id": 1, "type": "text", "content": long_text}],
+            pinned=[],
+        )
+        app.refresh_lists()
+        item = app.list_history.item(0)
+        widget = app.list_history.itemWidget(item)
+        self.assertEqual(widget.btn_expand.text(), "▼")
+        self.assertNotIn(1, app.browser.expanded_clip_ids)
+
+        app.handle_toggle_expand(1)
+        item = app.list_history.item(0)
+        widget = app.list_history.itemWidget(item)
+        self.assertEqual(widget.btn_expand.text(), "▲")
+        self.assertIn(1, app.browser.expanded_clip_ids)
+
+        app.handle_toggle_expand(1)
+        item = app.list_history.item(0)
+        widget = app.list_history.itemWidget(item)
+        self.assertEqual(widget.btn_expand.text(), "▼")
+        self.assertNotIn(1, app.browser.expanded_clip_ids)
+        app.backup_scheduler.cancel()
+        app.close()
+        QApplication.processEvents()
+
+    def test_fix_clip_updates_pinned_content_and_blocks_duplicates(self):
+        _get_qapp()
+        app = _TestClientApp()
+        app.storage = _FakeStorage(
+            history=[],
+            pinned=[
+                {"id": 1, "type": "text", "content": "old pinned", "group_name": ""},
+                {"id": 2, "type": "text", "content": "other pinned", "group_name": ""},
+            ],
+        )
+        app.refresh_lists()
+
+        app.handle_fix_clip(1, "new pinned")
+        self.assertEqual(app.storage._pinned[0]["content"], "new pinned")
+
+        with self.assertRaises(ValueError):
+            app.handle_fix_clip(1, "other pinned")
 
         app.backup_scheduler.cancel()
         app.close()

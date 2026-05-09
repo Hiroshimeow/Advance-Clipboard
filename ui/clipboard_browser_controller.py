@@ -22,6 +22,7 @@ class ClipboardBrowserController:
         # Group expansion state
         self.expanded_groups = set()
         self.group_headers = {}  # group_name -> QListWidgetItem
+        self.expanded_clip_ids = set()
 
         # UI state
         self.current_search_query = ""
@@ -47,6 +48,19 @@ class ClipboardBrowserController:
 
         # Ensure we have a valid selection in the active list
         self._ensure_current_item()
+        self._sync_selection_to_map()
+
+    def reset_for_hotkey_open(self, refresh=False):
+        """Reset transient UI state when user re-opens via hotkey."""
+        self.active_side = "history"
+        self.expanded_clip_ids.clear()
+        if refresh:
+            self.refresh_lists(maintain_selection=False)
+            return
+        self.set_active_side("history")
+        if self.app.list_history.count() > 0:
+            self.app.list_history.scrollToTop()
+        self._apply_default_selection()
         self._sync_selection_to_map()
 
     def set_active_side(self, side):
@@ -109,19 +123,17 @@ class ClipboardBrowserController:
 
     def _apply_default_selection(self):
         h_list = self.app.list_history
-        p_list = self.app.list_pinned
+        first_h = self._first_pasteable_row(h_list)
+        if first_h is not None:
+            h_list.setCurrentRow(first_h)
+            self.set_active_side("history")
+            return
 
-        # Priority 1: first pinned
+        p_list = self.app.list_pinned
         first_p = self._first_pasteable_row(p_list)
         if first_p is not None:
             p_list.setCurrentRow(first_p)
             self.set_active_side("pinned")
-        elif h_list.count() > 0:
-            # Priority 2: first history
-            first_h = self._first_pasteable_row(h_list)
-            if first_h is not None:
-                h_list.setCurrentRow(first_h)
-                self.set_active_side("history")
 
     def _select_with_fallback_rules(self, prev_clip_id=None, prev_row=-1, widget=None):
         """Apply selection fallback rules after a list refresh/filter."""
@@ -366,10 +378,18 @@ class ClipboardBrowserController:
                 # Add children
                 for c in clips:
                     child_item = QListWidgetItem(self.app.list_pinned)
-                    ui = ClipItemWidget(c, True, self.app, is_grouped=True)
+                    child_width = self.app.list_pinned.viewport().width() or 300
+                    ui = ClipItemWidget(
+                        c,
+                        True,
+                        self.app,
+                        is_grouped=True,
+                        expanded=c.get("id") in self.expanded_clip_ids,
+                        available_width=child_width,
+                    )
                     child_item.setSizeHint(
                         QSize(
-                            self.app.list_pinned.viewport().width() or 300, ui.height()
+                            child_width, ui.height()
                         )
                     )
                     child_item.setData(Qt.ItemDataRole.UserRole, c)
@@ -386,6 +406,7 @@ class ClipboardBrowserController:
 
     def remove_clip_from_ui(self, clip_id):
         """Optimistically remove a clip so delete feels instant."""
+        self.expanded_clip_ids.discard(clip_id)
         for list_widget in (self.app.list_history, self.app.list_pinned):
             for row in range(list_widget.count() - 1, -1, -1):
                 item = list_widget.item(row)
@@ -397,11 +418,28 @@ class ClipboardBrowserController:
                     if removed is not None:
                         del removed
 
+    def toggle_clip_expanded(self, clip_id):
+        if clip_id in self.expanded_clip_ids:
+            self.expanded_clip_ids.discard(clip_id)
+        else:
+            self.expanded_clip_ids.add(clip_id)
+
+    def reset_after_delete_refresh(self):
+        self._ensure_current_item()
+        self._sync_selection_to_map()
+
     def _append_items(self, list_widget, clips, is_pinned):
         width = list_widget.viewport().width() or ((self.app.width() // 2) - 25)
         for clip in clips:
             item = QListWidgetItem(list_widget)
-            ui = ClipItemWidget(clip, is_pinned, self.app)
+            is_expanded = clip.get("id") in self.expanded_clip_ids
+            ui = ClipItemWidget(
+                clip,
+                is_pinned,
+                self.app,
+                expanded=is_expanded,
+                available_width=width,
+            )
             item.setSizeHint(QSize(width, ui.height()))
             item.setData(Qt.ItemDataRole.UserRole, clip)
             list_widget.addItem(item)

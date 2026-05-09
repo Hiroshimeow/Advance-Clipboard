@@ -173,6 +173,12 @@ class ClipboardStorage:
             self._mark_dirty()
         return ok
 
+    def update_clip_content(self, clip_id: int, new_content: str) -> bool:
+        ok = self.clips.update_clip_content(clip_id, new_content)
+        if ok:
+            self._mark_dirty()
+        return ok
+
     def get_groups(self) -> List[str]:
         return self.clips.get_groups()
 
@@ -311,7 +317,10 @@ class ClipboardStorage:
             where_clauses.append("content LIKE ?")
             params.append(f"%{term}%")
         rows = conn.execute(
-            f"SELECT * FROM clips WHERE {' AND '.join(where_clauses)} ORDER BY updated_at DESC LIMIT ?",
+            f"""SELECT * FROM clips
+                WHERE ({' AND '.join(where_clauses)})
+                  AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
+                ORDER BY updated_at DESC LIMIT ?""",
             params + [limit],
         ).fetchall()
         return [dict(r) for r in rows]
@@ -326,7 +335,9 @@ class ClipboardStorage:
     def _get_all_history_for_search(self) -> List[Dict[str, Any]]:
         conn = get_connection()
         rows = conn.execute(
-            "SELECT * FROM clips WHERE is_pinned = 0 ORDER BY updated_at DESC"
+            """SELECT * FROM clips
+               WHERE is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at)
+               ORDER BY updated_at DESC"""
         ).fetchall()
         return [dict(r) for r in rows]
 

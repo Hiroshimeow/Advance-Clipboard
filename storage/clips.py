@@ -1,6 +1,6 @@
-import sqlite3
 import hashlib
-from datetime import datetime
+import sqlite3
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 from .db import get_connection, transaction
 
@@ -27,11 +27,20 @@ class ClipRepository:
         with transaction() as conn:
             # Check for duplicate
             existing = conn.execute(
-                "SELECT id, is_pinned FROM clips WHERE hash = ?", (content_hash,)
+                "SELECT id, is_pinned, updated_at FROM clips WHERE hash = ?",
+                (content_hash,),
             ).fetchone()
 
             if existing:
                 # Duplicate found - update timestamp to push to top
+                current_updated_at = existing["updated_at"]
+                if current_updated_at:
+                    try:
+                        current_dt = datetime.fromisoformat(current_updated_at)
+                        if datetime.fromisoformat(now) <= current_dt:
+                            now = (current_dt + timedelta(microseconds=1)).isoformat()
+                    except ValueError:
+                        pass
                 conn.execute(
                     "UPDATE clips SET updated_at = ? WHERE id = ?",
                     (now, existing["id"]),
@@ -40,8 +49,8 @@ class ClipRepository:
 
             # New clip - insert
             cursor = conn.execute(
-                """INSERT INTO clips (type, content, hash, tag, is_pinned, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, 0, ?, ?)""",
+                """INSERT INTO clips (type, content, hash, tag, is_pinned, pinned_at, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, 0, NULL, ?, ?)""",
                 (clip_type, content, content_hash, tag, now, now),
             )
             new_id = cursor.lastrowid if cursor.lastrowid else 0
@@ -57,8 +66,8 @@ class ClipRepository:
             ).fetchone()[0]
 
             conn.execute(
-                "UPDATE clips SET is_pinned = 1, pin_order = ?, updated_at = ? WHERE id = ?",
-                (max_order + 1, now, clip_id),
+                "UPDATE clips SET is_pinned = 1, pin_order = ?, pinned_at = ?, updated_at = ? WHERE id = ?",
+                (max_order + 1, now, now, clip_id),
             )
             return True
 
@@ -67,7 +76,7 @@ class ClipRepository:
         now = datetime.now().isoformat()
         with transaction() as conn:
             conn.execute(
-                "UPDATE clips SET is_pinned = 0, pin_order = 0, updated_at = ? WHERE id = ?",
+                "UPDATE clips SET is_pinned = 0, pin_order = 0, pinned_at = NULL, updated_at = ? WHERE id = ?",
                 (now, clip_id),
             )
             return True
@@ -89,6 +98,23 @@ class ClipRepository:
         with transaction() as conn:
             conn.execute(
                 "UPDATE clips SET group_name = ? WHERE id = ?", (group_name, clip_id)
+            )
+            return True
+
+    def update_clip_content(self, clip_id: int, new_content: str) -> bool:
+        """Update clip content while keeping dedupe guarantees."""
+        content_hash = compute_hash(new_content)
+        now = datetime.now().isoformat()
+        with transaction() as conn:
+            existing = conn.execute(
+                "SELECT id FROM clips WHERE hash = ? AND id != ?",
+                (content_hash, clip_id),
+            ).fetchone()
+            if existing:
+                raise ValueError("Clip content already exists.")
+            conn.execute(
+                "UPDATE clips SET content = ?, hash = ?, updated_at = ? WHERE id = ?",
+                (new_content, content_hash, now, clip_id),
             )
             return True
 
@@ -197,8 +223,9 @@ class ClipRepository:
         """Get history clips with pagination."""
         conn = get_connection()
         rows = conn.execute(
-            """SELECT id, type, content, hash, tag, created_at, updated_at
+            """SELECT id, type, content, hash, tag, group_name, pinned_at, created_at, updated_at
                FROM clips
+               WHERE is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at)
                ORDER BY updated_at DESC
                LIMIT ? OFFSET ?""",
             (limit, offset),
@@ -209,7 +236,7 @@ class ClipRepository:
         """Get pinned clips with pagination."""
         conn = get_connection()
         rows = conn.execute(
-            """SELECT id, type, content, hash, tag, group_name, created_at, updated_at
+            """SELECT id, type, content, hash, tag, group_name, pinned_at, created_at, updated_at
                FROM clips WHERE is_pinned = 1
                ORDER BY pin_order DESC
                LIMIT ? OFFSET ?""",
@@ -243,7 +270,8 @@ class ClipRepository:
         """Get total count of history clips."""
         conn = get_connection()
         return conn.execute(
-            "SELECT COUNT(*) FROM clips WHERE is_pinned = 0"
+            """SELECT COUNT(*) FROM clips
+               WHERE is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at)"""
         ).fetchone()[0]
 
     def get_pinned_count(self) -> int:

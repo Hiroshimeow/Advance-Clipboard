@@ -213,7 +213,8 @@ class ClientApp(QWidget):
         # Trigger daily RAG index rebuild in background (non-blocking)
         # If already rebuilt today, skips instantly. Otherwise builds in ~10s background.
         # Search works immediately with lexical-only fallback while index builds.
-        self.storage.trigger_daily_rebuild()
+        if os.getenv("ADV_CLIP_DISABLE_RAG_REBUILD") != "1":
+            self.storage.trigger_daily_rebuild()
 
         # Qt clipboard object — used to READ clipboard content only
         self.clipboard = QApplication.clipboard()
@@ -493,6 +494,7 @@ class ClientApp(QWidget):
 
     def refresh_lists(self, force_reset_selection=False):
         self.browser.refresh_lists(maintain_selection=not force_reset_selection)
+        self.is_ui_dirty = False
 
     def refresh_pinned_list(self):
         self.browser.refresh_pinned_list()
@@ -529,7 +531,6 @@ class ClientApp(QWidget):
                 )
             except:
                 pass
-        self.browser.active_side = "history"
         cp = QCursor.pos()
         w, h = self.width(), self.height()
         sc = QGuiApplication.screenAt(cp) or QGuiApplication.primaryScreen()
@@ -559,7 +560,14 @@ class ClientApp(QWidget):
         self.activateWindow()
         self.search_input.setFocus()
         self.search_input.setCursorPosition(len(self.search_input.text()))
-        self._on_ui_opened()
+        if self.is_ui_dirty:
+            self.browser.active_side = "history"
+            self.browser.expanded_clip_ids.clear()
+            self.list_history.setCurrentRow(-1)
+            self.list_pinned.setCurrentRow(-1)
+        else:
+            self.browser.reset_for_hotkey_open(refresh=False)
+            self._on_ui_opened()
         if self.is_ui_dirty:
             QTimer.singleShot(25, self._refresh_after_show)
 
@@ -567,7 +575,11 @@ class ClientApp(QWidget):
         if not self.isVisible() or not self.is_ui_dirty:
             return
         self.browser.active_side = "history"
+        self.browser.expanded_clip_ids.clear()
         self.browser.refresh_lists(maintain_selection=False)
+        if self.list_history.count() > 0:
+            self.list_history.scrollToTop()
+            self.list_history.setCurrentRow(0)
         self.is_ui_dirty = False
         self._on_ui_opened()
 
@@ -1196,7 +1208,7 @@ class ClientApp(QWidget):
             self.storage.pin_clip(clip_id)
         else:
             self.storage.unpin_clip(clip_id)
-        self.refresh_lists()
+        self.refresh_lists(force_reset_selection=True)
 
     def handle_add_tag(self, clip_id, tag):
         """Update tag for a clip."""
@@ -1205,7 +1217,24 @@ class ClientApp(QWidget):
 
     def handle_set_group(self, clip_id, group_name):
         """Set group for a clip."""
+        clip = self.storage.get_clip_by_id(clip_id)
+        if clip and not clip.get("is_pinned"):
+            self.storage.pin_clip(clip_id)
         self.storage.update_group(clip_id, group_name)
+        self.browser.active_side = "pinned"
+        self.refresh_lists(force_reset_selection=True)
+
+    def handle_toggle_expand(self, clip_id):
+        self.browser.toggle_clip_expanded(clip_id)
+        self.refresh_lists()
+
+    def handle_fix_clip(self, clip_id, new_content):
+        if not new_content:
+            raise ValueError("Clip content cannot be empty.")
+        if not new_content.strip():
+            raise ValueError("Clip content cannot be blank.")
+        self.storage.update_clip_content(clip_id, new_content)
+        self.browser.active_side = "pinned"
         self.refresh_lists()
 
     def handle_delete(self, clip_id):
@@ -1216,6 +1245,7 @@ class ClientApp(QWidget):
     def _delete_clip_backend(self, clip_id):
         self.storage.delete_clip(clip_id)
         self.refresh_lists()
+        self.browser.reset_after_delete_refresh()
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key.Key_Escape:

@@ -45,6 +45,7 @@ def init_db():
                 group_name TEXT DEFAULT '',
                 is_pinned INTEGER DEFAULT 0,
                 pin_order INTEGER DEFAULT 0,
+                pinned_at TEXT DEFAULT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -55,6 +56,15 @@ def init_db():
             conn.execute("ALTER TABLE clips ADD COLUMN group_name TEXT DEFAULT ''")
         except sqlite3.OperationalError:
             pass
+
+        try:
+            conn.execute("ALTER TABLE clips ADD COLUMN pinned_at TEXT DEFAULT NULL")
+        except sqlite3.OperationalError:
+            pass
+
+        conn.execute(
+            "UPDATE clips SET pinned_at = updated_at WHERE is_pinned = 1 AND pinned_at IS NULL"
+        )
 
         # Create indexes
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hash ON clips(hash)")

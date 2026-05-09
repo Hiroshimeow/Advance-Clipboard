@@ -1,3 +1,4 @@
+import math
 import os
 
 from PyQt6.QtCore import Qt, QTimer, QPoint, QSize
@@ -11,6 +12,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QMenu,
+    QPlainTextEdit,
     QPushButton,
     QSizePolicy,
     QVBoxLayout,
@@ -25,6 +27,33 @@ MAX_DISPLAY_CHARS = 300
 THUMB_SIZE = QSize(80, 60)
 PAGE_SIZE_HISTORY = 20
 PAGE_SIZE_PINNED = 50
+TEXT_FONT = QFont("Segoe UI", 10)
+TAG_FONT = QFont("Segoe UI", 7)
+COLLAPSED_MAX_LINES = 4
+EXPANDED_MAX_LINES = 10
+ROW_VERTICAL_PADDING = 10
+
+
+def _measure_text_lines(text: str, font: QFont, width: int) -> tuple[int, int]:
+    metrics = QFontMetrics(font)
+    wrap_width = max(40, width)
+    rect = metrics.boundingRect(
+        0,
+        0,
+        wrap_width,
+        10000,
+        int(Qt.TextFlag.TextWordWrap | Qt.TextFlag.TextExpandTabs),
+        text,
+    )
+    line_height = metrics.lineSpacing()
+    rendered_lines = max(1, math.ceil(max(rect.height(), line_height) / line_height))
+    return rendered_lines, line_height
+
+
+def _visible_text_height(text: str, font: QFont, width: int, max_lines: int) -> tuple[int, int]:
+    rendered_lines, line_height = _measure_text_lines(text, font, width)
+    visible_lines = min(rendered_lines, max_lines)
+    return rendered_lines, (visible_lines * line_height) + 6
 
 
 class SmoothListWidget(QListWidget):
@@ -123,6 +152,81 @@ class SearchLineEdit(QLineEdit):
         super().keyPressEvent(event)
 
 
+class ClipEditPopup(QWidget):
+    def __init__(self, clip_data, parent_list=None, parent=None):
+        super().__init__(parent)
+        self.clip_data = clip_data
+        self.parent_list = parent_list
+        self.clip_id = clip_data.get("id")
+        self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.resize(520, 320)
+        self.setStyleSheet("""
+            QWidget { background: #1f1f1f; color: #e0e0e0; }
+            QLabel { color: #d18616; font-size: 9pt; font-weight: bold; }
+            QPlainTextEdit {
+                background: #2a2a2a;
+                border: 1px solid #444;
+                color: #f0f0f0;
+                selection-background-color: #aa8030;
+                font: 10pt 'Segoe UI';
+            }
+            QPushButton {
+                background: #333;
+                color: #eee;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 4px 10px;
+            }
+            QPushButton:hover { border-color: #aa8030; }
+            QPushButton#saveButton {
+                background: #aa8030;
+                border-color: #aa8030;
+                color: white;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        title = QLabel("Fix pinned clip")
+        layout.addWidget(title)
+
+        self.editor = QPlainTextEdit(self)
+        self.editor.setPlainText(str(clip_data.get("content", "")))
+        layout.addWidget(self.editor, stretch=1)
+
+        self.lbl_error = QLabel("")
+        self.lbl_error.setStyleSheet("color: #e57373; font-size: 8pt; font-weight: normal;")
+        self.lbl_error.hide()
+        layout.addWidget(self.lbl_error)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        btn_cancel = QPushButton("Cancel", self)
+        btn_cancel.clicked.connect(self.close)
+        buttons.addWidget(btn_cancel)
+        btn_save = QPushButton("Save", self)
+        btn_save.setObjectName("saveButton")
+        btn_save.clicked.connect(self._save)
+        buttons.addWidget(btn_save)
+        layout.addLayout(buttons)
+
+    def _save(self):
+        if not self.parent_list or not self.clip_id:
+            self.close()
+            return
+        new_content = self.editor.toPlainText()
+        try:
+            self.parent_list.handle_fix_clip(self.clip_id, new_content)
+        except ValueError as exc:
+            self.lbl_error.setText(str(exc))
+            self.lbl_error.show()
+            return
+        self.close()
+
+
 class GroupHeaderWidget(QWidget):
     """Header for a group of clips - click to toggle expand/collapse."""
 
@@ -196,13 +300,23 @@ class GroupHeaderWidget(QWidget):
 
 
 class ClipItemWidget(QWidget):
-    def __init__(self, item_data, is_pinned=False, parent_list=None, is_grouped=False):
+    def __init__(
+        self,
+        item_data,
+        is_pinned=False,
+        parent_list=None,
+        is_grouped=False,
+        expanded=False,
+        available_width=300,
+    ):
         super().__init__()
         self.item_data = item_data
         self.clip_id = item_data.get("id")
         self.is_pinned = is_pinned
         self.parent_list = parent_list
         self.is_grouped = is_grouped
+        self.expanded = expanded
+        self.available_width = max(240, int(available_width))
         self.line_count = (
             len(self.item_data["content"].splitlines())
             if self.item_data["type"] == "text"
@@ -216,25 +330,39 @@ class ClipItemWidget(QWidget):
         self.content_container = QWidget()
         self.content_layout = QGridLayout(self.content_container)
         self.content_layout.setContentsMargins(0, 0, 0, 0)
-        self.content_layout.setSpacing(0)
+        self.content_layout.setSpacing(4)
 
         if self.item_data["type"] == "text":
             text = self.item_data["content"]
-            display_text = (
-                text[:MAX_DISPLAY_CHARS] + "..."
-                if len(text) > MAX_DISPLAY_CHARS
-                else text
+            display_text = text
+            if not self.expanded and len(text) > MAX_DISPLAY_CHARS:
+                display_text = text[:MAX_DISPLAY_CHARS] + "..."
+            text_width = max(150, self.available_width - 110 - (15 if is_grouped else 0))
+            self.rendered_lines, text_h = _visible_text_height(
+                display_text,
+                TEXT_FONT,
+                text_width,
+                EXPANDED_MAX_LINES if self.expanded else COLLAPSED_MAX_LINES,
             )
-            self.lbl_content = QLabel(display_text)
-            self.lbl_content.setStyleSheet("color: #e0e0e0; background: transparent;")
-            font = QFont("Segoe UI", 11)
-            self.lbl_content.setFont(font)
-            self.lbl_content.setWordWrap(True)
-            self.lbl_content.setAlignment(Qt.AlignmentFlag.AlignTop)
-            fm = QFontMetrics(font)
-            line_h = fm.lineSpacing()
-            max_lines = 2 if self.is_pinned else 3
-            text_h = (line_h * max_lines) + 12
+            if self.expanded and self.rendered_lines > EXPANDED_MAX_LINES:
+                self.lbl_content = QPlainTextEdit(self)
+                self.lbl_content.setPlainText(display_text)
+                self.lbl_content.setReadOnly(True)
+                self.lbl_content.setFrameStyle(QFrame.Shape.NoFrame)
+                self.lbl_content.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+                self.lbl_content.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                self.lbl_content.setStyleSheet(
+                    "QPlainTextEdit { color: #e0e0e0; background: transparent; padding: 0px; }"
+                )
+                self.lbl_content.setFont(TEXT_FONT)
+            else:
+                self.lbl_content = QLabel(display_text)
+                self.lbl_content.setStyleSheet("color: #e0e0e0; background: transparent;")
+                self.lbl_content.setFont(TEXT_FONT)
+                self.lbl_content.setWordWrap(True)
+                self.lbl_content.setAlignment(
+                    Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
+                )
             self.lbl_content.setFixedHeight(text_h)
             self.content_layout.addWidget(self.lbl_content, 0, 0)
             self.display_height = text_h
@@ -272,16 +400,17 @@ class ClipItemWidget(QWidget):
             self.lbl_tag.setStyleSheet("""
                 QLabel {
                     color: #d18616;
-                    font-size: 8pt;
+                    font-size: 7pt;
                     font-style: italic;
                     font-weight: normal;
                     background: rgba(209, 134, 22, 0.15);
                     border-radius: 3px;
-                    padding: 1px 6px;
+                    padding: 1px 5px;
                     margin: 0px;
                 }
             """)
-            tag_font = QFont("Segoe UI", 8)
+            tag_font = TAG_FONT
+            self.lbl_tag.setFont(tag_font)
             tag_fm = QFontMetrics(tag_font)
             self.tag_height = tag_fm.height() + 6
             self.lbl_tag.setFixedHeight(self.tag_height)
@@ -319,16 +448,15 @@ class ClipItemWidget(QWidget):
             style_lines,
             self.show_line_info,
         )
-        self.btn_up = create_badge_btn(
-            "▲", "Di chuyển lên", style_arrow, self.on_up_clicked, 14
-        )
-        self.btn_down = create_badge_btn(
-            "▼", "Di chuyển xuống", style_arrow, self.on_down_clicked, 14
+        expand_symbol = "▲" if self.expanded else "▼"
+        expand_tooltip = "Collapse" if self.expanded else "Expand"
+        self.btn_expand = create_badge_btn(
+            expand_symbol, expand_tooltip, style_arrow, self.on_expand_clicked, 14
         )
 
         self.btn_v_layout.addWidget(self.btn_lines)
-        self.btn_v_layout.addWidget(self.btn_up)
-        self.btn_v_layout.addWidget(self.btn_down)
+        if self.item_data["type"] == "text":
+            self.btn_v_layout.addWidget(self.btn_expand)
         self.btn_v_layout.addStretch()
 
         row_span = 2 if self.has_tag else 1
@@ -377,20 +505,16 @@ class ClipItemWidget(QWidget):
 
         min_widget_h = 35 if self.is_pinned else 60
         total_h = self.display_height + self.tag_height
-        self.setFixedHeight(max(total_h, min_widget_h) + 10)
+        self.setFixedHeight(max(total_h, min_widget_h) + ROW_VERTICAL_PADDING)
 
     def show_line_info(self):
         self.popup = LineInfoPopup(self.line_count)
         p = self.btn_lines.mapToGlobal(QPoint(0, 0))
         self.popup.show_at(QPoint(p.x() - self.popup.width() - 5, p.y()))
 
-    def on_up_clicked(self):
+    def on_expand_clicked(self):
         if self.parent_list and self.clip_id:
-            self.parent_list.handle_move(self.clip_id, -1, self.is_pinned)
-
-    def on_down_clicked(self):
-        if self.parent_list and self.clip_id:
-            self.parent_list.handle_move(self.clip_id, 1, self.is_pinned)
+            self.parent_list.handle_toggle_expand(self.clip_id)
 
     def on_copy_clicked(self):
         if self.parent_list:
@@ -411,24 +535,26 @@ class ClipItemWidget(QWidget):
             QMenu::item:selected { background-color: #d18616; color: white; }
         """)
 
-        if self.is_pinned:
-            group_menu = menu.addMenu("📁 Add to Group")
-            if self.parent_list:
-                groups = self.parent_list.storage.get_groups()
-                for g in groups:
-                    act = group_menu.addAction(g)
-                    act.setData(("group", g))
-                if groups:
-                    group_menu.addSeparator()
-                new_group_act = group_menu.addAction("➕ New Group...")
-                new_group_act.setData(("new_group", None))
-                current_group = self.item_data.get("group_name", "")
-                if current_group:
-                    remove_act = menu.addAction(f"❌ Remove from '{current_group}'")
-                    remove_act.setData(("remove_group", None))
-                menu.addSeparator()
-            add_tag_act = menu.addAction("🏷️ Add Tag")
-            add_tag_act.setData(("tag", None))
+        group_menu = menu.addMenu("📁 Add to Group")
+        if self.parent_list:
+            groups = self.parent_list.storage.get_groups()
+            for g in groups:
+                act = group_menu.addAction(g)
+                act.setData(("group", g))
+            if groups:
+                group_menu.addSeparator()
+            new_group_act = group_menu.addAction("➕ New Group...")
+            new_group_act.setData(("new_group", None))
+            current_group = self.item_data.get("group_name", "")
+            if current_group:
+                remove_act = menu.addAction(f"❌ Remove from '{current_group}'")
+                remove_act.setData(("remove_group", None))
+            menu.addSeparator()
+        add_tag_act = menu.addAction("🏷️ Add Tag")
+        add_tag_act.setData(("tag", None))
+        if self.is_pinned and self.item_data.get("type") == "text":
+            fix_act = menu.addAction("🛠 Fix")
+            fix_act.setData(("fix", None))
 
         action = menu.exec(self.mapToGlobal(event.pos()))
         if action:
@@ -443,6 +569,8 @@ class ClipItemWidget(QWidget):
                     self.on_new_group()
                 elif action_type == "remove_group":
                     self.on_set_group("")
+                elif action_type == "fix":
+                    self.on_fix_clip()
 
     def on_add_tag(self):
         current_tag = self.item_data.get("tag", "")
@@ -460,3 +588,10 @@ class ClipItemWidget(QWidget):
         group_name, ok = QInputDialog.getText(self, "New Group", "Enter group name:")
         if ok and group_name.strip() and self.clip_id and self.parent_list:
             self.parent_list.handle_set_group(self.clip_id, group_name.strip())
+
+    def on_fix_clip(self):
+        if not self.parent_list or not self.clip_id:
+            return
+        self.edit_popup = ClipEditPopup(self.item_data, self.parent_list, self)
+        self.edit_popup.move(self.mapToGlobal(QPoint(10, 10)))
+        self.edit_popup.show()
