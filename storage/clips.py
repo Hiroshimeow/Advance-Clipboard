@@ -106,15 +106,25 @@ class ClipRepository:
         content_hash = compute_hash(new_content)
         now = datetime.now().isoformat()
         with transaction() as conn:
+            clip = conn.execute(
+                "SELECT is_pinned, pinned_at, updated_at FROM clips WHERE id = ?",
+                (clip_id,),
+            ).fetchone()
+            if not clip:
+                return False
             existing = conn.execute(
                 "SELECT id FROM clips WHERE hash = ? AND id != ?",
                 (content_hash, clip_id),
             ).fetchone()
             if existing:
                 raise ValueError("Clip content already exists.")
+            updated_at = now
+            if clip["is_pinned"]:
+                # Keep current history visibility semantics for pinned edits.
+                updated_at = clip["updated_at"] or now
             conn.execute(
                 "UPDATE clips SET content = ?, hash = ?, updated_at = ? WHERE id = ?",
-                (new_content, content_hash, now, clip_id),
+                (new_content, content_hash, updated_at, clip_id),
             )
             return True
 

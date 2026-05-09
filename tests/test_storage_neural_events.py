@@ -142,6 +142,21 @@ class StorageNeuralEventTests(unittest.TestCase):
         clip = self.storage.get_clip_by_id(first_id)
         self.assertEqual(clip["content"], "first content")
 
+    def test_update_pinned_clip_content_keeps_hidden_pin_out_of_history(self):
+        clip_id, _ = self.storage.add_clip("text", "edit me")
+        self.storage.pin_clip(clip_id)
+
+        before = self.storage.get_clip_by_id(clip_id)
+        self.assertEqual(before["updated_at"], before["pinned_at"])
+
+        self.storage.update_clip_content(clip_id, "edit me updated")
+
+        after = self.storage.get_clip_by_id(clip_id)
+        self.assertEqual(after["content"], "edit me updated")
+        self.assertEqual(after["updated_at"], before["updated_at"])
+        history_ids = [clip["id"] for clip in self.storage.get_history()]
+        self.assertNotIn(clip_id, history_ids)
+
     def test_pin_and_unpin_emit_priority_event(self):
         clip_id, _ = self.storage.add_clip("text", "pin me")
         self.callback.reset_mock()
