@@ -12,6 +12,7 @@ from __future__ import annotations
 import ctypes as _ctypes
 import logging
 import sys
+from collections.abc import Callable
 from typing import Any
 
 from core.clipboard_monitor import VK_CONTROL, VK_MENU, simulate_paste
@@ -22,8 +23,15 @@ SW_RESTORE = 9
 class PasteService:
     """Coordinate Windows focus restoration and keyboard paste injection."""
 
-    def __init__(self, *, ctypes_module: Any = _ctypes, logger: logging.Logger | None = None):
+    def __init__(
+        self,
+        *,
+        ctypes_module: Any = _ctypes,
+        paste_func: Callable[[], None] = simulate_paste,
+        logger: logging.Logger | None = None,
+    ):
         self.ctypes = ctypes_module
+        self.paste_func = paste_func
         self.logger = logger or logging.getLogger(__name__)
 
     def ready_to_paste(self, target_hwnd) -> bool:
@@ -96,6 +104,6 @@ class PasteService:
             return False
 
     def perform_keyboard_paste(self, target_hwnd=None) -> None:
-        """Inject Ctrl+V after the UI layer has prepared the clipboard payload."""
+        """Inject Ctrl+V. Caller must ensure the target window is focused first."""
         self.logger.info("perform_keyboard_paste target_hwnd=%s", target_hwnd)
-        simulate_paste()
+        self.paste_func()
