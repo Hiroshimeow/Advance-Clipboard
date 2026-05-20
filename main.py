@@ -96,15 +96,21 @@ FAULT_LOG_FILE = os.path.join(LOG_DIR, "Advance Clipboard.fault.log")
 
 UI_EDGE_MARGIN = 150  # Minimum distance from screen edges
 
-# Ensure image directory exists
-if not os.path.exists(IMAGE_DIR):
-    os.makedirs(IMAGE_DIR)
-if not os.path.exists(LOG_DIR):
-    os.makedirs(LOG_DIR)
-
-
 logger = logging.getLogger("advance_clipboard")
-if not logger.handlers:
+_fault_log_handle = None
+
+
+def ensure_runtime_dirs() -> None:
+    """Create app runtime directories when runtime code actually needs them."""
+    os.makedirs(IMAGE_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+
+def configure_logging() -> None:
+    """Configure file logging without doing it as an import-time side effect."""
+    ensure_runtime_dirs()
+    if logger.handlers:
+        return
     logger.setLevel(logging.INFO)
     file_handler = logging.FileHandler(DEBUG_LOG_FILE, encoding="utf-8")
     file_handler.setFormatter(
@@ -114,11 +120,29 @@ if not logger.handlers:
     logger.propagate = False
 
 
-_fault_log_handle = open(FAULT_LOG_FILE, "a", encoding="utf-8")
-faulthandler.enable(_fault_log_handle, all_threads=True)
+def enable_fault_logging() -> None:
+    """Open the fault log only during explicit runtime bootstrap."""
+    global _fault_log_handle
+    ensure_runtime_dirs()
+    if _fault_log_handle is not None:
+        return
+    _fault_log_handle = open(FAULT_LOG_FILE, "a", encoding="utf-8")
+    faulthandler.enable(_fault_log_handle, all_threads=True)
+
+
+def configure_exception_hooks() -> None:
+    sys.excepthook = _log_unhandled_exception
+    threading.excepthook = _log_thread_exception
+
+
+def configure_runtime() -> None:
+    configure_logging()
+    enable_fault_logging()
+    configure_exception_hooks()
 
 
 def _log_unhandled_exception(exc_type, exc_value, exc_tb):
+    configure_logging()
     logger.critical(
         "Unhandled exception:\n%s",
         "".join(traceback.format_exception(exc_type, exc_value, exc_tb)),
@@ -127,6 +151,7 @@ def _log_unhandled_exception(exc_type, exc_value, exc_tb):
 
 
 def _log_thread_exception(args):
+    configure_logging()
     logger.critical(
         "Unhandled thread exception in %s:\n%s",
         getattr(args.thread, "name", "unknown-thread"),
@@ -136,10 +161,6 @@ def _log_thread_exception(args):
             )
         ),
     )
-
-
-sys.excepthook = _log_unhandled_exception
-threading.excepthook = _log_thread_exception
 
 
 class ClientApp(QWidget):
@@ -153,6 +174,7 @@ class ClientApp(QWidget):
         init_data: bool = True,
         enable_background_jobs: bool = True,
     ):
+        configure_logging()
         super().__init__()
         # SQLite storage - single source of truth
         self.storage = get_storage()
@@ -1244,6 +1266,7 @@ class ClientApp(QWidget):
             self._schedule_hidden_ui_refresh()
 
     def save_image_if_new(self, img):
+        ensure_runtime_dirs()
         fn = self._image_storage_name(img)
         fp = os.path.join(IMAGE_DIR, fn)
         if not os.path.exists(fp):
@@ -1344,6 +1367,7 @@ def main():
         print("Indexing complete.")
         sys.exit(0)
 
+    configure_runtime()
     logger.info("main_start pid=%s", os.getpid())
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
@@ -1365,7 +1389,8 @@ def main():
     window = ClientApp()
     exit_code = app.exec()
     logger.info("main_exit exit_code=%s", exit_code)
-    _fault_log_handle.flush()
+    if _fault_log_handle is not None:
+        _fault_log_handle.flush()
     sys.exit(exit_code)
 
 
