@@ -53,6 +53,22 @@ Full discovery currently includes GUI/neural/manual-style coverage and may excee
 | App hidden mode via `.vbs`          | Runs without visible console                   |
 | Debug mode via `.bat`               | Console visible for troubleshooting            |
 
+## Secret scanning
+
+Run secret scans against source files only. Exclude virtual environments and dependency caches:
+
+```powershell
+git ls-files | Select-String -NotMatch "^\.venv/|^dist/|^build/"
+```
+
+If using an external scanner, configure excludes for:
+
+- `.venv/`
+- `dist/`
+- `build/`
+- `__pycache__/`
+- dependency caches
+
 ## Known limitations
 
 - Some focus behavior is Windows/app dependent.
