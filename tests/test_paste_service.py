@@ -13,6 +13,8 @@ class _FakeUser32:
         self.alt_down = False
         self.invalid_windows = set()
         self.iconic_windows = set()
+        self.set_foreground_succeeds = True
+        self.attach_thread_succeeds = True
         self.calls = []
 
     def GetAsyncKeyState(self, key):
@@ -46,7 +48,7 @@ class _FakeUser32:
 
     def AttachThreadInput(self, source_thread, target_thread, attach):
         self.calls.append(("AttachThreadInput", source_thread, target_thread, attach))
-        return True
+        return self.attach_thread_succeeds
 
     def BringWindowToTop(self, hwnd):
         self.calls.append(("BringWindowToTop", hwnd))
@@ -54,8 +56,9 @@ class _FakeUser32:
 
     def SetForegroundWindow(self, hwnd):
         self.calls.append(("SetForegroundWindow", hwnd))
-        self.foreground = hwnd
-        return True
+        if self.set_foreground_succeeds:
+            self.foreground = hwnd
+        return self.set_foreground_succeeds
 
     def SetFocus(self, hwnd):
         self.calls.append(("SetFocus", hwnd))
@@ -124,6 +127,29 @@ class PasteServiceTests(unittest.TestCase):
             self.assertTrue(service.restore_target_focus(200))
 
         self.assertIn(("ShowWindow", 200, 9), user32.calls)
+
+    def test_restore_target_focus_returns_false_when_foreground_does_not_change(self):
+        user32 = _FakeUser32()
+        user32.set_foreground_succeeds = False
+        service = PasteService(ctypes_module=_FakeCtypes(user32), paste_func=lambda: None)
+
+        with patch.object(sys, "platform", "win32"):
+            self.assertFalse(service.restore_target_focus(200))
+
+        self.assertIn(("SetForegroundWindow", 200), user32.calls)
+        self.assertNotEqual(user32.foreground, 200)
+
+    def test_restore_target_focus_returns_false_on_win32_exception(self):
+        user32 = _FakeUser32()
+
+        def boom(hwnd):
+            raise OSError("boom")
+
+        user32.SetForegroundWindow = boom
+        service = PasteService(ctypes_module=_FakeCtypes(user32), paste_func=lambda: None)
+
+        with patch.object(sys, "platform", "win32"):
+            self.assertFalse(service.restore_target_focus(200))
 
     def test_perform_keyboard_paste_calls_injected_paste_func(self):
         calls = []
