@@ -10,7 +10,11 @@ $env:PYTHONPATH=$null
 $env:QT_QPA_PLATFORM='offscreen'
 ```
 
-## Fast validation
+## Test tiers
+
+### Fast automated validation
+
+Use this before each code commit:
 
 ```powershell
 .\.venv\Scripts\python.exe -m compileall main.py core\paste_service.py core\clipboard_monitor.py
@@ -18,11 +22,19 @@ $env:QT_QPA_PLATFORM='offscreen'
 .\.venv\Scripts\python.exe -m unittest tests.test_keyboard_navigation.KeyboardNavigationTests.test_ready_to_paste_restores_last_active_window_before_ctrl_v
 ```
 
-## Full test suite
+### Full discovery
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
+
+Full discovery currently includes GUI/neural/manual-style coverage and may exceed fast-validation time in headless environments. If this exceeds the local timeout, run test files individually and classify failures as unit, GUI/offscreen, neural/integration, or manual smoke coverage.
+
+### Known slow/manual areas
+
+- `tests/test_neural_show.py` opens the neural map UI and calls the Qt event loop at import time; it is a manual smoke/demo script, not a safe default unittest module.
+- Neural map display tests may require GUI/WebEngine behavior.
+- Screenshot/demo tests are closer to manual smoke validation than fast unit coverage.
 
 ## Manual Windows smoke test matrix
 
