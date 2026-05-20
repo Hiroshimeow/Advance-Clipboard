@@ -146,7 +146,13 @@ class ClientApp(QWidget):
     _neural_graph_loaded = pyqtSignal(int, list, list)
     _neural_graph_failed = pyqtSignal(int, str)
 
-    def __init__(self, *, enable_monitor: bool = True, init_data: bool = True):
+    def __init__(
+        self,
+        *,
+        enable_monitor: bool = True,
+        init_data: bool = True,
+        enable_background_jobs: bool = True,
+    ):
         super().__init__()
         # SQLite storage - single source of truth
         self.storage = get_storage()
@@ -209,7 +215,7 @@ class ClientApp(QWidget):
         # Trigger daily RAG index rebuild in background (non-blocking)
         # If already rebuilt today, skips instantly. Otherwise builds in ~10s background.
         # Search works immediately with lexical-only fallback while index builds.
-        if os.getenv("ADV_CLIP_DISABLE_RAG_REBUILD") != "1":
+        if enable_background_jobs and os.getenv("ADV_CLIP_DISABLE_RAG_REBUILD") != "1":
             self.storage.trigger_daily_rebuild()
 
         # Qt clipboard object — used to READ clipboard content only

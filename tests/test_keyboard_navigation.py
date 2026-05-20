@@ -159,7 +159,11 @@ def _wait_until(predicate, timeout_ms: int = 1200):
 
 class _TestClientApp(ClientApp):
     def __init__(self):
-        super().__init__(enable_monitor=False, init_data=False)
+        super().__init__(
+            enable_monitor=False,
+            init_data=False,
+            enable_background_jobs=False,
+        )
         self.pasted = []
 
     def handle_paste(self, data):
@@ -774,7 +778,11 @@ class KeyboardNavigationTests(unittest.TestCase):
 
     def test_ready_to_paste_restores_last_active_window_before_ctrl_v(self):
         _get_qapp()
-        app = ClientApp(enable_monitor=False, init_data=False)
+        app = ClientApp(
+            enable_monitor=False,
+            init_data=False,
+            enable_background_jobs=False,
+        )
         app.last_active_window_handle = 200
         user32 = _FakeUser32(foreground=100, target=200)
 

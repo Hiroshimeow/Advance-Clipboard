@@ -100,7 +100,11 @@ class UiPreloadRefreshTests(unittest.TestCase):
         storage_patch = patch.object(main, "get_storage", return_value=self.storage)
         storage_patch.start()
         self.addCleanup(storage_patch.stop)
-        app = ClientApp(enable_monitor=False, init_data=False)
+        app = ClientApp(
+            enable_monitor=False,
+            init_data=False,
+            enable_background_jobs=False,
+        )
         self.addCleanup(app.backup_scheduler.cancel)
         self.addCleanup(app.close)
         return app

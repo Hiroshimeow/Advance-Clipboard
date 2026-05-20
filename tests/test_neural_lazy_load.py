@@ -185,7 +185,11 @@ class NeuralLazyLoadTests(unittest.TestCase):
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
-        app = ClientApp(enable_monitor=False, init_data=False)
+        app = ClientApp(
+            enable_monitor=False,
+            init_data=False,
+            enable_background_jobs=False,
+        )
         self.addCleanup(app.backup_scheduler.cancel)
         self.addCleanup(app.close)
         return app
