@@ -2,7 +2,7 @@
 
 A powerful clipboard manager for Windows with SQLite storage, group organization, hybrid search, and an AI-powered **Neural Memory Map** that visualizes semantic relationships between your clips as an interactive galaxy.
 
-![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
+![Python](https://img.shields.io/badge/Python-3.11--3.13-blue.svg)
 ![PyQt6](https://img.shields.io/badge/PyQt6-6.4+-green.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey.svg)
 ![AI](https://img.shields.io/badge/AI-SentenceTransformers-orange.svg)
@@ -57,17 +57,24 @@ An AI-powered visualization that maps semantic relationships between your clipbo
 ## Installation
 
 ```bash
-# Clone repository
 git clone https://github.com/Hiroshimeow/Advance-Clipboard.git
 cd Advance-Clipboard
-
-# Option A: using uv (recommended)
 uv sync
 uv run main.py
+```
 
-# Option B: using pip
-pip install -r requirements.txt
-python main.py
+### Windows launchers
+
+- `adv-clip.bat`: visible console launch, useful for debugging.
+- `adv-clip.vbs`: hidden background launch.
+
+### Troubleshooting
+
+If Python fails with standard library mismatch errors, clear inherited Python env variables:
+
+```powershell
+$env:PYTHONHOME=$null
+$env:PYTHONPATH=$null
 ```
 
 ## Usage
@@ -155,29 +162,35 @@ python main.py
 
 ```
 advance-clipboard/
-├── main.py               # UI and app logic (PyQt6)
-├── storage.py            # SQLite storage layer + neural tables
-├── rag_search.py         # Lightweight local RAG / hybrid retriever
-├── backup.py             # Backup utilities
-├── backup_manager.py     # JSON backup with checksum
-├── win32_monitor.py      # Windows clipboard monitoring
-├── neural/
-│   ├── engine.py         # Background AI indexing (SentenceTransformer)
-│   ├── ui.py             # SidecarWindow (floating/docked map modes)
-│   ├── config.json       # All engine + visual settings (config-driven)
-│   └── graph/
-│       ├── index.html    # D3.js galaxy visualization
-│       └── d3.v7.min.js  # D3 v7 (bundled offline)
-├── docs/
-│   └── screenshots/      # README screenshots
-├── test_neural_index.py  # Test AI indexing on real DB
-├── test_neural_show.py   # Test map display standalone
-├── test_restore_db.py    # Restore DB from backup JSON
-├── pyproject.toml        # Project config (uv sync)
-├── requirements.txt
-├── FUTURE.md             # Roadmap and deferred improvements
-├── LICENSE
-└── .gitignore
+|-- main.py
+|-- core/
+|   |-- clipboard_monitor.py
+|   `-- paste_service.py
+|-- storage/
+|   |-- backup.py
+|   |-- clips.py
+|   |-- db.py
+|   |-- neural.py
+|   |-- rag_search.py
+|   `-- search.py
+|-- ui/
+|   |-- clipboard_browser_controller.py
+|   `-- widgets.py
+|-- neural/
+|   |-- engine.py
+|   |-- indexer.py
+|   |-- ui.py
+|   |-- config.json
+|   `-- graph/
+|-- docs/
+|   |-- CASE_STUDY.md
+|   |-- ADR/
+|   `-- screenshots/
+|-- tests/
+|-- adv-clip.bat
+|-- adv-clip.vbs
+|-- pyproject.toml
+`-- uv.lock
 ```
 
 > **Note:** Runtime artifacts (`clipboard.db`, `images/`, `backups/`, `logs/`) are excluded via `.gitignore`.
@@ -208,11 +221,19 @@ MAX_DISPLAY_CHARS = 300   # Text truncation limit
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.11-3.13
 - Windows 10/11
 - PyQt6, PyQt6-WebEngine
 - sentence-transformers (CPU only, ~90MB model download on first run)
-- scikit-learn, pynput
+- numpy
+
+
+## Engineering Case Study
+
+For architecture decisions, trade-offs, and refactor notes, see:
+
+- [Engineering Case Study](docs/CASE_STUDY.md)
+- [Architecture Decision Records](docs/ADR/)
 
 ## License
 
