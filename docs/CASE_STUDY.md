@@ -79,6 +79,52 @@ $env:QT_QPA_PLATFORM='offscreen'
 .\.venv\Scripts\python.exe -m unittest tests.test_keyboard_navigation.KeyboardNavigationTests.test_ready_to_paste_restores_last_active_window_before_ctrl_v
 ```
 
+
+## Before / After Refactor
+
+### Before
+
+- Win32 focus restoration lived directly in `main.py`.
+- Paste flow mixed UI state, clipboard payload writes, retry timing, focus restoration, and keyboard injection.
+- Platform-specific side effects were harder to test independently.
+
+### After
+
+- `core/paste_service.py` owns Windows focus restoration and keyboard paste injection.
+- `main.py` delegates through thin compatibility wrappers.
+- Existing paste/focus regression test still passes.
+- `PasteService` accepts an injected paste function, which allows direct unit tests without patching the global clipboard monitor module.
+
+### Evidence
+
+- Commit: `d17e837 refactor: isolate paste focus service`
+- Added: `core/paste_service.py`
+- Added: `tests/test_paste_service.py`
+- Validation:
+  - `compileall main.py core\paste_service.py core\clipboard_monitor.py`
+  - `unittest tests.test_paste_service`
+  - `unittest tests.test_keyboard_navigation.KeyboardNavigationTests.test_ready_to_paste_restores_last_active_window_before_ctrl_v`
+
+## Deliberate Non-Goals
+
+The following features were intentionally deferred:
+
+- Global typing suggestions while the user types in any app.
+- Low-level keyboard hooks for normal operation.
+- Go/Rust native helper process.
+- Cloud sync.
+- Unbounded AI indexing.
+- Heavy installer work before stabilizing testability and reliability.
+
+These were deferred because the current portfolio goal is to demonstrate reliability, local-first architecture, Windows integration, and maintainable refactoring rather than feature breadth.
+
+## Current Risks
+
+- `main.py` still owns too many responsibilities.
+- Some GUI tests still depend on broad `ClientApp` startup behavior.
+- Runtime data paths are still dev-oriented.
+- Packaging is currently launcher-based, not installer-based.
+
 ## Portfolio Narrative
 
 This project demonstrates:
