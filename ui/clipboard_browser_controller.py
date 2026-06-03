@@ -2,7 +2,6 @@ from PyQt6.QtCore import Qt, QTimer, QSize, QSignalBlocker
 from PyQt6.QtWidgets import QListWidgetItem
 from .widgets import (
     ClipItemWidget,
-    SearchResultWidget,
     GroupHeaderWidget,
     PAGE_SIZE_HISTORY,
     PAGE_SIZE_PINNED,
@@ -524,24 +523,16 @@ class ClipboardBrowserController:
 
     def _append_items(self, list_widget, clips, is_pinned):
         width = list_widget.viewport().width() or ((self.app.width() // 2) - 25)
-        use_lightweight_search_rows = bool(self.current_search_query)
         for clip in clips:
             item = QListWidgetItem(list_widget)
-            if use_lightweight_search_rows:
-                ui = SearchResultWidget(
-                    clip,
-                    is_pinned=is_pinned,
-                    available_width=width,
-                )
-            else:
-                is_expanded = clip.get("id") in self.expanded_clip_ids
-                ui = ClipItemWidget(
-                    clip,
-                    is_pinned,
-                    self.app,
-                    expanded=is_expanded,
-                    available_width=width,
-                )
+            is_expanded = clip.get("id") in self.expanded_clip_ids
+            ui = ClipItemWidget(
+                clip,
+                is_pinned,
+                self.app,
+                expanded=is_expanded,
+                available_width=width,
+            )
             item.setSizeHint(QSize(width, ui.height()))
             item.setData(Qt.ItemDataRole.UserRole, clip)
             list_widget.addItem(item)
