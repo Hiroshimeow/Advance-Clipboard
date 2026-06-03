@@ -1261,6 +1261,7 @@ class ClientApp(QWidget):
                     self._finish_paste_attempt(clear_guard=False)
                     return
             simulate_paste()
+            logger.info("simulate_paste_done target_hwnd=%s", target_hwnd)
         except Exception as exc:
             logger.error("perform_keyboard_paste_failed: %s", exc)
         self._finish_paste_attempt()

@@ -306,31 +306,28 @@ def _keyboard_input(vk: int, flags: int = 0) -> INPUT:
 
 def simulate_paste():
     """
-    Simulate Ctrl+V using Win32 SendInput.
+    Simulate Ctrl+V using discrete Win32 keybd_event calls.
 
-    This is much lighter than pynput because:
-    - SendInput directly injects into the keyboard input stream
-    - No hooks, no listeners, no extra threads
-    - Works with all applications including games and Adobe suite
+    SendInput-in-one-batch is faster, but several target apps appear to miss the
+    paste chord after focus restoration. The older discrete event sequence is
+    intentionally paced so Windows and the target message queue observe Ctrl as
+    down before V is pressed.
     """
-    user32 = ctypes.windll.user32
-    user32.SendInput.argtypes = [
-        ctypes.wintypes.UINT,
-        ctypes.POINTER(INPUT),
-        ctypes.c_int,
-    ]
-    user32.SendInput.restype = ctypes.wintypes.UINT
+    import time
 
-    # Release Ctrl/Alt first so the opener hotkey state cannot leak into paste.
-    # Send the whole chord in one syscall and avoid any fixed sleep on the hot path.
-    events = (INPUT * 6)(
-        _keyboard_input(VK_CONTROL, KEYEVENTF_KEYUP),
-        _keyboard_input(VK_MENU, KEYEVENTF_KEYUP),
-        _keyboard_input(VK_CONTROL, 0),
-        _keyboard_input(VK_V, 0),
-        _keyboard_input(VK_V, KEYEVENTF_KEYUP),
-        _keyboard_input(VK_CONTROL, KEYEVENTF_KEYUP),
-    )
-    sent = user32.SendInput(len(events), events, ctypes.sizeof(INPUT))
-    if sent != len(events):
-        raise OSError(f"SendInput sent {sent}/{len(events)} keyboard events")
+    user32 = ctypes.windll.user32
+
+    # Clear the opener hotkey state first. Ctrl+Alt+V may still be physically
+    # transitioning when the user clicks a clip, so release modifiers explicitly.
+    user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+    user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+    time.sleep(0.01)
+
+    # Press Ctrl, then V, then release in the natural order. The tiny gap after
+    # Ctrl down is what makes the chord reliable in editors/browsers/terminals.
+    user32.keybd_event(VK_CONTROL, 0, 0, 0)
+    time.sleep(0.005)
+    user32.keybd_event(VK_V, 0, 0, 0)
+    user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
+    time.sleep(0.005)
+    user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
