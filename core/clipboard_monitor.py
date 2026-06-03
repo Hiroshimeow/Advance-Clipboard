@@ -321,13 +321,13 @@ def simulate_paste():
     # transitioning when the user clicks a clip, so release modifiers explicitly.
     user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
     user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
-    time.sleep(0.01)
+    # time.sleep(0.001)
 
     # Press Ctrl, then V, then release in the natural order. The tiny gap after
     # Ctrl down is what makes the chord reliable in editors/browsers/terminals.
     user32.keybd_event(VK_CONTROL, 0, 0, 0)
-    time.sleep(0.005)
+    # time.sleep(0.001)
     user32.keybd_event(VK_V, 0, 0, 0)
     user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
-    time.sleep(0.005)
+    # time.sleep(0.001)
     user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
