@@ -100,6 +100,9 @@ FAULT_LOG_FILE = os.path.join(LOG_DIR, "Advance Clipboard.fault.log")
 
 UI_EDGE_MARGIN = 150  # Minimum distance from screen edges
 SW_RESTORE = 9
+ENABLE_RESTORE_FOCUS_AFTER_BG_CLICK = True
+RESTORE_FOCUS_SLEEP = 0.01
+PASTE_AFTER_HIDE_DELAY_MS = 10
 
 # Ensure image directory exists
 if not os.path.exists(IMAGE_DIR):
@@ -1017,7 +1020,10 @@ class ClientApp(QWidget):
         self._set_pending_clipboard_guard(data)
         logger.info("prepare_clipboard_success clip_id=%s", data.get("id"))
         self.hide()
-        QTimer.singleShot(0, lambda: self._restore_focus_and_paste(20))
+        # Give Windows a short tick to deactivate this popup before restoring
+        # the target app. Without this, clicking a clip can paste too early while
+        # the clipboard UI still owns foreground focus.
+        QTimer.singleShot(PASTE_AFTER_HIDE_DELAY_MS, lambda: self._restore_focus_and_paste(20))
 
     def _write_clipboard_payload(self, data):
         try:
@@ -1136,6 +1142,20 @@ class ClientApp(QWidget):
             return user32.GetForegroundWindow() == target_hwnd
         return True
 
+    def restore_foreground_hwnd(self, hwnd):
+        if not ENABLE_RESTORE_FOCUS_AFTER_BG_CLICK:
+            return False
+        if sys.platform != "win32" or not hwnd:
+            return False
+        try:
+            user32 = ctypes.windll.user32
+            user32.SetForegroundWindow(int(hwnd))
+            time.sleep(RESTORE_FOCUS_SLEEP)
+            return user32.GetForegroundWindow() == int(hwnd)
+        except Exception as exc:
+            logger.debug("restore_foreground_hwnd_failed hwnd=%s error=%s", hwnd, exc)
+            return False
+
     def _restore_target_focus(self, target_hwnd):
         if sys.platform != "win32" or not target_hwnd:
             return True
@@ -1181,8 +1201,11 @@ class ClientApp(QWidget):
                 if hasattr(user32, "BringWindowToTop"):
                     user32.BringWindowToTop(target_hwnd)
                 user32.SetForegroundWindow(target_hwnd)
+                if hasattr(user32, "SetActiveWindow"):
+                    user32.SetActiveWindow(target_hwnd)
                 if hasattr(user32, "SetFocus"):
                     user32.SetFocus(focus_hwnd or target_hwnd)
+                time.sleep(RESTORE_FOCUS_SLEEP)
             finally:
                 for thread_id in reversed(attached):
                     user32.AttachThreadInput(current_thread, thread_id, False)
@@ -1201,16 +1224,17 @@ class ClientApp(QWidget):
         target_hwnd = self.last_active_window_handle
         if target_hwnd:
             self._restore_target_focus(target_hwnd)
+            self.restore_foreground_hwnd(target_hwnd)
         try:
             if sys.platform == "win32" and target_hwnd:
                 foreground = ctypes.windll.user32.GetForegroundWindow()
                 if foreground != target_hwnd:
                     logger.warning(
-                        "paste_aborted_focus_mismatch target=%s foreground=%s",
+                        "paste_focus_mismatch_after_restore target=%s foreground=%s",
                         target_hwnd,
                         foreground,
                     )
-                    QTimer.singleShot(8, lambda: self._restore_focus_and_paste(6))
+                    QTimer.singleShot(int(RESTORE_FOCUS_SLEEP * 1000), lambda: self._restore_focus_and_paste(6))
                     return
             simulate_paste()
         except Exception as exc:
