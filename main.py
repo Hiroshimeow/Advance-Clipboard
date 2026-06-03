@@ -168,7 +168,9 @@ class ClientApp(QWidget):
         self.is_ui_dirty = True
         self.input_locked = False
         self.last_active_window_handle = None
+        self.last_focus_window_handle = None
         self._paste_in_progress = False
+        self._last_clipboard_capture_at = 0.0
         self._hidden_refresh_timer = QTimer(self)
         self._hidden_refresh_timer.setSingleShot(True)
         self._hidden_refresh_timer.timeout.connect(self._refresh_hidden_ui_cache)
@@ -529,6 +531,9 @@ class ClientApp(QWidget):
                 self.last_active_window_handle = (
                     ctypes.windll.user32.GetForegroundWindow()
                 )
+                self.last_focus_window_handle = self._get_focus_window_handle(
+                    self.last_active_window_handle
+                )
             except:
                 pass
         cp = QCursor.pos()
@@ -584,8 +589,11 @@ class ClientApp(QWidget):
         self._on_ui_opened()
 
     def _schedule_hidden_ui_refresh(self):
+        # Hot path: never rebuild QListWidget rows while the popup is hidden.
+        # Clipboard events can arrive in bursts; rendering the hidden UI on each
+        # event is the main reason the app feels progressively laggier.
         self.is_ui_dirty = True
-        self._hidden_refresh_timer.start(20)
+        self._hidden_refresh_timer.stop()
 
     def _refresh_hidden_ui_cache(self):
         if self.isVisible() or not self.is_ui_dirty:
@@ -973,12 +981,10 @@ class ClientApp(QWidget):
             self.last_active_window_handle,
         )
 
-        self.hide()
-        QTimer.singleShot(0, self._reset_ui_after_paste_request)
-        QTimer.singleShot(0, lambda: self._prepare_clipboard_and_paste(data, 0))
+        self._prepare_clipboard_and_paste(data, 0)
 
     def _prepare_clipboard_and_paste(self, data, attempt_index):
-        retry_delays = (0, 30, 70, 140)
+        retry_delays = (0, 8, 16, 32)
         logger.info(
             "prepare_clipboard attempt=%s clip_id=%s type=%s",
             attempt_index,
@@ -1010,7 +1016,8 @@ class ClientApp(QWidget):
 
         self._set_pending_clipboard_guard(data)
         logger.info("prepare_clipboard_success clip_id=%s", data.get("id"))
-        QTimer.singleShot(10, lambda: self._restore_focus_and_paste(12))
+        self.hide()
+        QTimer.singleShot(0, lambda: self._restore_focus_and_paste(20))
 
     def _write_clipboard_payload(self, data):
         try:
@@ -1068,10 +1075,52 @@ class ClientApp(QWidget):
         )
         if attempts_remaining > 0 and not ready:
             QTimer.singleShot(
-                20, lambda: self._restore_focus_and_paste(attempts_remaining - 1)
+                8, lambda: self._restore_focus_and_paste(attempts_remaining - 1)
             )
             return
-        self._perform_keyboard_paste()
+        if ready:
+            self._perform_keyboard_paste()
+        else:
+            logger.warning(
+                "restore_focus_gave_up target_hwnd=%s", self.last_active_window_handle
+            )
+            self._finish_paste_attempt(clear_guard=False)
+
+    def _get_focus_window_handle(self, foreground_hwnd):
+        if sys.platform != "win32" or not foreground_hwnd:
+            return None
+        try:
+            user32 = ctypes.windll.user32
+            thread_id = user32.GetWindowThreadProcessId(foreground_hwnd, None)
+
+            class RECT(ctypes.Structure):
+                _fields_ = [
+                    ("left", ctypes.c_long),
+                    ("top", ctypes.c_long),
+                    ("right", ctypes.c_long),
+                    ("bottom", ctypes.c_long),
+                ]
+
+            class GUITHREADINFO(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", ctypes.wintypes.DWORD),
+                    ("flags", ctypes.wintypes.DWORD),
+                    ("hwndActive", ctypes.wintypes.HWND),
+                    ("hwndFocus", ctypes.wintypes.HWND),
+                    ("hwndCapture", ctypes.wintypes.HWND),
+                    ("hwndMenuOwner", ctypes.wintypes.HWND),
+                    ("hwndMoveSize", ctypes.wintypes.HWND),
+                    ("hwndCaret", ctypes.wintypes.HWND),
+                    ("rcCaret", RECT),
+                ]
+
+            info = GUITHREADINFO()
+            info.cbSize = ctypes.sizeof(GUITHREADINFO)
+            if user32.GetGUIThreadInfo(thread_id, ctypes.byref(info)):
+                return int(info.hwndFocus or info.hwndCaret or 0) or None
+        except Exception as exc:
+            logger.debug("get_focus_window_handle_failed: %s", exc)
+        return None
 
     def _ready_to_paste(self):
         if sys.platform != "win32":
@@ -1105,7 +1154,14 @@ class ClientApp(QWidget):
 
             kernel32 = ctypes.windll.kernel32
             current_thread = kernel32.GetCurrentThreadId()
+            focus_hwnd = getattr(self, "last_focus_window_handle", None)
+            if focus_hwnd and hasattr(user32, "IsWindow") and not user32.IsWindow(focus_hwnd):
+                focus_hwnd = None
+
             target_thread = user32.GetWindowThreadProcessId(target_hwnd, None)
+            focus_thread = (
+                user32.GetWindowThreadProcessId(focus_hwnd, None) if focus_hwnd else 0
+            )
             foreground_thread = (
                 user32.GetWindowThreadProcessId(current_foreground, None)
                 if current_foreground
@@ -1120,12 +1176,13 @@ class ClientApp(QWidget):
 
             attach(foreground_thread)
             attach(target_thread)
+            attach(focus_thread)
             try:
                 if hasattr(user32, "BringWindowToTop"):
                     user32.BringWindowToTop(target_hwnd)
                 user32.SetForegroundWindow(target_hwnd)
                 if hasattr(user32, "SetFocus"):
-                    user32.SetFocus(target_hwnd)
+                    user32.SetFocus(focus_hwnd or target_hwnd)
             finally:
                 for thread_id in reversed(attached):
                     user32.AttachThreadInput(current_thread, thread_id, False)
@@ -1141,8 +1198,25 @@ class ClientApp(QWidget):
         logger.info(
             "perform_keyboard_paste target_hwnd=%s", self.last_active_window_handle
         )
-        simulate_paste()
+        target_hwnd = self.last_active_window_handle
+        if target_hwnd:
+            self._restore_target_focus(target_hwnd)
+        try:
+            if sys.platform == "win32" and target_hwnd:
+                foreground = ctypes.windll.user32.GetForegroundWindow()
+                if foreground != target_hwnd:
+                    logger.warning(
+                        "paste_aborted_focus_mismatch target=%s foreground=%s",
+                        target_hwnd,
+                        foreground,
+                    )
+                    QTimer.singleShot(8, lambda: self._restore_focus_and_paste(6))
+                    return
+            simulate_paste()
+        except Exception as exc:
+            logger.error("perform_keyboard_paste_failed: %s", exc)
         self._finish_paste_attempt()
+        QTimer.singleShot(0, self._reset_ui_after_paste_request)
 
     def _finish_paste_attempt(self, clear_guard=False):
         self._paste_in_progress = False
@@ -1226,7 +1300,6 @@ class ClientApp(QWidget):
 
     def handle_toggle_expand(self, clip_id):
         self.browser.toggle_clip_expanded(clip_id)
-        self.refresh_lists()
 
     def handle_fix_clip(self, clip_id, new_content):
         if not new_content:
@@ -1254,13 +1327,14 @@ class ClientApp(QWidget):
 
     def on_clipboard_change_delayed(self):
         """Delay reading clipboard slightly so source apps can finish publishing data."""
-        QTimer.singleShot(15, lambda: self._process_clipboard_data_retry(0))
+        self._last_clipboard_capture_at = time.perf_counter()
+        QTimer.singleShot(5, lambda: self._process_clipboard_data_retry(0))
 
     def _process_clipboard_data(self):
         self._process_clipboard_data_retry(0)
 
     def _process_clipboard_data_retry(self, attempt_index):
-        retry_delays = (15, 35, 75, 120)
+        retry_delays = (5, 15, 35, 75)
         mime = self.clipboard.mimeData()
         if self._should_ignore_clipboard_update(mime):
             return
@@ -1301,6 +1375,12 @@ class ClientApp(QWidget):
             self.refresh_lists()
         else:
             self._schedule_hidden_ui_refresh()
+        logger.info(
+            "clipboard_ingest_done clip_id=%s is_new=%s elapsed_ms=%.2f",
+            clip_id,
+            is_new,
+            (time.perf_counter() - self._last_clipboard_capture_at) * 1000,
+        )
 
     def save_image_if_new(self, img):
         fn = self._image_storage_name(img)

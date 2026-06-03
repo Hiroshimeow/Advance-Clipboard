@@ -112,6 +112,58 @@ class LineInfoPopup(QWidget):
         self.activateWindow()
 
 
+class SearchResultWidget(QWidget):
+    """Lightweight search row: no action buttons, no heavy text measurement.
+
+    Search rebuilds rows while the user types, so using the full ClipItemWidget
+    here causes visible stutter. Actions still work through Enter/click on the
+    QListWidgetItem's stored UserRole data.
+    """
+
+    def __init__(self, item_data, is_pinned=False, available_width=300):
+        super().__init__()
+        self.item_data = item_data
+        self.is_pinned = is_pinned
+        self.available_width = max(240, int(available_width))
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(7, 4, 7, 4)
+        layout.setSpacing(2)
+
+        prefix = "★ " if is_pinned else ""
+        if item_data.get("type") == "image":
+            text = f"{prefix}[image] {item_data.get('content', '')}"
+        else:
+            raw = str(item_data.get("content", "")).replace("\r", " ").replace("\n", " ")
+            text = prefix + (raw[:220] + "..." if len(raw) > 220 else raw)
+
+        self.lbl_content = QLabel(text or " ")
+        self.lbl_content.setFont(TEXT_FONT)
+        self.lbl_content.setStyleSheet("color: #e0e0e0; background: transparent;")
+        self.lbl_content.setWordWrap(False)
+        self.lbl_content.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        layout.addWidget(self.lbl_content)
+
+        meta_parts = []
+        tag = item_data.get("tag") or ""
+        group = item_data.get("group_name") or ""
+        if tag:
+            meta_parts.append(f"#{tag}")
+        if group:
+            meta_parts.append(f"[{group}]")
+        updated = item_data.get("updated_at") or item_data.get("created_at") or ""
+        if updated:
+            meta_parts.append(str(updated).replace("T", " ")[:19])
+        if meta_parts:
+            self.lbl_meta = QLabel("  ·  ".join(meta_parts))
+            self.lbl_meta.setFont(TAG_FONT)
+            self.lbl_meta.setStyleSheet("color: #a0a0a0; background: transparent;")
+            self.lbl_meta.setWordWrap(False)
+            layout.addWidget(self.lbl_meta)
+
+        self.setFixedHeight(42 if meta_parts else 30)
+
+
 class SearchLineEdit(QLineEdit):
     """QLineEdit with triple-click to clear functionality."""
 

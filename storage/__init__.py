@@ -72,6 +72,72 @@ except Exception as exc:
             return [], []
 
 
+def _lexical_rank(row: Dict[str, Any], query: str, *, include_meta: bool = False) -> int:
+    """Fast deterministic UI-search ranking.
+
+    Ranking policy for clipboard UX:
+    1. exact content match
+    2. prefix content match
+    3. phrase/content containment
+    4. all-token content match
+    5. optional tag/group metadata match
+    Recency is handled as a stable tie-breaker by updated_at.
+    """
+    normalized_query = " ".join((query or "").lower().split())
+    if not normalized_query:
+        return 0
+
+    content = " ".join(str(row.get("content", "")).lower().split())
+    tag = " ".join(str(row.get("tag", "")).lower().split())
+    group = " ".join(str(row.get("group_name", "")).lower().split())
+    terms = [t for t in normalized_query.split() if t]
+
+    score = 0
+    if content == normalized_query:
+        score += 10000
+    if content.startswith(normalized_query):
+        score += 7000
+    if normalized_query in content:
+        score += 4500
+    if terms and all(term in content for term in terms):
+        score += 2500
+    if terms:
+        score += sum(250 for term in terms if term in content)
+
+    if include_meta:
+        meta = f"{tag} {group}".strip()
+        if meta:
+            if normalized_query in meta:
+                score += 1800
+            if terms and all(term in meta for term in terms):
+                score += 900
+            score += sum(120 for term in terms if term in meta)
+
+    # Prefer text clips for text queries; image filenames should not outrank text.
+    if row.get("type") == "text":
+        score += 100
+    return score
+
+
+def _rank_lexical_rows(
+    rows: List[Dict[str, Any]],
+    query: str,
+    limit: int,
+    *,
+    include_meta: bool = False,
+    pinned_tiebreaker: bool = False,
+) -> List[Dict[str, Any]]:
+    def sort_key(row: Dict[str, Any]):
+        return (
+            _lexical_rank(row, query, include_meta=include_meta),
+            str(row.get("updated_at") or ""),
+            int(row.get("pin_order") or 0) if pinned_tiebreaker else 0,
+            int(row.get("id") or 0),
+        )
+
+    return sorted(rows, key=sort_key, reverse=True)[:limit]
+
+
 class ClipboardStorage:
     """Facade for clipboard storage subsystem."""
 
@@ -243,12 +309,23 @@ class ClipboardStorage:
 
     # ==================== SEARCH OPERATIONS (delegated) ====================
 
-    def search_pinned(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    def search_pinned(
+        self, query: str, limit: int = 20, *, semantic: bool = True
+    ) -> List[Dict[str, Any]]:
         terms = self.search.split_search_terms(query)
         if not terms:
             return []
 
-        lexical_rows = self._search_pinned_sql(query, max(limit * 3, 20))
+        lexical_rows = self._search_pinned_sql(query, max(limit * 8, 80))
+        ranked_lexical_rows = _rank_lexical_rows(
+            lexical_rows,
+            query,
+            limit=max(limit * 3, 20),
+            include_meta=True,
+            pinned_tiebreaker=True,
+        )
+        if not semantic:
+            return ranked_lexical_rows[:limit]
         if self.search.has_index("pinned"):
             all_rows = self._get_all_pinned_for_search()
             ranked_ids = self.search.search(
@@ -256,15 +333,15 @@ class ClipboardStorage:
                 query,
                 all_rows,
                 max(limit * 3, 20),
-                [r["id"] for r in lexical_rows],
+                [r["id"] for r in ranked_lexical_rows],
             )
             return self.search.merge_ranked_results(
                 ranked_ids=ranked_ids,
                 semantic_rows=all_rows,
-                lexical_rows=lexical_rows,
+                lexical_rows=ranked_lexical_rows,
                 limit=limit,
             )
-        return lexical_rows[:limit]
+        return ranked_lexical_rows[:limit]
 
     def _search_pinned_sql(self, query: str, limit: int) -> List[Dict[str, Any]]:
         terms = self.search.split_search_terms(query)
@@ -283,12 +360,23 @@ class ClipboardStorage:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def search_history(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    def search_history(
+        self, query: str, limit: int = 20, *, semantic: bool = True
+    ) -> List[Dict[str, Any]]:
         terms = self.search.split_search_terms(query)
         if not terms:
             return []
 
-        lexical_rows = self._search_history_sql(query, max(limit * 3, 20))
+        lexical_rows = self._search_history_sql(query, max(limit * 8, 80))
+        ranked_lexical_rows = _rank_lexical_rows(
+            lexical_rows,
+            query,
+            limit=max(limit * 3, 20),
+            include_meta=False,
+            pinned_tiebreaker=False,
+        )
+        if not semantic:
+            return ranked_lexical_rows[:limit]
         if self.search.has_index("history"):
             all_rows = self._get_all_history_for_search()
             ranked_ids = self.search.search(
@@ -296,15 +384,15 @@ class ClipboardStorage:
                 query,
                 all_rows,
                 max(limit * 3, 20),
-                [r["id"] for r in lexical_rows],
+                [r["id"] for r in ranked_lexical_rows],
             )
             return self.search.merge_ranked_results(
                 ranked_ids=ranked_ids,
                 semantic_rows=all_rows,
-                lexical_rows=lexical_rows,
+                lexical_rows=ranked_lexical_rows,
                 limit=limit,
             )
-        return lexical_rows[:limit]
+        return ranked_lexical_rows[:limit]
 
     def _search_history_sql(self, query: str, limit: int) -> List[Dict[str, Any]]:
         terms = self.search.split_search_terms(query)

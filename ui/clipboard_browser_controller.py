@@ -1,12 +1,16 @@
-import time
-from PyQt6.QtCore import Qt, QTimer, QSize
+from PyQt6.QtCore import Qt, QTimer, QSize, QSignalBlocker
 from PyQt6.QtWidgets import QListWidgetItem
 from .widgets import (
     ClipItemWidget,
+    SearchResultWidget,
     GroupHeaderWidget,
     PAGE_SIZE_HISTORY,
     PAGE_SIZE_PINNED,
 )
+
+SEARCH_PAGE_SIZE_HISTORY = 12
+SEARCH_PAGE_SIZE_PINNED = 12
+SEARCH_DEBOUNCE_MS = 120
 
 
 class ClipboardBrowserController:
@@ -26,9 +30,11 @@ class ClipboardBrowserController:
 
         # UI state
         self.current_search_query = ""
+        self._last_search_query = ""
+        self._search_generation = 0
+        self._queued_search_after_refresh = False
         self.active_side = "history"
         self._is_refreshing = False
-
         # Timers
         self.search_debounce_timer = QTimer()
         self.search_debounce_timer.setSingleShot(True)
@@ -152,7 +158,6 @@ class ClipboardBrowserController:
                 data = it.data(Qt.ItemDataRole.UserRole)
                 if isinstance(data, dict) and data.get("id") == prev_clip_id:
                     w.setCurrentRow(r)
-                    w.scrollToItem(it)
                     return
 
         # 2) Fallback to row position
@@ -167,7 +172,6 @@ class ClipboardBrowserController:
             it = w.item(r)
             if self._is_pasteable_item(it):
                 w.setCurrentRow(r)
-                w.scrollToItem(it)
                 return
 
         # Previous selectable before hint
@@ -175,14 +179,12 @@ class ClipboardBrowserController:
             it = w.item(r)
             if self._is_pasteable_item(it):
                 w.setCurrentRow(r)
-                w.scrollToItem(it)
                 return
 
         # First selectable
         first = self._first_pasteable_row(w, 0)
         if first is not None:
             w.setCurrentRow(first)
-            w.scrollToItem(w.item(first))
         else:
             self._apply_default_selection()
 
@@ -238,19 +240,39 @@ class ClipboardBrowserController:
         self.app.search_input.setFocus()
 
     def on_search_text_changed(self, text):
-        """Debounced search - waits 200ms after typing stops."""
+        """Debounced search optimized for interactive typing."""
+        previous_query = self.current_search_query
         self.current_search_query = text.strip()
+        if previous_query and not self.current_search_query:
+            # Clearing search is a navigation reset, not a filtered-refresh.
+            # Drop stale selection state so Enter returns to newest history.
+            self.active_side = "history"
+            self.app.list_history.setCurrentRow(-1)
+            self.app.list_pinned.setCurrentRow(-1)
         # Sync to sidecar immediately
         if self.app.sidecar:
             self.app.sidecar.search_bar.blockSignals(True)
             self.app.sidecar.search_bar.setText(text)
             self.app.sidecar.search_bar.blockSignals(False)
-        self.search_debounce_timer.start(200)
+        # Debounce typing enough to avoid rebuilding QWidget rows for every key.
+        # Search still feels live, but avoids UI-thread thrashing.
+        self.search_debounce_timer.start(SEARCH_DEBOUNCE_MS)
 
     def _do_search(self):
         """Execute the actual search query."""
         query = self.current_search_query
-        self.refresh_lists()
+        if query == self._last_search_query and not self._queued_search_after_refresh:
+            return
+        if self._is_refreshing:
+            self._queued_search_after_refresh = True
+            return
+
+        self._search_generation += 1
+        self._queued_search_after_refresh = False
+        # Search result ordering is the selection contract: focus the first ranked
+        # result. Clearing search resets to the newest history item.
+        self.refresh_lists(maintain_selection=False)
+        self._last_search_query = query
 
         # Sync search to sidecar map
         if self.app.sidecar:
@@ -310,13 +332,24 @@ class ClipboardBrowserController:
         try:
             self.app.setUpdatesEnabled(False)
 
+            history_bar = self.app.list_history.verticalScrollBar()
+            pinned_bar = self.app.list_pinned.verticalScrollBar()
+            history_scroll_value = history_bar.value()
+            pinned_scroll_value = pinned_bar.value()
+            history_blocker = QSignalBlocker(history_bar)
+            pinned_blocker = QSignalBlocker(pinned_bar)
+
             # 1. Refresh History
             self.app.list_history.clear()
             self.history_offset = 0
 
             if self.current_search_query:
-                history_clips = self.storage.search_history(self.current_search_query)
-                self.history_has_more = False  # Search returns all
+                history_clips = self.storage.search_history(
+                    self.current_search_query,
+                    limit=SEARCH_PAGE_SIZE_HISTORY,
+                    semantic=False,
+                )
+                self.history_has_more = False  # Search returns first fast page
             else:
                 history_clips = self.storage.get_history(
                     limit=PAGE_SIZE_HISTORY, offset=0
@@ -337,9 +370,17 @@ class ClipboardBrowserController:
             else:
                 self._apply_default_selection()
 
+            if self.current_search_query and maintain_selection:
+                history_bar.setValue(min(history_scroll_value, history_bar.maximum()))
+                pinned_bar.setValue(min(pinned_scroll_value, pinned_bar.maximum()))
+
+            del history_blocker
+            del pinned_blocker
             self.app.setUpdatesEnabled(True)
         finally:
             self._is_refreshing = False
+            if self._queued_search_after_refresh:
+                self.search_debounce_timer.start(0)
 
     def refresh_pinned_list(self):
         """Refresh only the pinned list, preserving group expansion state."""
@@ -349,8 +390,12 @@ class ClipboardBrowserController:
 
         if self.current_search_query:
             # In search mode, flat list of pinned items (no groups)
-            pinned_clips = self.storage.search_pinned(self.current_search_query)
-            self.pinned_has_more = False  # Search returns all
+            pinned_clips = self.storage.search_pinned(
+                self.current_search_query,
+                limit=SEARCH_PAGE_SIZE_PINNED,
+                semantic=False,
+            )
+            self.pinned_has_more = False  # Search returns first fast page
             self._append_items(self.app.list_pinned, pinned_clips, is_pinned=True)
         else:
             # Grouped view
@@ -423,6 +468,55 @@ class ClipboardBrowserController:
             self.expanded_clip_ids.discard(clip_id)
         else:
             self.expanded_clip_ids.add(clip_id)
+        self._rerender_clip_row_in_place(clip_id)
+
+    def _rerender_clip_row_in_place(self, clip_id):
+        """Update only one expanded/collapsed row without resetting scroll."""
+        for list_widget, is_pinned in (
+            (self.app.list_history, False),
+            (self.app.list_pinned, True),
+        ):
+            for row in range(list_widget.count()):
+                item = list_widget.item(row)
+                if not self._is_pasteable_item(item):
+                    continue
+                clip = item.data(Qt.ItemDataRole.UserRole)
+                if not isinstance(clip, dict) or clip.get("id") != clip_id:
+                    continue
+                scroll_bar = list_widget.verticalScrollBar()
+                scroll_value = scroll_bar.value()
+                horizontal_bar = list_widget.horizontalScrollBar()
+                horizontal_value = horizontal_bar.value()
+                width = list_widget.viewport().width() or ((self.app.width() // 2) - 25)
+                group_name = item.data(Qt.ItemDataRole.UserRole + 1)
+
+                list_widget.setUpdatesEnabled(False)
+                scroll_blocker = QSignalBlocker(scroll_bar)
+                horizontal_blocker = QSignalBlocker(horizontal_bar)
+                try:
+                    ui = ClipItemWidget(
+                        clip,
+                        is_pinned,
+                        self.app,
+                        is_grouped=bool(group_name),
+                        expanded=clip_id in self.expanded_clip_ids,
+                        available_width=width,
+                    )
+                    item.setSizeHint(QSize(width, ui.height()))
+                    list_widget.setItemWidget(item, ui)
+                    scroll_bar.setValue(min(scroll_value, scroll_bar.maximum()))
+                    horizontal_bar.setValue(min(horizontal_value, horizontal_bar.maximum()))
+                finally:
+                    del scroll_blocker
+                    del horizontal_blocker
+                    list_widget.setUpdatesEnabled(True)
+
+                def restore_scroll():
+                    scroll_bar.setValue(min(scroll_value, scroll_bar.maximum()))
+                    horizontal_bar.setValue(min(horizontal_value, horizontal_bar.maximum()))
+
+                QTimer.singleShot(0, restore_scroll)
+                return
 
     def reset_after_delete_refresh(self):
         self._ensure_current_item()
@@ -430,16 +524,24 @@ class ClipboardBrowserController:
 
     def _append_items(self, list_widget, clips, is_pinned):
         width = list_widget.viewport().width() or ((self.app.width() // 2) - 25)
+        use_lightweight_search_rows = bool(self.current_search_query)
         for clip in clips:
             item = QListWidgetItem(list_widget)
-            is_expanded = clip.get("id") in self.expanded_clip_ids
-            ui = ClipItemWidget(
-                clip,
-                is_pinned,
-                self.app,
-                expanded=is_expanded,
-                available_width=width,
-            )
+            if use_lightweight_search_rows:
+                ui = SearchResultWidget(
+                    clip,
+                    is_pinned=is_pinned,
+                    available_width=width,
+                )
+            else:
+                is_expanded = clip.get("id") in self.expanded_clip_ids
+                ui = ClipItemWidget(
+                    clip,
+                    is_pinned,
+                    self.app,
+                    expanded=is_expanded,
+                    available_width=width,
+                )
             item.setSizeHint(QSize(width, ui.height()))
             item.setData(Qt.ItemDataRole.UserRole, clip)
             list_widget.addItem(item)
@@ -460,7 +562,6 @@ class ClipboardBrowserController:
             self._load_more_pinned()
 
     def _load_more_history(self):
-        self.history_offset += 20
         clips = self.storage.get_history(
             limit=PAGE_SIZE_HISTORY, offset=self.history_offset
         )
@@ -468,11 +569,11 @@ class ClipboardBrowserController:
             self.history_has_more = False
         if clips:
             self._append_items(self.app.list_history, clips, is_pinned=False)
+            self.history_offset += len(clips)
 
     def _load_more_pinned(self):
         if not self.current_search_query:
             return
-        self.pinned_offset += 50
         clips = self.storage.get_pinned(
             limit=PAGE_SIZE_PINNED, offset=self.pinned_offset
         )
@@ -480,6 +581,7 @@ class ClipboardBrowserController:
             self.pinned_has_more = False
         if clips:
             self._append_items(self.app.list_pinned, clips, is_pinned=True)
+            self.pinned_offset += len(clips)
 
     def expand_group(self, group_name):
         self.expanded_groups.add(group_name)

@@ -47,8 +47,10 @@ MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_NOREPEAT = 0x4000
 
-# keybd_event flags
+# keyboard injection flags
 KEYEVENTF_KEYUP = 0x0002
+INPUT_KEYBOARD = 1
+
 
 # Hotkey IDs
 HOTKEY_TOGGLE = 1  # Ctrl+Alt+V
@@ -67,10 +69,12 @@ if sys.maxsize > 2**32:
     LRESULT = ctypes.c_int64
     LPARAM = ctypes.c_int64
     WPARAM = ctypes.c_uint64
+    ULONG_PTR = ctypes.c_uint64
 else:
     LRESULT = ctypes.c_long
     LPARAM = ctypes.c_long
     WPARAM = ctypes.c_uint
+    ULONG_PTR = ctypes.c_ulong
 
 WNDPROC = ctypes.WINFUNCTYPE(
     LRESULT,
@@ -275,28 +279,58 @@ class Win32ClipboardMonitor(QObject):
         return user32.DefWindowProcW(hwnd, msg, wparam, _coerce_lparam(lparam))
 
 
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", ctypes.wintypes.WORD),
+        ("wScan", ctypes.wintypes.WORD),
+        ("dwFlags", ctypes.wintypes.DWORD),
+        ("time", ctypes.wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+class INPUT_UNION(ctypes.Union):
+    _fields_ = [("ki", KEYBDINPUT)]
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = [("type", ctypes.wintypes.DWORD), ("union", INPUT_UNION)]
+
+
+def _keyboard_input(vk: int, flags: int = 0) -> INPUT:
+    inp = INPUT()
+    inp.type = INPUT_KEYBOARD
+    inp.union.ki = KEYBDINPUT(vk, 0, flags, 0, 0)
+    return inp
+
+
 def simulate_paste():
     """
-    Simulate Ctrl+V using Win32 keybd_event.
+    Simulate Ctrl+V using Win32 SendInput.
 
     This is much lighter than pynput because:
-    - keybd_event directly injects into the keyboard input stream
+    - SendInput directly injects into the keyboard input stream
     - No hooks, no listeners, no extra threads
     - Works with all applications including games and Adobe suite
     """
     user32 = ctypes.windll.user32
+    user32.SendInput.argtypes = [
+        ctypes.wintypes.UINT,
+        ctypes.POINTER(INPUT),
+        ctypes.c_int,
+    ]
+    user32.SendInput.restype = ctypes.wintypes.UINT
 
-    # First, make sure Ctrl and Alt are released (in case they're stuck)
-    user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-    user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
-
-    # Small delay to let keys settle
-    import time
-
-    time.sleep(0.02)
-
-    # Press Ctrl+V
-    user32.keybd_event(VK_CONTROL, 0, 0, 0)  # Ctrl down
-    user32.keybd_event(VK_V, 0, 0, 0)  # V down
-    user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)  # V up
-    user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)  # Ctrl up
+    # Release Ctrl/Alt first so the opener hotkey state cannot leak into paste.
+    # Send the whole chord in one syscall and avoid any fixed sleep on the hot path.
+    events = (INPUT * 6)(
+        _keyboard_input(VK_CONTROL, KEYEVENTF_KEYUP),
+        _keyboard_input(VK_MENU, KEYEVENTF_KEYUP),
+        _keyboard_input(VK_CONTROL, 0),
+        _keyboard_input(VK_V, 0),
+        _keyboard_input(VK_V, KEYEVENTF_KEYUP),
+        _keyboard_input(VK_CONTROL, KEYEVENTF_KEYUP),
+    )
+    sent = user32.SendInput(len(events), events, ctypes.sizeof(INPUT))
+    if sent != len(events):
+        raise OSError(f"SendInput sent {sent}/{len(events)} keyboard events")
