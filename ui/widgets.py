@@ -127,21 +127,28 @@ class SearchResultWidget(QWidget):
         self.available_width = max(240, int(available_width))
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(7, 4, 7, 4)
-        layout.setSpacing(2)
+        layout.setContentsMargins(7, 6, 7, 6)
+        layout.setSpacing(3)
 
         prefix = "★ " if is_pinned else ""
         if item_data.get("type") == "image":
             text = f"{prefix}[image] {item_data.get('content', '')}"
         else:
             raw = str(item_data.get("content", "")).replace("\r", " ").replace("\n", " ")
-            text = prefix + (raw[:220] + "..." if len(raw) > 220 else raw)
+            text = prefix + raw
 
-        self.lbl_content = QLabel(text or " ")
+        content_metrics = QFontMetrics(TEXT_FONT)
+        content_width = max(80, self.available_width - 24)
+        content_text = content_metrics.elidedText(
+            text or " ", Qt.TextElideMode.ElideRight, content_width
+        )
+        self.lbl_content = QLabel(content_text)
         self.lbl_content.setFont(TEXT_FONT)
         self.lbl_content.setStyleSheet("color: #e0e0e0; background: transparent;")
         self.lbl_content.setWordWrap(False)
         self.lbl_content.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        self.lbl_content.setMinimumHeight(content_metrics.lineSpacing() + 4)
+        self.lbl_content.setMaximumHeight(content_metrics.lineSpacing() + 6)
         layout.addWidget(self.lbl_content)
 
         meta_parts = []
@@ -154,14 +161,31 @@ class SearchResultWidget(QWidget):
         updated = item_data.get("updated_at") or item_data.get("created_at") or ""
         if updated:
             meta_parts.append(str(updated).replace("T", " ")[:19])
+        meta_height = 0
         if meta_parts:
-            self.lbl_meta = QLabel("  ·  ".join(meta_parts))
+            meta_metrics = QFontMetrics(TAG_FONT)
+            meta_text = meta_metrics.elidedText(
+                "  ·  ".join(meta_parts), Qt.TextElideMode.ElideRight, content_width
+            )
+            self.lbl_meta = QLabel(meta_text)
             self.lbl_meta.setFont(TAG_FONT)
             self.lbl_meta.setStyleSheet("color: #a0a0a0; background: transparent;")
             self.lbl_meta.setWordWrap(False)
+            self.lbl_meta.setMinimumHeight(meta_metrics.lineSpacing() + 3)
+            self.lbl_meta.setMaximumHeight(meta_metrics.lineSpacing() + 5)
             layout.addWidget(self.lbl_meta)
+            meta_height = meta_metrics.lineSpacing() + 5
 
-        self.setFixedHeight(42 if meta_parts else 30)
+        total_height = (
+            content_metrics.lineSpacing()
+            + meta_height
+            + layout.contentsMargins().top()
+            + layout.contentsMargins().bottom()
+            + (layout.spacing() if meta_parts else 0)
+            + 8
+        )
+        self.setMinimumHeight(total_height)
+        self.setFixedHeight(total_height)
 
 
 class SearchLineEdit(QLineEdit):
