@@ -381,6 +381,24 @@ class ClipboardBrowserController:
             if self._queued_search_after_refresh:
                 self.search_debounce_timer.start(0)
 
+    def _create_clip_item(self, list_widget, clip, is_pinned, *, is_grouped=False):
+        """Create one fully-featured clip row. All render paths must use this."""
+        width = list_widget.viewport().width() or ((self.app.width() // 2) - 25)
+        item = QListWidgetItem()
+        item.setData(Qt.ItemDataRole.UserRole, clip)
+        if is_grouped:
+            item.setData(Qt.ItemDataRole.UserRole + 1, clip.get("group_name", ""))
+        ui = ClipItemWidget(
+            clip,
+            is_pinned,
+            self.app,
+            is_grouped=is_grouped,
+            expanded=clip.get("id") in self.expanded_clip_ids,
+            available_width=width,
+        )
+        item.setSizeHint(QSize(width, ui.height()))
+        return item, ui
+
     def refresh_pinned_list(self):
         """Refresh only the pinned list, preserving group expansion state."""
         self.app.list_pinned.clear()
@@ -421,22 +439,9 @@ class ClipboardBrowserController:
 
                 # Add children
                 for c in clips:
-                    child_item = QListWidgetItem(self.app.list_pinned)
-                    child_width = self.app.list_pinned.viewport().width() or 300
-                    ui = ClipItemWidget(
-                        c,
-                        True,
-                        self.app,
-                        is_grouped=True,
-                        expanded=c.get("id") in self.expanded_clip_ids,
-                        available_width=child_width,
+                    child_item, ui = self._create_clip_item(
+                        self.app.list_pinned, c, True, is_grouped=True
                     )
-                    child_item.setSizeHint(
-                        QSize(
-                            child_width, ui.height()
-                        )
-                    )
-                    child_item.setData(Qt.ItemDataRole.UserRole, c)
                     child_item.setData(Qt.ItemDataRole.UserRole + 1, g_name)
                     self.app.list_pinned.addItem(child_item)
                     self.app.list_pinned.setItemWidget(child_item, ui)
@@ -543,21 +548,11 @@ class ClipboardBrowserController:
                         existing_row = row
                         break
                 if existing_row is not None:
-                    item = self.app.list_history.takeItem(existing_row)
-                    if item is None:
-                        continue
-                else:
-                    item = QListWidgetItem()
+                    old_item = self.app.list_history.takeItem(existing_row)
+                    if old_item is not None:
+                        del old_item
 
-                item.setData(Qt.ItemDataRole.UserRole, clip)
-                ui = ClipItemWidget(
-                    clip,
-                    False,
-                    self.app,
-                    expanded=clip_id in self.expanded_clip_ids,
-                    available_width=width,
-                )
-                item.setSizeHint(QSize(width, ui.height()))
+                item, ui = self._create_clip_item(self.app.list_history, clip, False)
                 self.app.list_history.insertItem(0, item)
                 self.app.list_history.setItemWidget(item, ui)
                 changed = True
@@ -576,19 +571,8 @@ class ClipboardBrowserController:
         self._sync_selection_to_map()
 
     def _append_items(self, list_widget, clips, is_pinned):
-        width = list_widget.viewport().width() or ((self.app.width() // 2) - 25)
         for clip in clips:
-            item = QListWidgetItem(list_widget)
-            is_expanded = clip.get("id") in self.expanded_clip_ids
-            ui = ClipItemWidget(
-                clip,
-                is_pinned,
-                self.app,
-                expanded=is_expanded,
-                available_width=width,
-            )
-            item.setSizeHint(QSize(width, ui.height()))
-            item.setData(Qt.ItemDataRole.UserRole, clip)
+            item, ui = self._create_clip_item(list_widget, clip, is_pinned)
             list_widget.addItem(item)
             list_widget.setItemWidget(item, ui)
 

@@ -1080,8 +1080,12 @@ class ClientApp(QWidget):
                 )
                 return False
 
-            pixmap = QPixmap(p)
-            if pixmap.isNull():
+            # Do not re-hash/PNG-encode the image after setting the clipboard.
+            # That verification path blocks the UI for large images. Loading the
+            # file and checking that Qt accepts image data is enough here; the
+            # content filename is already a hash generated when the clip was saved.
+            image = QImage(p)
+            if image.isNull():
                 logger.error(
                     "write_clipboard_image_invalid clip_id=%s path=%s",
                     data.get("id"),
@@ -1089,18 +1093,14 @@ class ClientApp(QWidget):
                 )
                 return False
 
-            self.clipboard.setPixmap(pixmap)
-            mime = self.clipboard.mimeData()
-            if not mime or not mime.hasImage():
-                logger.error("write_clipboard_image_no_mime clip_id=%s", data.get("id"))
-                return False
-
-            img = QImage(mime.imageData())
-            ok = not img.isNull() and self._image_storage_name(img) == data["content"]
+            self.clipboard.setImage(image)
             logger.info(
-                "write_clipboard_image clip_id=%s success=%s", data.get("id"), ok
+                "write_clipboard_image clip_id=%s success=True size=%sx%s",
+                data.get("id"),
+                image.width(),
+                image.height(),
             )
-            return ok
+            return True
         except Exception as e:
             logger.error("write_clipboard_failed: %s", e)
             return False
@@ -1342,10 +1342,12 @@ class ClientApp(QWidget):
                 self.pending_clipboard_guard = None
                 return True
         elif guard["type"] == "image" and mime.hasImage():
-            img = QImage(mime.imageData())
-            if not img.isNull() and self._image_storage_name(img) == guard["content"]:
-                self.pending_clipboard_guard = None
-                return True
+            # Avoid hashing image clipboard data on the UI thread. Large image
+            # encoding here was causing multi-second freezes immediately after
+            # clicking an image clip. The guard only suppresses our own clipboard
+            # write event; a short-lived image guard is sufficient.
+            self.pending_clipboard_guard = None
+            return True
         self.pending_clipboard_guard = None
         return False
 
@@ -1356,7 +1358,9 @@ class ClientApp(QWidget):
         else:
             p = os.path.join(IMAGE_DIR, data["content"])
             if os.path.exists(p):
-                self.clipboard.setPixmap(QPixmap(p))
+                image = QImage(p)
+                if not image.isNull():
+                    self.clipboard.setImage(image)
 
     def handle_star(self, clip_id, should_pin):
         """Pin or unpin a clip."""
