@@ -19,10 +19,11 @@ from .db import (
 _get_connection = get_connection
 _transaction = transaction
 
-from .clips import ClipRepository, compute_hash
+from .clips import ClipRepository, compute_hash, DEFAULT_HISTORY_RETENTION_LIMIT
 from .search import SearchService
 
 _NEURAL_REPOSITORY_IMPORT_ERROR: Exception | None = None
+MAX_HISTORY_CLIPS = DEFAULT_HISTORY_RETENTION_LIMIT
 
 try:
     from .neural import NeuralRepository
@@ -177,6 +178,12 @@ class ClipboardStorage:
             except Exception:
                 pass
 
+    def _prune_history_if_needed(self) -> int:
+        pruned = self.clips.prune_history_limit(MAX_HISTORY_CLIPS)
+        if pruned > 0:
+            self.search.increment_revision()
+        return pruned
+
     def trigger_daily_rebuild(self):
         self.search.trigger_daily_rebuild(self)
 
@@ -198,6 +205,8 @@ class ClipboardStorage:
         if is_new or True:  # always mark dirty for updated_at changes
             self._mark_dirty()
 
+        self._prune_history_if_needed()
+
         if is_new:
             # Incrementally add to search index
             clip = self.get_clip_by_id(clip_id)
@@ -218,6 +227,7 @@ class ClipboardStorage:
         ok = self.clips.unpin_clip(clip_id)
         if ok:
             self._mark_dirty()
+            self._prune_history_if_needed()
             self._emit_neural_event("pin_state_changed", clip_id)
         return ok
 
@@ -274,6 +284,13 @@ class ClipboardStorage:
             self._mark_dirty()
         return count
 
+
+    def prune_history(self, limit: int = MAX_HISTORY_CLIPS) -> int:
+        count = self.clips.prune_history_limit(limit)
+        if count > 0:
+            self._mark_dirty()
+        return count
+
     def get_history(self, limit: int = 20, offset: int = 0) -> List[Dict[str, Any]]:
         return self.clips.get_history(limit, offset)
 
@@ -299,7 +316,11 @@ class ClipboardStorage:
         return self.clips.is_duplicate(content)
 
     def import_clips(self, clips: List[Dict[str, Any]]) -> int:
-        return self.clips.import_clips(clips)
+        count = self.clips.import_clips(clips)
+        if count > 0:
+            self._prune_history_if_needed()
+            self._mark_dirty()
+        return count
 
     def is_db_valid(self) -> bool:
         return self.clips.is_db_valid()
