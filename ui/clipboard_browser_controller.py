@@ -517,6 +517,60 @@ class ClipboardBrowserController:
                 QTimer.singleShot(0, restore_scroll)
                 return
 
+
+    def apply_pending_history_updates(self, clip_ids):
+        """Incrementally prepend/move copied clips instead of rebuilding all UI."""
+        if self.current_search_query or not clip_ids:
+            return False
+        if self.app.list_history.count() == 0:
+            return False
+
+        width = self.app.list_history.viewport().width() or ((self.app.width() // 2) - 25)
+        changed = False
+        self.app.list_history.setUpdatesEnabled(False)
+        try:
+            for clip_id in reversed(list(dict.fromkeys(clip_ids))):
+                clip = self.storage.get_clip_by_id(clip_id)
+                if not clip:
+                    continue
+                existing_row = None
+                for row in range(self.app.list_history.count()):
+                    item = self.app.list_history.item(row)
+                    if not self._is_pasteable_item(item):
+                        continue
+                    data = item.data(Qt.ItemDataRole.UserRole)
+                    if isinstance(data, dict) and data.get("id") == clip_id:
+                        existing_row = row
+                        break
+                if existing_row is not None:
+                    item = self.app.list_history.takeItem(existing_row)
+                    if item is None:
+                        continue
+                else:
+                    item = QListWidgetItem()
+
+                item.setData(Qt.ItemDataRole.UserRole, clip)
+                ui = ClipItemWidget(
+                    clip,
+                    False,
+                    self.app,
+                    expanded=clip_id in self.expanded_clip_ids,
+                    available_width=width,
+                )
+                item.setSizeHint(QSize(width, ui.height()))
+                self.app.list_history.insertItem(0, item)
+                self.app.list_history.setItemWidget(item, ui)
+                changed = True
+
+            if changed:
+                self.history_offset = max(self.history_offset, self.app.list_history.count())
+                self.app.list_history.scrollToTop()
+                self.app.list_history.setCurrentRow(0)
+                self.set_active_side("history")
+        finally:
+            self.app.list_history.setUpdatesEnabled(True)
+        return changed
+
     def reset_after_delete_refresh(self):
         self._ensure_current_item()
         self._sync_selection_to_map()

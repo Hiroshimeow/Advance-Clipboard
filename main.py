@@ -169,6 +169,8 @@ class ClientApp(QWidget):
         # UI state
         self.pending_clipboard_guard = None
         self.is_ui_dirty = True
+        self.pending_ui_clip_ids = []
+        self._requires_full_ui_refresh = True
         self.input_locked = False
         self.last_active_window_handle = None
         self.last_focus_window_handle = None
@@ -499,6 +501,8 @@ class ClientApp(QWidget):
 
     def refresh_lists(self, force_reset_selection=False):
         self.browser.refresh_lists(maintain_selection=not force_reset_selection)
+        self.pending_ui_clip_ids.clear()
+        self._requires_full_ui_refresh = False
         self.is_ui_dirty = False
 
     def refresh_pinned_list(self):
@@ -577,25 +581,54 @@ class ClientApp(QWidget):
             self.browser.reset_for_hotkey_open(refresh=False)
             self._on_ui_opened()
         if self.is_ui_dirty:
-            QTimer.singleShot(25, self._refresh_after_show)
+            QTimer.singleShot(0, self._refresh_after_show)
 
     def _refresh_after_show(self):
+        refresh_started_at = time.perf_counter()
         if not self.isVisible() or not self.is_ui_dirty:
             return
         self.browser.active_side = "history"
         self.browser.expanded_clip_ids.clear()
+
+        if not self._requires_full_ui_refresh and self.pending_ui_clip_ids:
+            applied = self.browser.apply_pending_history_updates(self.pending_ui_clip_ids)
+            if applied:
+                self.pending_ui_clip_ids.clear()
+                self.is_ui_dirty = False
+                logger.info(
+                    "ui_incremental_refresh_after_show elapsed_ms=%.2f",
+                    (time.perf_counter() - refresh_started_at) * 1000,
+                )
+                self._on_ui_opened()
+                return
+
         self.browser.refresh_lists(maintain_selection=False)
         if self.list_history.count() > 0:
             self.list_history.scrollToTop()
             self.list_history.setCurrentRow(0)
+        self.pending_ui_clip_ids.clear()
+        self._requires_full_ui_refresh = False
         self.is_ui_dirty = False
+        logger.info(
+            "ui_full_refresh_after_show elapsed_ms=%.2f",
+            (time.perf_counter() - refresh_started_at) * 1000,
+        )
         self._on_ui_opened()
 
-    def _schedule_hidden_ui_refresh(self):
+    def _schedule_hidden_ui_refresh(self, clip_id=None, *, full_refresh=False):
         # Hot path: never rebuild QListWidget rows while the popup is hidden.
         # Clipboard events can arrive in bursts; rendering the hidden UI on each
         # event is the main reason the app feels progressively laggier.
         self.is_ui_dirty = True
+        if full_refresh:
+            self._requires_full_ui_refresh = True
+            self.pending_ui_clip_ids.clear()
+        elif clip_id is not None and not self._requires_full_ui_refresh:
+            if clip_id in self.pending_ui_clip_ids:
+                self.pending_ui_clip_ids.remove(clip_id)
+            self.pending_ui_clip_ids.insert(0, clip_id)
+            # Keep the queue small; opening the UI only needs visible first page.
+            del self.pending_ui_clip_ids[PAGE_SIZE_HISTORY:]
         self._hidden_refresh_timer.stop()
 
     def _refresh_hidden_ui_cache(self):
@@ -1421,9 +1454,9 @@ class ClientApp(QWidget):
             return
         clip_id, is_new = self.storage.add_clip(clip_type, content)
         if self.isVisible():
-            self.refresh_lists()
+            self.browser.apply_pending_history_updates([clip_id]) or self.refresh_lists()
         else:
-            self._schedule_hidden_ui_refresh()
+            self._schedule_hidden_ui_refresh(clip_id)
         logger.info(
             "clipboard_ingest_done clip_id=%s is_new=%s elapsed_ms=%.2f",
             clip_id,
