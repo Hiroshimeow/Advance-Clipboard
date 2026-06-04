@@ -9,7 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
 
-from ui.widgets import COLLAPSED_MAX_LINES, ClipItemWidget, TEXT_FONT, _visible_text_height
+from ui.widgets import ACTION_COLUMN_WIDTH, BADGE_COLUMN_WIDTH, COLLAPSED_MAX_LINES, ClipItemWidget, TEXT_FONT, _visible_text_height
 
 _APP: QApplication | None = None
 
@@ -76,9 +76,24 @@ class WidgetLayoutTests(unittest.TestCase):
         }
         widget = ClipItemWidget(item, is_pinned=False, parent_list=None, available_width=260)
         self.assertTrue(widget.btn_container.isVisibleTo(widget) or widget.btn_container.isVisible())
-        self.assertGreaterEqual(widget.btn_container.width(), 30)
+        self.assertEqual(widget.btn_container.width(), ACTION_COLUMN_WIDTH)
         self.assertGreaterEqual(widget.height(), widget.btn_container.minimumHeight() + 10)
         self.assertEqual(widget.btn_container.layout().count(), 3)
+
+
+    def test_long_unbroken_text_does_not_push_action_buttons_out(self):
+        item = {
+            "id": 4,
+            "type": "text",
+            "content": "https://" + ("very-long-segment" * 30) + ".example.com/path",
+            "tag": "",
+            "group_name": "",
+        }
+        widget = ClipItemWidget(item, is_pinned=False, parent_list=None, available_width=260)
+        self.assertEqual(widget.btn_container.sizePolicy().horizontalPolicy(), widget.btn_container.sizePolicy().Policy.Fixed)
+        self.assertLessEqual(widget.content_container.minimumWidth(), 0)
+        self.assertEqual(widget.content_container.sizePolicy().horizontalPolicy(), widget.content_container.sizePolicy().Policy.Ignored)
+        self.assertEqual(widget.btn_container.width(), ACTION_COLUMN_WIDTH)
 
 
 
