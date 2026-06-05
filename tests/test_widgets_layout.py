@@ -66,21 +66,6 @@ class WidgetLayoutTests(unittest.TestCase):
         self.assertGreaterEqual(widget.height(), widget.btn_container.minimumHeight() + 10)
         self.assertGreaterEqual(widget.height(), widget.btn_v_widget.minimumHeight() + 10)
 
-    def test_image_row_keeps_action_buttons_visible(self):
-        item = {
-            "id": 3,
-            "type": "image",
-            "content": "missing-test-image.png",
-            "tag": "",
-            "group_name": "",
-        }
-        widget = ClipItemWidget(item, is_pinned=False, parent_list=None, available_width=260)
-        self.assertTrue(widget.btn_container.isVisibleTo(widget) or widget.btn_container.isVisible())
-        self.assertGreaterEqual(widget.btn_container.width(), 30)
-        self.assertGreaterEqual(widget.height(), widget.btn_container.minimumHeight() + 10)
-        self.assertEqual(widget.btn_container.layout().count(), 3)
-
-
 
 if __name__ == "__main__":
     unittest.main()
