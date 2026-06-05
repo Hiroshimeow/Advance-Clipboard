@@ -32,8 +32,6 @@ TAG_FONT = QFont("Segoe UI", 7)
 COLLAPSED_MAX_LINES = 4
 EXPANDED_MAX_LINES = 10
 ROW_VERTICAL_PADDING = 10
-BADGE_COLUMN_WIDTH = 27
-ACTION_COLUMN_WIDTH = 30
 
 
 def _normalized_display_text(text: str) -> str:
@@ -339,10 +337,6 @@ class ClipItemWidget(QWidget):
         layout.setSpacing(8)
 
         self.content_container = QWidget()
-        self.content_container.setMinimumWidth(0)
-        self.content_container.setSizePolicy(
-            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
-        )
         self.content_layout = QGridLayout(self.content_container)
         self.content_layout.setContentsMargins(0, 0, 0, 0)
         self.content_layout.setSpacing(4)
@@ -370,19 +364,11 @@ class ClipItemWidget(QWidget):
                     "QPlainTextEdit { color: #e0e0e0; background: transparent; padding: 0px; }"
                 )
                 self.lbl_content.setFont(TEXT_FONT)
-                self.lbl_content.setMinimumWidth(0)
-                self.lbl_content.setSizePolicy(
-                    QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
-                )
             else:
                 self.lbl_content = QLabel(display_text)
                 self.lbl_content.setStyleSheet("color: #e0e0e0; background: transparent;")
                 self.lbl_content.setFont(TEXT_FONT)
                 self.lbl_content.setWordWrap(True)
-                self.lbl_content.setMinimumWidth(0)
-                self.lbl_content.setSizePolicy(
-                    QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
-                )
                 self.lbl_content.setAlignment(
                     Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
                 )
@@ -393,9 +379,6 @@ class ClipItemWidget(QWidget):
         else:
             self.lbl_content = QLabel()
             self.lbl_content.setFixedSize(THUMB_SIZE)
-            self.lbl_content.setSizePolicy(
-                QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
-            )
             self.lbl_content.setScaledContents(False)
             self.lbl_content.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.lbl_content.setStyleSheet(
@@ -485,12 +468,7 @@ class ClipItemWidget(QWidget):
         if self.item_data["type"] == "text":
             self.btn_v_layout.addWidget(self.btn_expand)
         self.btn_v_layout.addStretch()
-        self.btn_v_widget.setFixedWidth(BADGE_COLUMN_WIDTH)
-        self.btn_v_widget.setMinimumWidth(BADGE_COLUMN_WIDTH)
-        self.btn_v_widget.setMaximumWidth(BADGE_COLUMN_WIDTH)
-        self.btn_v_widget.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
-        )
+        self.btn_v_widget.setFixedWidth(27)
         badge_stack_height = 16 + (14 if self.item_data["type"] == "text" else 0)
         badge_stack_height += self.btn_v_layout.spacing()
         self.btn_v_widget.setMinimumHeight(badge_stack_height)
@@ -504,12 +482,7 @@ class ClipItemWidget(QWidget):
         layout.addWidget(self.content_container, stretch=1)
 
         self.btn_container = QWidget()
-        self.btn_container.setFixedWidth(ACTION_COLUMN_WIDTH)
-        self.btn_container.setMinimumWidth(ACTION_COLUMN_WIDTH)
-        self.btn_container.setMaximumWidth(ACTION_COLUMN_WIDTH)
-        self.btn_container.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
-        )
+        self.btn_container.setFixedWidth(30)
         btn_layout = QVBoxLayout(self.btn_container)
         btn_layout.setContentsMargins(0, 0, 0, 0)
         btn_layout.setSpacing(2)
@@ -542,10 +515,8 @@ class ClipItemWidget(QWidget):
         )
         self.btn_container.setMinimumHeight((18 * 3) + (btn_layout.spacing() * 2))
 
-        layout.addWidget(self.btn_container, stretch=0, alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        layout.addWidget(self.btn_container, stretch=0)
         self.setLayout(layout)
-        self.setMinimumWidth(0)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         min_widget_h = 35 if self.is_pinned else 60
         content_height = self.display_height + self.tag_height
