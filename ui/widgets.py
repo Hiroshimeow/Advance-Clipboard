@@ -34,11 +34,7 @@ EXPANDED_MAX_LINES = 10
 ROW_VERTICAL_PADDING = 10
 
 
-def _normalized_display_text(text: str) -> str:
-    return text if text else " "
-
-
-def _measure_text_lines(text: str, font: QFont, width: int) -> tuple[int, int, int]:
+def _measure_text_lines(text: str, font: QFont, width: int) -> tuple[int, int]:
     metrics = QFontMetrics(font)
     wrap_width = max(40, width)
     rect = metrics.boundingRect(
@@ -47,22 +43,17 @@ def _measure_text_lines(text: str, font: QFont, width: int) -> tuple[int, int, i
         wrap_width,
         10000,
         int(Qt.TextFlag.TextWordWrap | Qt.TextFlag.TextExpandTabs),
-        _normalized_display_text(text),
+        text,
     )
-    line_height = max(metrics.height(), metrics.lineSpacing())
-    rendered_height = max(rect.height(), line_height)
-    rendered_lines = max(1, math.ceil(rendered_height / line_height))
-    return rendered_lines, line_height, rendered_height
+    line_height = metrics.lineSpacing()
+    rendered_lines = max(1, math.ceil(max(rect.height(), line_height) / line_height))
+    return rendered_lines, line_height
 
 
 def _visible_text_height(text: str, font: QFont, width: int, max_lines: int) -> tuple[int, int]:
-    rendered_lines, line_height, rendered_height = _measure_text_lines(
-        text, font, width
-    )
+    rendered_lines, line_height = _measure_text_lines(text, font, width)
     visible_lines = min(rendered_lines, max_lines)
-    visible_height = min(rendered_height, visible_lines * line_height)
-    metrics = QFontMetrics(font)
-    return rendered_lines, int(visible_height + max(8, metrics.descent() + 5))
+    return rendered_lines, (visible_lines * line_height) + 6
 
 
 class SmoothListWidget(QListWidget):
@@ -372,7 +363,6 @@ class ClipItemWidget(QWidget):
                 self.lbl_content.setAlignment(
                     Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
                 )
-                self.lbl_content.setContentsMargins(0, 0, 0, 0)
             self.lbl_content.setFixedHeight(text_h)
             self.content_layout.addWidget(self.lbl_content, 0, 0)
             self.display_height = text_h
@@ -468,10 +458,6 @@ class ClipItemWidget(QWidget):
         if self.item_data["type"] == "text":
             self.btn_v_layout.addWidget(self.btn_expand)
         self.btn_v_layout.addStretch()
-        self.btn_v_widget.setFixedWidth(27)
-        badge_stack_height = 16 + (14 if self.item_data["type"] == "text" else 0)
-        badge_stack_height += self.btn_v_layout.spacing()
-        self.btn_v_widget.setMinimumHeight(badge_stack_height)
 
         row_span = 2 if self.has_tag else 1
         self.content_layout.addWidget(
@@ -513,16 +499,13 @@ class ClipItemWidget(QWidget):
         btn_layout.addWidget(
             create_act_btn("✕", "Delete", "#752b2b", "#e93d3d", self.on_delete_clicked)
         )
-        self.btn_container.setMinimumHeight((18 * 3) + (btn_layout.spacing() * 2))
 
         layout.addWidget(self.btn_container, stretch=0)
         self.setLayout(layout)
 
         min_widget_h = 35 if self.is_pinned else 60
-        content_height = self.display_height + self.tag_height
-        controls_height = max(self.btn_v_widget.minimumHeight(), self.btn_container.minimumHeight())
-        row_height = max(content_height, controls_height, min_widget_h)
-        self.setFixedHeight(row_height + ROW_VERTICAL_PADDING)
+        total_h = self.display_height + self.tag_height
+        self.setFixedHeight(max(total_h, min_widget_h) + ROW_VERTICAL_PADDING)
 
     def show_line_info(self):
         self.popup = LineInfoPopup(self.line_count)
