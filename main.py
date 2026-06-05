@@ -313,11 +313,14 @@ class ClientApp(QWidget):
         self.setStyleSheet("""
             QWidget { background-color: #1e1e1e; color: #f0f0f0; font-family: 'Segoe UI', sans-serif; border-radius: 8px; }
             QLabel { font-weight: bold; color: #888; margin: 5px 0; }
-            QListWidget { background-color: #252526; border: 1px solid #333; border-radius: 4px; outline: none; }
-            QListWidget::item { border-bottom: 1px solid #303030; margin: 0px; }
-            QListWidget::item:selected { background-color: #37373d; border: 1px solid #007acc; }
-            QScrollBar:vertical { border: none; background: #252526; width: 10px; }
-            QScrollBar::handle:vertical { background: #424242; min-height: 20px; border-radius: 5px; }
+            QListWidget { background-color: #202020; border: 1px solid #3a3a3a; border-radius: 6px; outline: none; padding: 6px; }
+            QListWidget::item { border-bottom: 1px solid #303030; margin: 3px 0px; }
+            QListWidget::item:selected { background-color: #303840; border: 1px solid #3daee9; border-radius: 4px; }
+            QScrollBar:vertical { border: none; background: #1f1f1f; width: 8px; margin: 4px 0px 4px 0px; }
+            QScrollBar::handle:vertical { background: #555; min-height: 24px; border-radius: 4px; }
+            QScrollBar::handle:vertical:hover { background: #666; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
             QLineEdit { 
                 background-color: #2d2d2d; 
                 color: #e0e0e0; 

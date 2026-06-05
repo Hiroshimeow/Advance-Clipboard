@@ -317,10 +317,10 @@ class ClipItemWidget(QWidget):
         self.is_grouped = is_grouped
         self.expanded = expanded
         self.available_width = max(240, int(available_width))
-        self.action_width = 34
-        self.side_badge_width = 28
-        self.outer_left_margin = 5 if not is_grouped else 20
-        self.outer_right_margin = 5
+        self.action_width = 42
+        self.side_badge_width = 36
+        self.outer_left_margin = 8 if not is_grouped else 22
+        self.outer_right_margin = 8
         self.outer_spacing = 8
         self.line_count = (
             len(self.item_data["content"].splitlines())
@@ -329,7 +329,7 @@ class ClipItemWidget(QWidget):
         )
 
         layout = QHBoxLayout()
-        layout.setContentsMargins(self.outer_left_margin, 5, self.outer_right_margin, 5)
+        layout.setContentsMargins(self.outer_left_margin, 6, self.outer_right_margin, 6)
         layout.setSpacing(self.outer_spacing)
 
         self.content_container = QWidget()
@@ -349,12 +349,13 @@ class ClipItemWidget(QWidget):
             fixed_side_width = (
                 self.outer_left_margin
                 + self.outer_right_margin
-                + self.outer_spacing
+                + (self.outer_spacing * 2)
                 + self.action_width
                 + self.side_badge_width
+                + 10
                 + (15 if is_grouped else 0)
             )
-            text_width = max(120, self.available_width - fixed_side_width)
+            text_width = max(120, min(520, self.available_width - fixed_side_width))
             self.rendered_lines, text_h = _visible_text_height(
                 display_text,
                 TEXT_FONT,
@@ -382,8 +383,9 @@ class ClipItemWidget(QWidget):
                 )
             self.lbl_content.setMinimumWidth(0)
             self.lbl_content.setMaximumWidth(text_width)
+            self.lbl_content.setFixedWidth(text_width)
             self.lbl_content.setSizePolicy(
-                QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
+                QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
             )
             self.lbl_content.setFixedHeight(text_h)
             self.content_layout.addWidget(self.lbl_content, 0, 0)
@@ -453,13 +455,13 @@ class ClipItemWidget(QWidget):
             QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
         )
         self.btn_v_layout = QVBoxLayout(self.btn_v_widget)
-        self.btn_v_layout.setContentsMargins(5, 0, 0, 0)
-        self.btn_v_layout.setSpacing(2)
+        self.btn_v_layout.setContentsMargins(4, 0, 0, 0)
+        self.btn_v_layout.setSpacing(4)
 
         def create_badge_btn(text, tooltip, style, func, h=16):
             btn = QPushButton(text)
             btn.setToolTip(tooltip)
-            btn.setFixedSize(22, h)
+            btn.setFixedSize(28, max(h, 16))
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setStyleSheet(style)
             btn.clicked.connect(func)
@@ -501,13 +503,13 @@ class ClipItemWidget(QWidget):
             QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
         )
         btn_layout = QVBoxLayout(self.btn_container)
-        btn_layout.setContentsMargins(0, 0, 0, 0)
-        btn_layout.setSpacing(2)
+        btn_layout.setContentsMargins(4, 0, 0, 0)
+        btn_layout.setSpacing(4)
 
         def create_act_btn(text, tooltip, color, hover, func):
             btn = QPushButton(text)
             btn.setToolTip(tooltip)
-            btn.setFixedSize(28, 18)
+            btn.setFixedSize(32, 22)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setStyleSheet(
                 f"QPushButton {{ background: {color}; border: none; border-radius: 3px; color: #ddd; font-size: 8pt; }} QPushButton:hover {{ background: {hover}; color: #fff; }}"

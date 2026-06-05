@@ -292,6 +292,12 @@ class ClipboardBrowserController:
             )
             self._focus_query_timer.start(300)
 
+    def _list_content_width(self, list_widget):
+        """Return a conservative row width that leaves room for list padding/scrollbar."""
+        viewport_width = list_widget.viewport().width() or ((self.app.width() // 2) - 25)
+        scrollbar_width = list_widget.verticalScrollBar().sizeHint().width()
+        return max(240, viewport_width - scrollbar_width - 18)
+
     def _sync_selection_to_map(self):
         """Sync the currently selected clip to the neural map (focus node)."""
         if (
@@ -422,7 +428,7 @@ class ClipboardBrowserController:
                 # Add children
                 for c in clips:
                     child_item = QListWidgetItem(self.app.list_pinned)
-                    child_width = self.app.list_pinned.viewport().width() or 300
+                    child_width = self._list_content_width(self.app.list_pinned)
                     ui = ClipItemWidget(
                         c,
                         True,
@@ -486,7 +492,7 @@ class ClipboardBrowserController:
                 scroll_value = scroll_bar.value()
                 horizontal_bar = list_widget.horizontalScrollBar()
                 horizontal_value = horizontal_bar.value()
-                width = list_widget.viewport().width() or ((self.app.width() // 2) - 25)
+                width = self._list_content_width(list_widget)
                 group_name = item.data(Qt.ItemDataRole.UserRole + 1)
 
                 list_widget.setUpdatesEnabled(False)
@@ -525,7 +531,7 @@ class ClipboardBrowserController:
         if self.app.list_history.count() == 0:
             return False
 
-        width = self.app.list_history.viewport().width() or ((self.app.width() // 2) - 25)
+        width = self._list_content_width(self.app.list_history)
         changed = False
         self.app.list_history.setUpdatesEnabled(False)
         try:
@@ -576,7 +582,7 @@ class ClipboardBrowserController:
         self._sync_selection_to_map()
 
     def _append_items(self, list_widget, clips, is_pinned):
-        width = list_widget.viewport().width() or ((self.app.width() // 2) - 25)
+        width = self._list_content_width(list_widget)
         for clip in clips:
             item = QListWidgetItem(list_widget)
             is_expanded = clip.get("id") in self.expanded_clip_ids
