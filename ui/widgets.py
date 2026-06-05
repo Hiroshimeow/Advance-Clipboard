@@ -34,6 +34,11 @@ EXPANDED_MAX_LINES = 10
 ROW_VERTICAL_PADDING = 10
 BADGE_COLUMN_WIDTH = 27
 ACTION_COLUMN_WIDTH = 30
+ROW_MARGIN_LEFT = 5
+ROW_MARGIN_RIGHT = 5
+ROW_MARGIN_LEFT_GROUPED = 20
+ROW_LAYOUT_SPACING = 8
+TOOLS_RESERVED_WIDTH = BADGE_COLUMN_WIDTH + ACTION_COLUMN_WIDTH + ROW_LAYOUT_SPACING
 
 
 def _normalized_display_text(text: str) -> str:
@@ -328,6 +333,8 @@ class ClipItemWidget(QWidget):
         self.is_grouped = is_grouped
         self.expanded = expanded
         self.available_width = max(240, int(available_width))
+        self.row_left_margin = ROW_MARGIN_LEFT_GROUPED if is_grouped else ROW_MARGIN_LEFT
+        self.content_width = max(80, self.available_width - self.row_left_margin - ROW_MARGIN_RIGHT - TOOLS_RESERVED_WIDTH - 2)
         self.line_count = (
             len(self.item_data["content"].splitlines())
             if self.item_data["type"] == "text"
@@ -335,11 +342,12 @@ class ClipItemWidget(QWidget):
         )
 
         layout = QHBoxLayout()
-        layout.setContentsMargins(5 if not is_grouped else 20, 5, 5, 5)
-        layout.setSpacing(8)
+        layout.setContentsMargins(self.row_left_margin, 5, ROW_MARGIN_RIGHT, 5)
+        layout.setSpacing(ROW_LAYOUT_SPACING)
 
         self.content_container = QWidget()
         self.content_container.setMinimumWidth(0)
+        self.content_container.setMaximumWidth(self.content_width + BADGE_COLUMN_WIDTH)
         self.content_container.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
         )
@@ -352,7 +360,7 @@ class ClipItemWidget(QWidget):
             display_text = text
             if not self.expanded and len(text) > MAX_DISPLAY_CHARS:
                 display_text = text[:MAX_DISPLAY_CHARS] + "..."
-            text_width = max(150, self.available_width - 110 - (15 if is_grouped else 0))
+            text_width = self.content_width
             self.rendered_lines, text_h = _visible_text_height(
                 display_text,
                 TEXT_FONT,
