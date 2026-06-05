@@ -328,9 +328,9 @@ class ClipItemWidget(QWidget):
             else 1
         )
 
-        layout = QHBoxLayout()
-        layout.setContentsMargins(self.outer_left_margin, 6, self.outer_right_margin, 6)
-        layout.setSpacing(self.outer_spacing)
+        layout = QVBoxLayout()
+        layout.setContentsMargins(self.outer_left_margin, 8, self.outer_right_margin, 8)
+        layout.setSpacing(8)
 
         self.content_container = QWidget()
         self.content_container.setMinimumWidth(0)
@@ -349,10 +349,6 @@ class ClipItemWidget(QWidget):
             fixed_side_width = (
                 self.outer_left_margin
                 + self.outer_right_margin
-                + (self.outer_spacing * 2)
-                + self.action_width
-                + self.side_badge_width
-                + 10
                 + (15 if is_grouped else 0)
             )
             text_width = max(120, min(520, self.available_width - fixed_side_width))
@@ -487,24 +483,21 @@ class ClipItemWidget(QWidget):
             self.btn_v_layout.addWidget(self.btn_expand)
         self.btn_v_layout.addStretch()
 
-        row_span = 2 if self.has_tag else 1
-        self.content_layout.addWidget(
-            self.btn_v_widget, 0, 1, row_span, 1, Qt.AlignmentFlag.AlignTop
-        )
         self.content_layout.setColumnStretch(0, 1)
-        self.content_layout.setColumnStretch(1, 0)
         layout.addWidget(self.content_container, stretch=1)
 
         self.btn_container = QWidget()
-        self.btn_container.setFixedWidth(self.action_width)
-        self.btn_container.setMinimumWidth(self.action_width)
-        self.btn_container.setMaximumWidth(self.action_width)
+        self.btn_container.setMinimumWidth(0)
         self.btn_container.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
-        btn_layout = QVBoxLayout(self.btn_container)
-        btn_layout.setContentsMargins(4, 0, 0, 0)
-        btn_layout.setSpacing(4)
+        btn_layout = QHBoxLayout(self.btn_container)
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.setSpacing(8)
+        btn_layout.addWidget(self.btn_lines)
+        if self.item_data["type"] == "text":
+            btn_layout.addWidget(self.btn_expand)
+        btn_layout.addStretch()
 
         def create_act_btn(text, tooltip, color, hover, func):
             btn = QPushButton(text)
@@ -533,11 +526,11 @@ class ClipItemWidget(QWidget):
             create_act_btn("✕", "Delete", "#752b2b", "#e93d3d", self.on_delete_clicked)
         )
 
-        layout.addWidget(self.btn_container, stretch=0)
+        layout.addWidget(self.btn_container, stretch=0, alignment=Qt.AlignmentFlag.AlignRight)
         self.setLayout(layout)
 
         min_widget_h = 35 if self.is_pinned else 60
-        total_h = self.display_height + self.tag_height
+        total_h = self.display_height + self.tag_height + 28
         self.setFixedWidth(self.available_width)
         self.setFixedHeight(max(total_h, min_widget_h) + ROW_VERTICAL_PADDING)
 
