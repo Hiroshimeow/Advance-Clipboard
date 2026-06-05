@@ -342,7 +342,12 @@ class ClipItemWidget(QWidget):
         )
 
         layout = QHBoxLayout()
-        layout.setContentsMargins(self.row_left_margin, 5, ROW_MARGIN_RIGHT, 5)
+        layout.setContentsMargins(
+            self.row_left_margin,
+            5,
+            ROW_MARGIN_RIGHT + ACTION_COLUMN_WIDTH + ROW_LAYOUT_SPACING,
+            5,
+        )
         layout.setSpacing(ROW_LAYOUT_SPACING)
 
         self.content_container = QWidget()
@@ -550,7 +555,8 @@ class ClipItemWidget(QWidget):
         )
         self.btn_container.setMinimumHeight((18 * 3) + (btn_layout.spacing() * 2))
 
-        layout.addWidget(self.btn_container, stretch=0, alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        self.btn_container.setParent(self)
+        self.btn_container.raise_()
         self.setLayout(layout)
         self.setMinimumWidth(0)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -560,6 +566,26 @@ class ClipItemWidget(QWidget):
         controls_height = max(self.btn_v_widget.minimumHeight(), self.btn_container.minimumHeight())
         row_height = max(content_height, controls_height, min_widget_h)
         self.setFixedHeight(row_height + ROW_VERTICAL_PADDING)
+        self._position_action_column()
+
+    def _position_action_column(self):
+        if not hasattr(self, "btn_container"):
+            return
+        x = max(
+            self.row_left_margin,
+            self.width() - ROW_MARGIN_RIGHT - ACTION_COLUMN_WIDTH,
+        )
+        self.btn_container.setGeometry(
+            x,
+            5,
+            ACTION_COLUMN_WIDTH,
+            self.btn_container.minimumHeight(),
+        )
+        self.btn_container.raise_()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_action_column()
 
     def show_line_info(self):
         self.popup = LineInfoPopup(self.line_count)
