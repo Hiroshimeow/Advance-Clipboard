@@ -317,6 +317,11 @@ class ClipItemWidget(QWidget):
         self.is_grouped = is_grouped
         self.expanded = expanded
         self.available_width = max(240, int(available_width))
+        self.action_width = 34
+        self.side_badge_width = 28
+        self.outer_left_margin = 5 if not is_grouped else 20
+        self.outer_right_margin = 5
+        self.outer_spacing = 8
         self.line_count = (
             len(self.item_data["content"].splitlines())
             if self.item_data["type"] == "text"
@@ -324,10 +329,14 @@ class ClipItemWidget(QWidget):
         )
 
         layout = QHBoxLayout()
-        layout.setContentsMargins(5 if not is_grouped else 20, 5, 5, 5)
-        layout.setSpacing(8)
+        layout.setContentsMargins(self.outer_left_margin, 5, self.outer_right_margin, 5)
+        layout.setSpacing(self.outer_spacing)
 
         self.content_container = QWidget()
+        self.content_container.setMinimumWidth(0)
+        self.content_container.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
         self.content_layout = QGridLayout(self.content_container)
         self.content_layout.setContentsMargins(0, 0, 0, 0)
         self.content_layout.setSpacing(4)
@@ -337,7 +346,15 @@ class ClipItemWidget(QWidget):
             display_text = text
             if not self.expanded and len(text) > MAX_DISPLAY_CHARS:
                 display_text = text[:MAX_DISPLAY_CHARS] + "..."
-            text_width = max(150, self.available_width - 110 - (15 if is_grouped else 0))
+            fixed_side_width = (
+                self.outer_left_margin
+                + self.outer_right_margin
+                + self.outer_spacing
+                + self.action_width
+                + self.side_badge_width
+                + (15 if is_grouped else 0)
+            )
+            text_width = max(120, self.available_width - fixed_side_width)
             self.rendered_lines, text_h = _visible_text_height(
                 display_text,
                 TEXT_FONT,
@@ -363,6 +380,11 @@ class ClipItemWidget(QWidget):
                 self.lbl_content.setAlignment(
                     Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
                 )
+            self.lbl_content.setMinimumWidth(0)
+            self.lbl_content.setMaximumWidth(text_width)
+            self.lbl_content.setSizePolicy(
+                QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
+            )
             self.lbl_content.setFixedHeight(text_h)
             self.content_layout.addWidget(self.lbl_content, 0, 0)
             self.display_height = text_h
@@ -426,6 +448,10 @@ class ClipItemWidget(QWidget):
             )
 
         self.btn_v_widget = QWidget()
+        self.btn_v_widget.setFixedWidth(self.side_badge_width)
+        self.btn_v_widget.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
         self.btn_v_layout = QVBoxLayout(self.btn_v_widget)
         self.btn_v_layout.setContentsMargins(5, 0, 0, 0)
         self.btn_v_layout.setSpacing(2)
@@ -468,7 +494,12 @@ class ClipItemWidget(QWidget):
         layout.addWidget(self.content_container, stretch=1)
 
         self.btn_container = QWidget()
-        self.btn_container.setFixedWidth(30)
+        self.btn_container.setFixedWidth(self.action_width)
+        self.btn_container.setMinimumWidth(self.action_width)
+        self.btn_container.setMaximumWidth(self.action_width)
+        self.btn_container.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
         btn_layout = QVBoxLayout(self.btn_container)
         btn_layout.setContentsMargins(0, 0, 0, 0)
         btn_layout.setSpacing(2)
@@ -505,6 +536,7 @@ class ClipItemWidget(QWidget):
 
         min_widget_h = 35 if self.is_pinned else 60
         total_h = self.display_height + self.tag_height
+        self.setFixedWidth(self.available_width)
         self.setFixedHeight(max(total_h, min_widget_h) + ROW_VERTICAL_PADDING)
 
     def show_line_info(self):
