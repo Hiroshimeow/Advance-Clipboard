@@ -4,8 +4,6 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 from .db import get_connection, transaction
 
-DEFAULT_HISTORY_RETENTION_LIMIT = 1000
-
 
 def compute_hash(content: str) -> str:
     """Compute MD5 hash for content."""
@@ -229,44 +227,6 @@ class ClipRepository:
         """Clear all pinned clips. Returns count deleted."""
         with transaction() as conn:
             cursor = conn.execute("DELETE FROM clips WHERE is_pinned = 1")
-            return cursor.rowcount
-
-    def prune_history_limit(self, limit: int = DEFAULT_HISTORY_RETENTION_LIMIT) -> int:
-        """Delete oldest non-pinned clips so History keeps at most ``limit`` rows.
-
-        Pinned clips are user-protected and are never pruned here, even if they
-        may appear in the recent History view after being recopied. Neural rows
-        referencing deleted clips are removed in the same transaction to avoid
-        orphan graph/index data.
-        """
-        if limit <= 0:
-            raise ValueError("History retention limit must be positive")
-
-        with transaction() as conn:
-            rows = conn.execute(
-                """SELECT id FROM clips
-                   WHERE is_pinned = 0
-                   ORDER BY updated_at DESC, id DESC
-                   LIMIT -1 OFFSET ?""",
-                (limit,),
-            ).fetchall()
-            prune_ids = [int(row["id"]) for row in rows]
-            if not prune_ids:
-                return 0
-
-            placeholders = ",".join("?" for _ in prune_ids)
-            conn.execute(
-                f"DELETE FROM neural_vectors WHERE clip_id IN ({placeholders})",
-                prune_ids,
-            )
-            conn.execute(
-                f"DELETE FROM neural_links WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})",
-                prune_ids + prune_ids,
-            )
-            cursor = conn.execute(
-                f"DELETE FROM clips WHERE is_pinned = 0 AND id IN ({placeholders})",
-                prune_ids,
-            )
             return cursor.rowcount
 
     def get_history(self, limit: int = 20, offset: int = 0) -> List[Dict[str, Any]]:
