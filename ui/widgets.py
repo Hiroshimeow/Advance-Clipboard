@@ -1,9 +1,12 @@
 import math
 import os
+import re
 
 from PyQt6.QtCore import Qt, QTimer, QPoint, QSize
 from PyQt6.QtGui import QFont, QFontMetrics, QPixmap
+from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -29,9 +32,10 @@ PAGE_SIZE_HISTORY = 20
 PAGE_SIZE_PINNED = 50
 TEXT_FONT = QFont("Segoe UI", 10)
 TAG_FONT = QFont("Segoe UI", 7)
-COLLAPSED_MAX_LINES = 4
+COLLAPSED_MAX_LINES = 3
 EXPANDED_MAX_LINES = 10
 ROW_VERTICAL_PADDING = 10
+CLIP_TEXT_BOTTOM_PADDING = 2
 
 
 def _measure_text_lines(text: str, font: QFont, width: int) -> tuple[int, int]:
@@ -53,17 +57,79 @@ def _measure_text_lines(text: str, font: QFont, width: int) -> tuple[int, int]:
 def _visible_text_height(text: str, font: QFont, width: int, max_lines: int) -> tuple[int, int]:
     rendered_lines, line_height = _measure_text_lines(text, font, width)
     visible_lines = min(rendered_lines, max_lines)
-    return rendered_lines, (visible_lines * line_height) + 6
+    return rendered_lines, (visible_lines * line_height) + CLIP_TEXT_BOTTOM_PADDING
 
 
 class SmoothListWidget(QListWidget):
-    """QListWidget with reduced scroll speed for smoother experience."""
+    """QListWidget with smooth scrolling, hover highlighting, and variable-height item support."""
+
+    HOVER_BACKGROUND = "#2a3a4a"
+    HOVER_BORDER_COLOR = "#3a7abf"
+    DEFAULT_BORDER_COLOR = "#333"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.setMouseTracking(True)
+        self._hovered_row = -1
+        self._hovered_item = None
+        self._previous_border_color = ""
 
     def wheelEvent(self, event):
         delta = event.angleDelta().y()
         bar = self.verticalScrollBar()
-        bar.setValue(bar.value() - delta // 3)
+        step = max(1, abs(delta) // 3)
+        bar.setValue(bar.value() - step if delta > 0 else bar.value() + step)
         event.accept()
+
+    def _clear_hover(self):
+        if self._hovered_item is not None:
+            self._restore_item_border(self._hovered_item)
+            self._hovered_item = None
+            self._hovered_row = -1
+
+    def _set_item_border(self, item, color):
+        widget = self.itemWidget(item)
+        if widget is None:
+            return
+        old = widget.styleSheet()
+        if not old or not old.strip():
+            widget.setStyleSheet(f"border: 1px solid {color}; background-color: {self.HOVER_BACKGROUND};")
+            return
+        # Replace existing border/background styles
+        new_sheet = re.sub(r'background[-:]?\s*#[0-9a-fA-F]{3,8}', f'background: {self.HOVER_BACKGROUND}', old)
+        new_sheet = re.sub(r'border[-:;\s]*#[0-9a-fA-F]{3,8}', f'border-color: {color}', new_sheet)
+        if 'border' not in old:
+            new_sheet += f" border: 1px solid {color}; background-color: {self.HOVER_BACKGROUND};"
+        widget.setStyleSheet(new_sheet)
+
+    def _restore_item_border(self, item):
+        widget = self.itemWidget(item)
+        if widget is None:
+            return
+        widget.setStyleSheet("")
+
+    def mouseMoveEvent(self, e):
+        super().mouseMoveEvent(e)
+        item = self.itemAt(e.position().toPoint()) if e else None
+        new_row = self.row(item) if item else -1
+        if new_row != self._hovered_row:
+            self._clear_hover()
+            if item and new_row >= 0:
+                self._hovered_item = item
+                self._hovered_row = new_row
+                self._set_item_border(item, self.HOVER_BORDER_COLOR)
+
+    def leaveEvent(self, a0):
+        super().leaveEvent(a0)
+        self._clear_hover()
+
+    def scrollToSelected(self, hint: QAbstractItemView.ScrollHint = QAbstractItemView.ScrollHint.PositionAtCenter):
+        """Scroll the currently selected item into view, centered in the viewport."""
+        current = self.currentItem()
+        if current is None:
+            return
+        self.scrollToItem(current, hint)
 
 
 class LineInfoPopup(QWidget):
@@ -328,9 +394,9 @@ class ClipItemWidget(QWidget):
             else 1
         )
 
-        layout = QVBoxLayout()
-        layout.setContentsMargins(self.outer_left_margin, 8, self.outer_right_margin, 8)
-        layout.setSpacing(8)
+        layout = QHBoxLayout()
+        layout.setContentsMargins(self.outer_left_margin, 6, self.outer_right_margin, 6)
+        layout.setSpacing(self.outer_spacing)
 
         self.content_container = QWidget()
         self.content_container.setMinimumWidth(0)
@@ -349,6 +415,10 @@ class ClipItemWidget(QWidget):
             fixed_side_width = (
                 self.outer_left_margin
                 + self.outer_right_margin
+                + (self.outer_spacing * 2)
+                + self.action_width
+                + self.side_badge_width
+                + 10
                 + (15 if is_grouped else 0)
             )
             text_width = max(120, min(520, self.available_width - fixed_side_width))
@@ -379,9 +449,8 @@ class ClipItemWidget(QWidget):
                 )
             self.lbl_content.setMinimumWidth(0)
             self.lbl_content.setMaximumWidth(text_width)
-            self.lbl_content.setFixedWidth(text_width)
             self.lbl_content.setSizePolicy(
-                QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+                QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
             )
             self.lbl_content.setFixedHeight(text_h)
             self.content_layout.addWidget(self.lbl_content, 0, 0)
@@ -395,28 +464,39 @@ class ClipItemWidget(QWidget):
                 "border: 1px solid #444; background-color: #000; border-radius: 4px;"
             )
             p = os.path.join(IMAGE_DIR, self.item_data["content"])
+            self.image_path = p
+            self._loaded_pixmap_cache = None
             if os.path.exists(p):
-                pix = QPixmap(p)
-                if not pix.isNull():
-                    self.lbl_content.setPixmap(
-                        pix.scaled(
-                            THUMB_SIZE,
-                            Qt.AspectRatioMode.KeepAspectRatio,
-                            Qt.TransformationMode.SmoothTransformation,
-                        )
-                    )
+                self._apply_thumbnail_pixmap()
             self.content_layout.addWidget(self.lbl_content, 0, 0)
             self.display_height = THUMB_SIZE.height()
 
+        # Tag label — stored here; added to badge column (btn_v_widget) later so layout exists first
+        self.has_tag = False
+        self.tag_height = 0
         tag_text = self.item_data.get("tag", "")
         group_name = self.item_data.get("group_name", "")
         badge_text = tag_text or (
             f"[{group_name}]" if group_name and not is_grouped else ""
         )
         self.has_tag = bool(badge_text)
-        self.tag_height = 0
+        self._badge_text = badge_text
         if self.has_tag:
-            self.lbl_tag = QLabel(badge_text)
+            tag_fm = QFontMetrics(TAG_FONT)
+            self.tag_height = tag_fm.height() + 6
+
+        self.btn_v_widget = QWidget()
+        self.btn_v_widget.setFixedWidth(self.side_badge_width)
+        self.btn_v_widget.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
+        self.btn_v_layout = QVBoxLayout(self.btn_v_widget)
+        self.btn_v_layout.setContentsMargins(4, 0, 0, 0)
+        self.btn_v_layout.setSpacing(4)
+
+        # Insert tag label at the top of the badge column if present
+        if self.has_tag:
+            self.lbl_tag = QLabel(self._badge_text)
             self.lbl_tag.setStyleSheet("""
                 QLabel {
                     color: #d18616;
@@ -429,30 +509,13 @@ class ClipItemWidget(QWidget):
                     margin: 0px;
                 }
             """)
-            tag_font = TAG_FONT
-            self.lbl_tag.setFont(tag_font)
-            tag_fm = QFontMetrics(tag_font)
-            self.tag_height = tag_fm.height() + 6
+            self.lbl_tag.setFont(TAG_FONT)
             self.lbl_tag.setFixedHeight(self.tag_height)
             self.lbl_tag.setMaximumWidth(200)
             self.lbl_tag.setSizePolicy(
                 QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed
             )
-            self.content_layout.addWidget(
-                self.lbl_tag,
-                1,
-                0,
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
-            )
-
-        self.btn_v_widget = QWidget()
-        self.btn_v_widget.setFixedWidth(self.side_badge_width)
-        self.btn_v_widget.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
-        )
-        self.btn_v_layout = QVBoxLayout(self.btn_v_widget)
-        self.btn_v_layout.setContentsMargins(4, 0, 0, 0)
-        self.btn_v_layout.setSpacing(4)
+            self.btn_v_layout.insertWidget(0, self.lbl_tag)
 
         def create_badge_btn(text, tooltip, style, func, h=16):
             btn = QPushButton(text)
@@ -483,21 +546,22 @@ class ClipItemWidget(QWidget):
             self.btn_v_layout.addWidget(self.btn_expand)
         self.btn_v_layout.addStretch()
 
+        # move badge column out of the content grid so it doesn't inflate text width
         self.content_layout.setColumnStretch(0, 1)
-        layout.addWidget(self.content_container, stretch=1)
+        layout.addWidget(self.content_container, 1)
+        # badge column sits between text and action buttons
+        layout.addWidget(self.btn_v_widget, 0, Qt.AlignmentFlag.AlignTop)
 
         self.btn_container = QWidget()
-        self.btn_container.setMinimumWidth(0)
+        self.btn_container.setFixedWidth(self.action_width)
+        self.btn_container.setMinimumWidth(self.action_width)
+        self.btn_container.setMaximumWidth(self.action_width)
         self.btn_container.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
         )
-        btn_layout = QHBoxLayout(self.btn_container)
-        btn_layout.setContentsMargins(0, 0, 0, 0)
-        btn_layout.setSpacing(8)
-        btn_layout.addWidget(self.btn_lines)
-        if self.item_data["type"] == "text":
-            btn_layout.addWidget(self.btn_expand)
-        btn_layout.addStretch()
+        btn_layout = QVBoxLayout(self.btn_container)
+        btn_layout.setContentsMargins(4, 0, 0, 0)
+        btn_layout.setSpacing(4)
 
         def create_act_btn(text, tooltip, color, hover, func):
             btn = QPushButton(text)
@@ -526,11 +590,15 @@ class ClipItemWidget(QWidget):
             create_act_btn("✕", "Delete", "#752b2b", "#e93d3d", self.on_delete_clicked)
         )
 
-        layout.addWidget(self.btn_container, stretch=0, alignment=Qt.AlignmentFlag.AlignRight)
+        # ensure action column stays flush-right
+        layout.addWidget(self.btn_container, alignment=Qt.AlignmentFlag.AlignRight)
+        layout.setStretchFactor(self.content_container, 1)
+        layout.setStretchFactor(self.btn_container, 0)
         self.setLayout(layout)
 
-        min_widget_h = 35 if self.is_pinned else 60
-        total_h = self.display_height + self.tag_height + 28
+        # pinned rows need enough vertical space to show all action buttons (3 x 22 + spacing + margins ~= 78px)
+        min_widget_h = 75 if self.is_pinned else 60
+        total_h = self.display_height + self.tag_height
         self.setFixedWidth(self.available_width)
         self.setFixedHeight(max(total_h, min_widget_h) + ROW_VERTICAL_PADDING)
 
@@ -546,6 +614,25 @@ class ClipItemWidget(QWidget):
     def on_copy_clicked(self):
         if self.parent_list:
             self.parent_list.handle_copy_only(self.item_data)
+
+    def _apply_thumbnail_pixmap(self):
+        if self.item_data.get("type") != "image":
+            return
+        image_path = getattr(self, "image_path", None)
+        if not image_path or not os.path.exists(image_path):
+            return
+        pix = self._loaded_pixmap_cache
+        if pix is None or pix.isNull():
+            pix = QPixmap(image_path)
+            self._loaded_pixmap_cache = pix
+        if pix.isNull():
+            return
+        scaled = pix.scaled(
+            THUMB_SIZE,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.FastTransformation,
+        )
+        self.lbl_content.setPixmap(scaled)
 
     def on_star_clicked(self):
         if self.parent_list and self.clip_id:
