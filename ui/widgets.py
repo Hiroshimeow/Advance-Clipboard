@@ -78,7 +78,7 @@ class SmoothListWidget(QListWidget):
     def wheelEvent(self, event):
         delta = event.angleDelta().y()
         bar = self.verticalScrollBar()
-        step = max(1, abs(delta) // 3)
+        step = int(max(1, abs(delta) // 3))
         bar.setValue(bar.value() - step if delta > 0 else bar.value() + step)
         event.accept()
 
