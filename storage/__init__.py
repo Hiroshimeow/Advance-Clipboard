@@ -138,6 +138,16 @@ def _rank_lexical_rows(
     return sorted(rows, key=sort_key, reverse=True)[:limit]
 
 
+def _parse_tag_search_query(query: str) -> Optional[str]:
+    parts = (query or "").strip().split(maxsplit=1)
+    if len(parts) != 2:
+        return None
+    prefix, keyword = parts[0].lower(), parts[1].strip()
+    if prefix not in {"tag", "tags"} or not keyword:
+        return None
+    return keyword
+
+
 class ClipboardStorage:
     """Facade for clipboard storage subsystem."""
 
@@ -312,6 +322,10 @@ class ClipboardStorage:
     def search_pinned(
         self, query: str, limit: int = 20, *, semantic: bool = True
     ) -> List[Dict[str, Any]]:
+        tag_query = _parse_tag_search_query(query)
+        if tag_query is not None:
+            return self._search_pinned_tags_sql(tag_query, limit)
+
         terms = self.search.split_search_terms(query)
         if not terms:
             return []
@@ -351,8 +365,8 @@ class ClipboardStorage:
         where_clauses = []
         params = []
         for term in terms:
-            pattern = f"%{term}%"
-            where_clauses.append("(content LIKE ? OR tag LIKE ? OR group_name LIKE ?)")
+            pattern = self.search.like_pattern(term)
+            where_clauses.append("(content LIKE ? ESCAPE '\\' OR tag LIKE ? ESCAPE '\\' OR group_name LIKE ? ESCAPE '\\')")
             params.extend([pattern, pattern, pattern])
         rows = conn.execute(
             f"SELECT * FROM clips WHERE is_pinned = 1 AND ({' AND '.join(where_clauses)}) ORDER BY pin_order DESC LIMIT ?",
@@ -360,9 +374,30 @@ class ClipboardStorage:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def _search_pinned_tags_sql(self, query: str, limit: int) -> List[Dict[str, Any]]:
+        terms = self.search.split_search_terms(query)
+        if not terms:
+            return []
+        conn = get_connection()
+        where_clauses = []
+        params = []
+        for term in terms:
+            pattern = self.search.like_pattern(term)
+            where_clauses.append("tag LIKE ? ESCAPE '\\'")
+            params.append(pattern)
+        rows = conn.execute(
+            f"SELECT * FROM clips WHERE is_pinned = 1 AND tag <> '' AND ({' AND '.join(where_clauses)}) ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ?",
+            params + [limit],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def search_history(
         self, query: str, limit: int = 20, *, semantic: bool = True
     ) -> List[Dict[str, Any]]:
+        tag_query = _parse_tag_search_query(query)
+        if tag_query is not None:
+            return self._search_history_tags_sql(tag_query, limit)
+
         terms = self.search.split_search_terms(query)
         if not terms:
             return []
@@ -372,7 +407,7 @@ class ClipboardStorage:
             lexical_rows,
             query,
             limit=max(limit * 3, 20),
-            include_meta=False,
+            include_meta=True,
             pinned_tiebreaker=False,
         )
         if not semantic:
@@ -402,13 +437,35 @@ class ClipboardStorage:
         where_clauses = []
         params = []
         for term in terms:
-            where_clauses.append("content LIKE ?")
-            params.append(f"%{term}%")
+            pattern = self.search.like_pattern(term)
+            where_clauses.append("(content LIKE ? ESCAPE '\\' OR tag LIKE ? ESCAPE '\\' OR group_name LIKE ? ESCAPE '\\')")
+            params.extend([pattern, pattern, pattern])
         rows = conn.execute(
             f"""SELECT * FROM clips
                 WHERE ({' AND '.join(where_clauses)})
                   AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
                 ORDER BY updated_at DESC LIMIT ?""",
+            params + [limit],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _search_history_tags_sql(self, query: str, limit: int) -> List[Dict[str, Any]]:
+        terms = self.search.split_search_terms(query)
+        if not terms:
+            return []
+        conn = get_connection()
+        where_clauses = []
+        params = []
+        for term in terms:
+            pattern = self.search.like_pattern(term)
+            where_clauses.append("tag LIKE ? ESCAPE '\\'")
+            params.append(pattern)
+        rows = conn.execute(
+            f"""SELECT * FROM clips
+                WHERE tag <> ''
+                  AND ({' AND '.join(where_clauses)})
+                  AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
+                ORDER BY updated_at DESC, id DESC LIMIT ?""",
             params + [limit],
         ).fetchall()
         return [dict(r) for r in rows]

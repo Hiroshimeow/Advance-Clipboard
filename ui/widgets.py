@@ -1,6 +1,5 @@
 import math
 import os
-import re
 
 from PyQt6.QtCore import Qt, QTimer, QPoint, QSize
 from PyQt6.QtGui import QFont, QFontMetrics, QPixmap
@@ -17,6 +16,7 @@ from PyQt6.QtWidgets import (
     QMenu,
     QPlainTextEdit,
     QPushButton,
+    QApplication,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -32,10 +32,10 @@ PAGE_SIZE_HISTORY = 20
 PAGE_SIZE_PINNED = 50
 TEXT_FONT = QFont("Segoe UI", 10)
 TAG_FONT = QFont("Segoe UI", 7)
-COLLAPSED_MAX_LINES = 3
+COLLAPSED_MAX_LINES = 4
 EXPANDED_MAX_LINES = 10
 ROW_VERTICAL_PADDING = 10
-CLIP_TEXT_BOTTOM_PADDING = 2
+CLIP_TEXT_BOTTOM_PADDING = 4
 
 
 def _measure_text_lines(text: str, font: QFont, width: int) -> tuple[int, int]:
@@ -71,15 +71,54 @@ class SmoothListWidget(QListWidget):
         super().__init__(*args, **kwargs)
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setMouseTracking(True)
+        self.setStyleSheet(
+            self.styleSheet()
+            + "QScrollBar:vertical { width: 8px; margin: 0px; }"
+              "QScrollBar::handle:vertical { min-height: 24px; background: #666; border-radius: 4px; }"
+              "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }"
+              "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }"
+              "QListWidget[activeSide=\"true\"] { border-color: #aa8030; }"
+              "QListWidget[activeSide=\"false\"] { border-color: #333; }"
+        )
         self._hovered_row = -1
         self._hovered_item = None
         self._previous_border_color = ""
+        self._wheel_angle_pixel_remainder = 0.0
+        self.setProperty("activeSide", False)
+
+    def set_active_visual(self, active: bool):
+        self.setProperty("activeSide", bool(active))
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def _wheel_pixels_per_notch(self) -> int:
+        line_count = max(1, QApplication.wheelScrollLines())
+        return max(24, line_count * self.fontMetrics().lineSpacing())
 
     def wheelEvent(self, event):
-        delta = event.angleDelta().y()
         bar = self.verticalScrollBar()
-        step = int(max(1, abs(delta) // 3))
-        bar.setValue(bar.value() - step if delta > 0 else bar.value() + step)
+
+        pixel_delta = event.pixelDelta().y()
+        if pixel_delta:
+            self._wheel_angle_pixel_remainder = 0.0
+            bar.setValue(bar.value() - pixel_delta)
+            event.accept()
+            return
+
+        angle_delta = event.angleDelta().y()
+        if not angle_delta:
+            event.ignore()
+            return
+
+        raw_step = (
+            self._wheel_angle_pixel_remainder
+            + (angle_delta / 120.0) * self._wheel_pixels_per_notch()
+        )
+        step = math.trunc(raw_step)
+        self._wheel_angle_pixel_remainder = raw_step - step
+        if step:
+            bar.setValue(bar.value() - step)
         event.accept()
 
     def _clear_hover(self):
@@ -92,22 +131,19 @@ class SmoothListWidget(QListWidget):
         widget = self.itemWidget(item)
         if widget is None:
             return
-        old = widget.styleSheet()
-        if not old or not old.strip():
-            widget.setStyleSheet(f"border: 1px solid {color}; background-color: {self.HOVER_BACKGROUND};")
+        if hasattr(widget, "set_hovered"):
+            widget.set_hovered(True)
             return
-        # Replace existing border/background styles
-        new_sheet = re.sub(r'background[-:]?\s*#[0-9a-fA-F]{3,8}', f'background: {self.HOVER_BACKGROUND}', old)
-        new_sheet = re.sub(r'border[-:;\s]*#[0-9a-fA-F]{3,8}', f'border-color: {color}', new_sheet)
-        if 'border' not in old:
-            new_sheet += f" border: 1px solid {color}; background-color: {self.HOVER_BACKGROUND};"
-        widget.setStyleSheet(new_sheet)
+        widget.setProperty("hovered", True)
 
     def _restore_item_border(self, item):
         widget = self.itemWidget(item)
         if widget is None:
             return
-        widget.setStyleSheet("")
+        if hasattr(widget, "set_hovered"):
+            widget.set_hovered(False)
+            return
+        widget.setProperty("hovered", False)
 
     def mouseMoveEvent(self, e):
         super().mouseMoveEvent(e)
@@ -383,11 +419,11 @@ class ClipItemWidget(QWidget):
         self.is_grouped = is_grouped
         self.expanded = expanded
         self.available_width = max(240, int(available_width))
-        self.action_width = 42
+        self.action_width = 32
         self.side_badge_width = 36
         self.outer_left_margin = 8 if not is_grouped else 22
-        self.outer_right_margin = 8
-        self.outer_spacing = 8
+        self.outer_right_margin = 2
+        self.outer_spacing = 4
         self.line_count = (
             len(self.item_data["content"].splitlines())
             if self.item_data["type"] == "text"
@@ -418,7 +454,7 @@ class ClipItemWidget(QWidget):
                 + (self.outer_spacing * 2)
                 + self.action_width
                 + self.side_badge_width
-                + 10
+                + 4
                 + (15 if is_grouped else 0)
             )
             text_width = max(120, min(520, self.available_width - fixed_side_width))
@@ -441,7 +477,7 @@ class ClipItemWidget(QWidget):
                 self.lbl_content.setFont(TEXT_FONT)
             else:
                 self.lbl_content = QLabel(display_text)
-                self.lbl_content.setStyleSheet("color: #e0e0e0; background: transparent;")
+                self.lbl_content.setStyleSheet("color: #e0e0e0; background: transparent; padding-top: 1px; padding-bottom: 1px;")
                 self.lbl_content.setFont(TEXT_FONT)
                 self.lbl_content.setWordWrap(True)
                 self.lbl_content.setAlignment(
@@ -468,7 +504,12 @@ class ClipItemWidget(QWidget):
             self._loaded_pixmap_cache = None
             if os.path.exists(p):
                 self._apply_thumbnail_pixmap()
-            self.content_layout.addWidget(self.lbl_content, 0, 0)
+            self.content_layout.addWidget(
+                self.lbl_content,
+                0,
+                0,
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+            )
             self.display_height = THUMB_SIZE.height()
 
         # Tag label — stored here; added to badge column (btn_v_widget) later so layout exists first
@@ -491,7 +532,7 @@ class ClipItemWidget(QWidget):
             QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
         )
         self.btn_v_layout = QVBoxLayout(self.btn_v_widget)
-        self.btn_v_layout.setContentsMargins(4, 0, 0, 0)
+        self.btn_v_layout.setContentsMargins(1, 0, 0, 0)
         self.btn_v_layout.setSpacing(4)
 
         # Insert tag label at the top of the badge column if present
@@ -526,22 +567,20 @@ class ClipItemWidget(QWidget):
             btn.clicked.connect(func)
             return btn
 
-        style_lines = "QPushButton { background: #d18616; color: white; border: none; border-radius: 3px; font-size: 9pt; font-weight: bold; } QPushButton:hover { background: #f0ad4e; }"
         style_arrow = "QPushButton { background: #333; color: #888; border: none; border-radius: 2px; font-size: 8pt; } QPushButton:hover { background: #444; color: #fff; }"
 
-        self.btn_lines = create_badge_btn(
-            str(self.line_count),
-            "Số dòng (Click xem lời chào)",
-            style_lines,
-            self.show_line_info,
+        self.lbl_line_count = QLabel(str(self.line_count), self.content_container)
+        self.lbl_line_count.setToolTip("Số dòng")
+        self.lbl_line_count.setStyleSheet(
+            "QLabel { color: #e6c36a; background: transparent; font-size: 8pt; font-weight: 600; }"
         )
+        self.lbl_line_count.adjustSize()
         expand_symbol = "▲" if self.expanded else "▼"
         expand_tooltip = "Collapse" if self.expanded else "Expand"
         self.btn_expand = create_badge_btn(
             expand_symbol, expand_tooltip, style_arrow, self.on_expand_clicked, 14
         )
 
-        self.btn_v_layout.addWidget(self.btn_lines)
         if self.item_data["type"] == "text":
             self.btn_v_layout.addWidget(self.btn_expand)
         self.btn_v_layout.addStretch()
@@ -560,7 +599,7 @@ class ClipItemWidget(QWidget):
             QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
         )
         btn_layout = QVBoxLayout(self.btn_container)
-        btn_layout.setContentsMargins(4, 0, 0, 0)
+        btn_layout.setContentsMargins(0, 0, 0, 0)
         btn_layout.setSpacing(4)
 
         def create_act_btn(text, tooltip, color, hover, func):
@@ -601,10 +640,14 @@ class ClipItemWidget(QWidget):
         total_h = self.display_height + self.tag_height
         self.setFixedWidth(self.available_width)
         self.setFixedHeight(max(total_h, min_widget_h) + ROW_VERTICAL_PADDING)
+        self.lbl_line_count.move(
+            max(0, self.content_container.width() - self.lbl_line_count.width() - 4),
+            0,
+        )
 
     def show_line_info(self):
         self.popup = LineInfoPopup(self.line_count)
-        p = self.btn_lines.mapToGlobal(QPoint(0, 0))
+        p = self.lbl_line_count.mapToGlobal(QPoint(0, 0))
         self.popup.show_at(QPoint(p.x() - self.popup.width() - 5, p.y()))
 
     def on_expand_clicked(self):
@@ -709,3 +752,8 @@ class ClipItemWidget(QWidget):
         self.edit_popup = ClipEditPopup(self.item_data, self.parent_list, self)
         self.edit_popup.move(self.mapToGlobal(QPoint(10, 10)))
         self.edit_popup.show()
+
+
+from .clip_row import ClipRowWidget
+
+ClipItemWidget = ClipRowWidget

@@ -174,6 +174,7 @@ class ClientApp(QWidget):
         self.input_locked = False
         self.last_active_window_handle = None
         self.last_focus_window_handle = None
+        self._ui_opening_until = 0.0
         self._paste_in_progress = False
         self._last_clipboard_capture_at = 0.0
         self._hidden_refresh_timer = QTimer(self)
@@ -457,8 +458,9 @@ class ClientApp(QWidget):
         columns_layout.addLayout(col_h, 1)
         columns_layout.addLayout(col_p, 1)
         outer_layout.addLayout(columns_layout)
-        self.setLayout(outer_layout)
 
+        self.setLayout(outer_layout)
+        self.browser.bind_viewports()
     @property
     def active_side(self):
         return self.browser.active_side
@@ -496,6 +498,10 @@ class ClientApp(QWidget):
     def _on_ui_opened(self):
         self.browser.on_ui_opened()
 
+    def eventFilter(self, watched, event):
+        self.browser.handle_viewport_event(watched, event)
+        return super().eventFilter(watched, event)
+
     def expand_group(self, group_name):
         self.browser.expand_group(group_name)
 
@@ -527,15 +533,11 @@ class ClientApp(QWidget):
             self.show_at_cursor()
             if self.sidecar and self.chk_map.isChecked():
                 self._show_map_docked()
-            # Re-focus main UI after map docked (map.show() steals focus)
-            self.raise_()
-            self.activateWindow()
-            self.search_input.setFocus()
-            self._on_ui_opened()
 
     def show_at_cursor(self):
         self.input_locked = True
-        QTimer.singleShot(150, lambda: setattr(self, "input_locked", False))
+        QTimer.singleShot(30, lambda: setattr(self, "input_locked", False))
+        self._ui_opening_until = time.monotonic() + 0.25
         if sys.platform == "win32":
             try:
                 self.last_active_window_handle = (
@@ -584,7 +586,7 @@ class ClientApp(QWidget):
             self.browser.reset_for_hotkey_open(refresh=False)
             self._on_ui_opened()
         if self.is_ui_dirty:
-            QTimer.singleShot(0, self._refresh_after_show)
+            QTimer.singleShot(50, self._refresh_after_show)
 
     def _refresh_after_show(self):
         refresh_started_at = time.perf_counter()
@@ -605,18 +607,11 @@ class ClientApp(QWidget):
                 self._on_ui_opened()
                 return
 
-        self.browser.refresh_lists(maintain_selection=False)
-        if self.list_history.count() > 0:
-            self.list_history.scrollToTop()
-            self.list_history.setCurrentRow(0)
-        self.pending_ui_clip_ids.clear()
-        self._requires_full_ui_refresh = False
-        self.is_ui_dirty = False
+        self.browser.start_background_refresh()
         logger.info(
-            "ui_full_refresh_after_show elapsed_ms=%.2f",
+            "ui_background_refresh_after_show_scheduled elapsed_ms=%.2f",
             (time.perf_counter() - refresh_started_at) * 1000,
         )
-        self._on_ui_opened()
 
     def _schedule_hidden_ui_refresh(self, clip_id=None, *, full_refresh=False):
         # Hot path: never rebuild QListWidget rows while the popup is hidden.
@@ -1021,6 +1016,31 @@ class ClientApp(QWidget):
         )
 
         self._prepare_clipboard_and_paste(data, 0)
+        self._promote_after_clipboard_action(data)
+
+    def _promote_after_clipboard_action(self, data):
+        clip_id = data.get("id") if data else None
+        if clip_id is None:
+            return
+        if data.get("type") == "image" and data.get("is_pinned"):
+            self._schedule_hidden_ui_refresh(clip_id)
+            return
+        self._promote_history_clip_async(clip_id)
+
+    def _promote_history_clip_async(self, clip_id):
+        if clip_id is None:
+            return
+        QTimer.singleShot(0, lambda: self._promote_history_clip(clip_id))
+
+    def _promote_history_clip(self, clip_id):
+        if self.isVisible():
+            promoted = self.browser.apply_pending_history_updates([clip_id])
+            if promoted:
+                if clip_id in self.pending_ui_clip_ids:
+                    self.pending_ui_clip_ids.remove(clip_id)
+                self.is_ui_dirty = False
+                return
+        self._schedule_hidden_ui_refresh(clip_id)
 
     def _prepare_clipboard_and_paste(self, data, attempt_index):
         retry_delays = (0, 8, 16, 32)
@@ -1098,8 +1118,7 @@ class ClientApp(QWidget):
                 logger.error("write_clipboard_image_no_mime clip_id=%s", data.get("id"))
                 return False
 
-            img = QImage(mime.imageData())
-            ok = not img.isNull() and self._image_storage_name(img) == data["content"]
+            ok = True
             logger.info(
                 "write_clipboard_image clip_id=%s success=%s", data.get("id"), ok
             )
@@ -1345,10 +1364,8 @@ class ClientApp(QWidget):
                 self.pending_clipboard_guard = None
                 return True
         elif guard["type"] == "image" and mime.hasImage():
-            img = QImage(mime.imageData())
-            if not img.isNull() and self._image_storage_name(img) == guard["content"]:
-                self.pending_clipboard_guard = None
-                return True
+            self.pending_clipboard_guard = None
+            return True
         self.pending_clipboard_guard = None
         return False
 
@@ -1359,7 +1376,8 @@ class ClientApp(QWidget):
         else:
             p = os.path.join(IMAGE_DIR, data["content"])
             if os.path.exists(p):
-                self.clipboard.setPixmap(QPixmap(p))
+                self._write_clipboard_payload(data)
+        self._promote_after_clipboard_action(data)
 
     def handle_star(self, clip_id, should_pin):
         """Pin or unpin a clip."""
@@ -1459,7 +1477,12 @@ class ClientApp(QWidget):
         if self.isVisible():
             self.browser.apply_pending_history_updates([clip_id]) or self.refresh_lists()
         else:
-            self._schedule_hidden_ui_refresh(clip_id)
+            if self.browser.apply_pending_history_updates([clip_id]):
+                self.pending_ui_clip_ids.clear()
+                self._requires_full_ui_refresh = False
+                self.is_ui_dirty = False
+            else:
+                self._schedule_hidden_ui_refresh(clip_id)
         logger.info(
             "clipboard_ingest_done clip_id=%s is_new=%s elapsed_ms=%.2f",
             clip_id,

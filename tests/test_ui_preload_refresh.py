@@ -2,6 +2,9 @@ import os
 import sys
 import time
 import unittest
+import ctypes
+import types
+from unittest.mock import MagicMock
 from unittest.mock import patch
 
 
@@ -9,6 +12,16 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT_DIR)
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+if not hasattr(ctypes, "WINFUNCTYPE"):
+    ctypes.WINFUNCTYPE = ctypes.CFUNCTYPE
+
+_clipboard_monitor_mod = types.ModuleType("core.clipboard_monitor")
+_clipboard_monitor_mod.Win32ClipboardMonitor = MagicMock()
+_clipboard_monitor_mod.VK_CONTROL = 0x11
+_clipboard_monitor_mod.VK_MENU = 0x12
+_clipboard_monitor_mod.simulate_paste = MagicMock()
+sys.modules["core.clipboard_monitor"] = _clipboard_monitor_mod
 
 from PyQt6.QtCore import QMimeData
 from PyQt6.QtWidgets import QApplication
@@ -50,6 +63,7 @@ class _StubStorage:
     def __init__(self):
         self.added = []
         self.need_backup = False
+        self._clips = []
 
     def is_db_valid(self):
         return True
@@ -72,15 +86,16 @@ class _StubStorage:
     def add_clip(self, clip_type, content, tag=""):
         clip_id = len(self.added) + 1
         self.added.append((clip_type, content, tag))
+        self._clips.insert(0, {"id": clip_id, "type": clip_type, "content": content, "tag": tag})
         return clip_id, True
 
-    def search_history(self, query):
+    def search_history(self, query, limit=None, semantic=True):
         return []
 
     def get_history(self, limit=20, offset=0):
-        return []
+        return self._clips[offset : offset + limit]
 
-    def search_pinned(self, query):
+    def search_pinned(self, query, limit=None, semantic=True):
         return []
 
     def get_groups(self):
@@ -88,6 +103,15 @@ class _StubStorage:
 
     def get_ungrouped_pinned(self, limit=50, offset=0):
         return []
+
+    def get_clips_by_group(self, group_name):
+        return []
+
+    def get_clip_by_id(self, clip_id):
+        for clip in self._clips:
+            if clip["id"] == clip_id:
+                return dict(clip)
+        return None
 
 
 class UiPreloadRefreshTests(unittest.TestCase):
@@ -105,7 +129,7 @@ class UiPreloadRefreshTests(unittest.TestCase):
         self.addCleanup(app.close)
         return app
 
-    def test_hidden_clipboard_update_preloads_refresh_before_show(self):
+    def test_hidden_clipboard_update_preloads_history_row_without_full_open_refresh(self):
         app = self._make_app()
         mime = QMimeData()
         mime.setText("fresh clip")
@@ -120,13 +144,18 @@ class UiPreloadRefreshTests(unittest.TestCase):
 
         app._process_clipboard_data_retry(0)
 
-        self.assertTrue(_wait_until(lambda: len(refresh_calls) == 1))
-        self.assertEqual([False], refresh_calls)
+        QApplication.processEvents()
+        self.assertEqual([], refresh_calls)
         self.assertFalse(app.is_ui_dirty)
+        self.assertFalse(app._requires_full_ui_refresh)
+        self.assertEqual(app.list_history.count(), 1)
+        item = app.list_history.item(0)
+        self.assertEqual(item.data(main.Qt.ItemDataRole.UserRole)["content"], "fresh clip")
 
-    def test_show_does_not_schedule_extra_refresh_after_preload(self):
+    def test_show_schedules_single_refresh_when_hidden_update_is_dirty(self):
         app = self._make_app()
-        app.is_ui_dirty = False
+        app.is_ui_dirty = True
+        app.pending_ui_clip_ids = [1]
 
         single_shot_calls = []
         original_single_shot = main.QTimer.singleShot
@@ -139,7 +168,12 @@ class UiPreloadRefreshTests(unittest.TestCase):
             app.show_at_cursor()
             QApplication.processEvents()
 
-        self.assertFalse(any(delay == 25 for delay, _ in single_shot_calls))
+        refresh_delays = [
+            delay
+            for delay, callback_name in single_shot_calls
+            if callback_name == "_refresh_after_show"
+        ]
+        self.assertEqual([50], refresh_delays)
 
 
 if __name__ == "__main__":

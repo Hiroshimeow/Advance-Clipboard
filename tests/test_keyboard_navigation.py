@@ -2,6 +2,8 @@ import os
 import sys
 import time
 import unittest
+import ctypes
+import types
 from unittest.mock import MagicMock, patch
 
 # Add project root to path
@@ -21,8 +23,17 @@ sys.modules.setdefault("neural.bridge", MagicMock())
 sys.modules.setdefault("PyQt6.QtWebEngineWidgets", MagicMock())
 sys.modules.setdefault("PyQt6.QtWebChannel", MagicMock())
 
+if not hasattr(ctypes, "WINFUNCTYPE"):
+    ctypes.WINFUNCTYPE = ctypes.CFUNCTYPE
+
+_clipboard_monitor_mod = types.ModuleType("core.clipboard_monitor")
+_clipboard_monitor_mod.Win32ClipboardMonitor = MagicMock()
+_clipboard_monitor_mod.VK_CONTROL = 0x11
+_clipboard_monitor_mod.VK_MENU = 0x12
+_clipboard_monitor_mod.simulate_paste = MagicMock()
+sys.modules["core.clipboard_monitor"] = _clipboard_monitor_mod
+
 # Patch NeuralEngine and SidecarWindow with safe stubs
-import types
 
 _neural_engine_mod = types.ModuleType("neural.engine")
 
@@ -112,6 +123,7 @@ except Exception:  # pragma: no cover
 
 
 from main import ClientApp
+from ui.clipboard_browser_controller import SEARCH_DEBOUNCE_MS
 from ui.widgets import SearchLineEdit
 
 
@@ -159,11 +171,30 @@ def _wait_until(predicate, timeout_ms: int = 1200):
 
 class _TestClientApp(ClientApp):
     def __init__(self):
-        super().__init__(enable_monitor=False, init_data=False)
+        storage_patch = patch("main.get_storage", return_value=_FakeStorage())
+        storage_patch.start()
+        try:
+            super().__init__(enable_monitor=False, init_data=False)
+        finally:
+            storage_patch.stop()
         self.pasted = []
 
     def handle_paste(self, data):
         self.pasted.append(data)
+
+
+class _OpenTraceClientApp(_TestClientApp):
+    def __init__(self):
+        self.open_calls = []
+        super().__init__()
+
+    def show_at_cursor(self):
+        self.open_calls.append("show_at_cursor")
+        return super().show_at_cursor()
+
+    def _on_ui_opened(self):
+        self.open_calls.append("on_ui_opened")
+        return super()._on_ui_opened()
 
 
 class _FakeStorage:
@@ -181,13 +212,15 @@ class _FakeStorage:
     def clear_backup_flag(self):
         self.need_backup = False
 
-    def search_history(self, query: str):
+    def search_history(self, query: str, limit=None, semantic=True):
         q = (query or "").lower()
-        return [c for c in self._history if q in str(c.get("content", "")).lower()]
+        rows = [c for c in self._history if q in str(c.get("content", "")).lower()]
+        return rows if limit is None else rows[:limit]
 
-    def search_pinned(self, query: str):
+    def search_pinned(self, query: str, limit=None, semantic=True):
         q = (query or "").lower()
-        return [c for c in self._pinned if q in str(c.get("content", "")).lower()]
+        rows = [c for c in self._pinned if q in str(c.get("content", "")).lower()]
+        return rows if limit is None else rows[:limit]
 
     def get_history(self, limit=20, offset=0):
         return list(self._history)[offset : offset + limit]
@@ -276,6 +309,29 @@ class _SlowFakeStorage(_FakeStorage):
     def get_history(self, limit=20, offset=0):
         time.sleep(0.25)
         return super().get_history(limit, offset)
+
+
+class _SlowSearchStorage(_FakeStorage):
+    def search_history(self, query: str, limit=None, semantic=True):
+        time.sleep(0.25)
+        return super().search_history(query, limit, semantic)
+
+    def search_pinned(self, query: str, limit=None, semantic=True):
+        time.sleep(0.25)
+        return super().search_pinned(query, limit, semantic)
+
+
+class _OutOfOrderSearchStorage(_FakeStorage):
+    def search_history(self, query: str, limit=None, semantic=True):
+        if query == "slow":
+            time.sleep(0.2)
+        rows = [{"id": 1, "type": "text", "content": f"{query} result"}]
+        return rows if limit is None else rows[:limit]
+
+    def search_pinned(self, query: str, limit=None, semantic=True):
+        if query == "slow":
+            time.sleep(0.2)
+        return []
 
 
 class _DeleteObservingStorage(_FakeStorage):
@@ -369,6 +425,9 @@ class _FakeWindll:
 
 
 class KeyboardNavigationTests(unittest.TestCase):
+    def test_search_debounce_is_100ms_for_responsive_typing(self):
+        self.assertEqual(SEARCH_DEBOUNCE_MS, 100)
+
     @classmethod
     def setUpClass(cls):
         _get_qapp()
@@ -616,6 +675,20 @@ class KeyboardNavigationTests(unittest.TestCase):
         app.close()
         QApplication.processEvents()
 
+    def test_toggle_visibility_does_not_duplicate_open_flow(self):
+        _get_qapp()
+        app = _OpenTraceClientApp()
+        app.toggle_visibility()
+        QApplication.processEvents()
+
+        self.assertEqual(app.open_calls.count("show_at_cursor"), 1)
+        self.assertTrue(_wait_until(lambda: app.open_calls.count("on_ui_opened") == 1))
+        self.assertEqual(app.open_calls.count("on_ui_opened"), 1)
+
+        app.backup_scheduler.cancel()
+        app.close()
+        QApplication.processEvents()
+
     def test_ui_open_resets_selection_to_newest_item(self):
         _get_qapp()
         app = _TestClientApp()
@@ -772,14 +845,85 @@ class KeyboardNavigationTests(unittest.TestCase):
         app.close()
         QApplication.processEvents()
 
+    def test_deferred_dirty_refresh_does_not_block_event_loop_on_slow_storage(self):
+        _get_qapp()
+        app = _TestClientApp()
+        app.storage = _SlowFakeStorage(
+            history=[{"id": 1, "type": "text", "content": "delayed"}]
+        )
+        app.is_ui_dirty = True
+
+        app.show_at_cursor()
+        time.sleep(0.07)
+        start = time.monotonic()
+        QApplication.processEvents()
+        elapsed = time.monotonic() - start
+
+        self.assertLess(elapsed, 0.1)
+        self.assertTrue(_wait_until(lambda: app.list_history.count() == 1))
+
+        app.backup_scheduler.cancel()
+        app.close()
+        QApplication.processEvents()
+
+    def test_search_execution_returns_before_slow_storage_search_finishes(self):
+        _get_qapp()
+        app = _TestClientApp()
+        app.storage = _SlowSearchStorage(
+            history=[{"id": 1, "type": "text", "content": "delayed search"}],
+            pinned=[],
+        )
+        app.browser.current_search_query = "delayed"
+
+        start = time.monotonic()
+        app.browser._do_search()
+        elapsed = time.monotonic() - start
+
+        self.assertLess(elapsed, 0.1)
+        self.assertEqual(app.list_history.count(), 0)
+        time.sleep(0.07)
+        start = time.monotonic()
+        QApplication.processEvents()
+        elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 0.1)
+        self.assertTrue(_wait_until(lambda: app.list_history.count() == 1))
+
+        app.backup_scheduler.cancel()
+        app.close()
+        QApplication.processEvents()
+
+    def test_newer_search_result_wins_over_older_slow_result(self):
+        _get_qapp()
+        app = _TestClientApp()
+        app.storage = _OutOfOrderSearchStorage()
+
+        app.browser.current_search_query = "slow"
+        app.browser._do_search()
+        time.sleep(0.07)
+        QApplication.processEvents()
+
+        app.browser.current_search_query = "fast"
+        app.browser._do_search()
+        time.sleep(0.07)
+        QApplication.processEvents()
+
+        self.assertTrue(_wait_until(lambda: app.list_history.count() == 1))
+        current = app.list_history.item(0).data(Qt.ItemDataRole.UserRole)
+        self.assertEqual(current["content"], "fast result")
+
+        app.backup_scheduler.cancel()
+        app.close()
+        QApplication.processEvents()
+
     def test_ready_to_paste_restores_last_active_window_before_ctrl_v(self):
         _get_qapp()
-        app = ClientApp(enable_monitor=False, init_data=False)
+        with patch("main.get_storage", return_value=_FakeStorage()):
+            app = ClientApp(enable_monitor=False, init_data=False)
         app.last_active_window_handle = 200
         user32 = _FakeUser32(foreground=100, target=200)
 
         with patch.object(sys, "platform", "win32"), patch(
-            "main.ctypes.windll", _FakeWindll(user32)
+            "main.ctypes.windll", _FakeWindll(user32), create=True
         ):
             self.assertTrue(app._ready_to_paste())
 

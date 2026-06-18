@@ -25,6 +25,12 @@ class StorageSearchRankingTests(unittest.TestCase):
         self.storage = ClipboardStorage()
 
     def tearDown(self):
+        import storage.db as db
+
+        conn = getattr(db._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            db._local.conn = None
         self.tmp.cleanup()
 
     def _insert_clip(self, content, updated_at, *, pinned=False, tag="", group=""):
@@ -60,6 +66,44 @@ class StorageSearchRankingTests(unittest.TestCase):
         rows = self.storage.search_history("token", limit=10, semantic=False)
 
         self.assertEqual(rows[0]["id"], exact_id)
+
+    def test_history_search_includes_tag_and_group_metadata(self):
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        tagged_id = self._insert_clip("unrelated body", base, tag="linux", group="workspace tools")
+
+        tag_rows = self.storage.search_history("linux", limit=10, semantic=False)
+        group_rows = self.storage.search_history("workspace", limit=10, semantic=False)
+
+        self.assertEqual([row["id"] for row in tag_rows], [tagged_id])
+        self.assertEqual([row["id"] for row in group_rows], [tagged_id])
+
+    def test_tag_prefix_search_filters_to_tag_only_and_prefers_recent(self):
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        older = self._insert_clip("body mentions proxy", base, tag="proxy")
+        newer = self._insert_clip("unrelated body", base + timedelta(minutes=5), tag="proxy-tools")
+        self._insert_clip("tag word only in content", base + timedelta(minutes=10), tag="")
+
+        rows = self.storage.search_history("tag proxy", limit=10, semantic=False)
+
+        self.assertEqual([row["id"] for row in rows], [newer, older])
+
+    def test_tags_prefix_search_matches_partial_tag_keyword(self):
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        tagged_id = self._insert_clip("unrelated body", base, tag="workspace-tools")
+        self._insert_clip("workspace-tools appears only in body", base + timedelta(minutes=5), tag="")
+
+        rows = self.storage.search_history("tags work", limit=10, semantic=False)
+
+        self.assertEqual([row["id"] for row in rows], [tagged_id])
+
+    def test_literal_like_wildcards_do_not_match_everything(self):
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        literal_id = self._insert_clip("literal 100% proxy_token", base)
+        self._insert_clip("ordinary unrelated clip", base + timedelta(minutes=5))
+
+        rows = self.storage.search_history("%", limit=10, semantic=False)
+
+        self.assertEqual([row["id"] for row in rows], [literal_id])
 
 
 if __name__ == "__main__":

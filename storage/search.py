@@ -92,6 +92,12 @@ class SearchService:
         return [term for term in re.split(r"\s+", (query or "").strip()) if term]
 
     @staticmethod
+    def like_pattern(term: str) -> str:
+        """Return a literal contains-match LIKE pattern with wildcard escaping."""
+        escaped = (term or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        return f"%{escaped}%"
+
+    @staticmethod
     def merge_ranked_results(
         *,
         ranked_ids: List[int],
