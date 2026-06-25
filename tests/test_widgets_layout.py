@@ -12,6 +12,9 @@ from PyQt6.QtCore import Qt, QSize, QEvent, QPoint
 from PyQt6.QtWidgets import QApplication, QLabel, QListWidgetItem, QPushButton, QWidget
 
 from ui.clipboard_browser_controller import ClipboardBrowserController
+from ui.clip_delegate import ClipRowDelegate
+from ui.clip_list_view import ClipListView
+from ui.clip_models import HistoryListModel, ROW_ROLE
 from ui.widgets import (
     COLLAPSED_MAX_LINES,
     ClipItemWidget,
@@ -42,8 +45,8 @@ class _BrowserHarness(QWidget):
     def __init__(self):
         super().__init__()
         self.storage = SimpleNamespace()
-        self.list_history = SmoothListWidget()
-        self.list_pinned = SmoothListWidget()
+        self.list_history = ClipListView(HistoryListModel(self))
+        self.list_pinned = ClipListView(HistoryListModel(self))
         self.search_input = SimpleNamespace(setFocus=lambda: None, text=lambda: "")
         self.sidecar = None
         self._updates_enabled = True
@@ -97,6 +100,12 @@ class WidgetLayoutTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         _get_qapp()
+
+    def tearDown(self):
+        app = _get_qapp()
+        for widget in app.topLevelWidgets():
+            widget.close()
+        app.processEvents()
 
     def test_single_line_text_gets_full_height(self):
         lines, height = _visible_text_height("single line", TEXT_FONT, 220, 4)
@@ -252,7 +261,7 @@ class WidgetLayoutTests(unittest.TestCase):
             widget.lbl_tag.y() + widget.lbl_tag.height(),
         )
 
-    def test_initial_refresh_gives_every_history_row_action_tools(self):
+    def test_initial_refresh_gives_every_history_row_action_hitboxes(self):
         harness = _BrowserHarness()
         clips = [
             {"id": idx, "type": "text", "content": f"clip {idx}", "tag": ""}
@@ -268,9 +277,17 @@ class WidgetLayoutTests(unittest.TestCase):
         self.assertEqual(harness.list_history.count(), 3)
         for row in range(harness.list_history.count()):
             item = harness.list_history.item(row)
-            widget = harness.list_history.itemWidget(item)
-            buttons = widget.btn_container.findChildren(QPushButton)
-            self.assertEqual(len(buttons), 3)
+            row_data = item.data(ROW_ROLE)
+            self.assertTrue(row_data.is_clip)
+            index = harness.list_history.model().index(row, 0)
+            option = harness.list_history.viewOptions()
+            option.rect = harness.list_history.visualRect(index)
+            if option.rect.isNull():
+                option.rect = harness.list_history.rect().adjusted(0, row * 80, 0, row * 80 + 80)
+            rects = harness.list_history.itemDelegate().rects_for(option, row_data)
+            self.assertFalse(rects.copy.isNull())
+            self.assertFalse(rects.pin.isNull())
+            self.assertFalse(rects.delete.isNull())
 
     def test_mixed_cjk_text_allocates_full_visible_text_height(self):
         item = {
@@ -395,7 +412,7 @@ class WidgetLayoutTests(unittest.TestCase):
         self.assertTrue(any(btn.toolTip() == "Pin/Unpin" for btn in buttons))
         self.assertTrue(any(btn.toolTip() == "Delete" for btn in buttons))
 
-    def test_resize_reflows_history_row_width(self):
+    def test_resize_reflows_history_delegate_width(self):
         harness = _BrowserHarness()
         harness.list_history.resize(420, 320)
         harness.list_history.show()
@@ -408,31 +425,23 @@ class WidgetLayoutTests(unittest.TestCase):
             "tag": "demo",
             "group_name": "",
         }
-        width = harness.browser._list_content_width(harness.list_history)
-        item = QListWidgetItem(harness.list_history)
-        item.setData(Qt.ItemDataRole.UserRole, clip)
-        ui = ClipItemWidget(clip, False, harness, available_width=width)
-        item.setSizeHint(QSize(width, ui.height()))
-        harness.list_history.addItem(item)
-        harness.list_history.setItemWidget(item, ui)
+        harness.list_history.set_rows(harness.browser.build_history_rows([clip]))
         _get_qapp().processEvents()
 
-        initial_hint_width = item.sizeHint().width()
-        initial_widget_width = ui.width()
+        delegate = harness.list_history.itemDelegate()
+        index = harness.list_history.model().index(0, 0)
+        option = harness.list_history.viewOptions()
+        option.rect = harness.list_history.rect()
+        initial_hint_width = delegate.sizeHint(option, index).width()
 
         harness.list_history.resize(280, 320)
         _get_qapp().processEvents()
         harness.browser._refresh_visible_row_layouts()
         _get_qapp().processEvents()
 
-        resized_item = harness.list_history.item(0)
-        resized_widget = harness.list_history.itemWidget(resized_item)
-        self.assertLess(resized_item.sizeHint().width(), initial_hint_width)
-        self.assertLess(resized_widget.width(), initial_widget_width)
-        self.assertEqual(
-            resized_item.sizeHint().width(),
-            harness.browser._list_content_width(harness.list_history),
-        )
+        option.rect = harness.list_history.rect()
+        resized_hint_width = delegate.sizeHint(option, index).width()
+        self.assertLess(resized_hint_width, initial_hint_width)
 
     def test_action_column_is_flush_to_list_viewport_not_just_row_widget(self):
         harness = _BrowserHarness()
@@ -447,21 +456,15 @@ class WidgetLayoutTests(unittest.TestCase):
             "tag": "demo",
             "group_name": "",
         }
-        width = harness.browser._list_content_width(harness.list_history)
-        item = QListWidgetItem(harness.list_history)
-        item.setData(Qt.ItemDataRole.UserRole, clip)
-        ui = ClipItemWidget(clip, False, harness, available_width=width)
-        item.setSizeHint(QSize(width, ui.height()))
-        harness.list_history.addItem(item)
-        harness.list_history.setItemWidget(item, ui)
+        harness.list_history.set_rows(harness.browser.build_history_rows([clip]))
         _get_qapp().processEvents()
 
-        buttons = ui.btn_container.findChildren(QPushButton)
-        self.assertTrue(buttons)
-        visual_right = max(
-            ui.btn_container.x() + button.x() + button.width()
-            for button in buttons
-        )
+        index = harness.list_history.model().index(0, 0)
+        row_data = index.data(ROW_ROLE)
+        option = harness.list_history.viewOptions()
+        option.rect = harness.list_history.rect()
+        rects = harness.list_history.itemDelegate().rects_for(option, row_data)
+        visual_right = rects.actions.right()
         viewport_right = harness.list_history.viewport().width()
         self.assertLessEqual(viewport_right - visual_right, 12)
 

@@ -81,7 +81,9 @@ class ClipRowMetrics:
         tag_text = item_data.get("tag", "")
         group_name = item_data.get("group_name", "")
         badge_text = tag_text or (f"[{group_name}]" if group_name and not state.is_grouped else "")
-        tag_height = measure_tag_height(badge_text, content_width) if badge_text else 0
+        # Tag sits below action buttons (bottom-right), add to actions column
+        if badge_text:
+            actions_height += QFontMetrics(TAG_FONT).height() + 4 + ACTION_BUTTON_SPACING
 
         if item_data.get("type") == "text":
             text = item_data.get("content", "")
@@ -90,11 +92,11 @@ class ClipRowMetrics:
                 display_text = text[:MAX_DISPLAY_CHARS] + "..."
             max_lines = EXPANDED_MAX_LINES if state.expanded else COLLAPSED_MAX_LINES
             rendered_lines, text_height = measure_visible_text(display_text, content_width, max_lines)
-            content_height = text_height + tag_height + (TAG_SPACING if tag_height else 0)
+            content_height = text_height
         else:
             rendered_lines = 1
             text_height = THUMB_SIZE.height()
-            content_height = THUMB_SIZE.height() + tag_height + (TAG_SPACING if tag_height else 0)
+            content_height = THUMB_SIZE.height()
 
         line_height = QFontMetrics(TAG_FONT).height() + 4
         expand_height = 16 if item_data.get("type") == "text" else 0

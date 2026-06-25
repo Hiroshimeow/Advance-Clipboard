@@ -42,7 +42,6 @@ from PyQt6.QtCore import (
     Qt,
     QTimer,
     pyqtSignal,
-    QSize,
     QEvent,
     QByteArray,
     QBuffer,
@@ -74,14 +73,12 @@ from storage.backup import (
     BackupScheduler,
 )
 from ui.widgets import (
-    SmoothListWidget,
-    LineInfoPopup,
     SearchLineEdit,
-    GroupHeaderWidget,
-    ClipItemWidget,
     PAGE_SIZE_HISTORY,
     PAGE_SIZE_PINNED,
 )
+from ui.clip_list_view import ClipListView
+from ui.clip_models import HistoryListModel, PinnedListModel
 from ui.clipboard_browser_controller import ClipboardBrowserController
 
 # Neural modules are imported only after the user explicitly opens Neural Map.
@@ -314,9 +311,9 @@ class ClientApp(QWidget):
         self.setStyleSheet("""
             QWidget { background-color: #1e1e1e; color: #f0f0f0; font-family: 'Segoe UI', sans-serif; border-radius: 8px; }
             QLabel { font-weight: bold; color: #888; margin: 5px 0; }
-            QListWidget { background-color: #202020; border: 1px solid #3a3a3a; border-radius: 6px; outline: none; padding: 6px; }
-            QListWidget::item { border-bottom: 1px solid #303030; margin: 3px 0px; }
-            QListWidget::item:selected { background-color: #303840; border: 1px solid #3daee9; border-radius: 4px; }
+            QListView { background-color: #202020; border: 1px solid #3a3a3a; border-radius: 6px; outline: none; padding: 6px; }
+            QListView::item { border-bottom: 1px solid #303030; margin: 3px 0px; }
+            QListView::item:selected { background-color: transparent; }
             QScrollBar:vertical { border: none; background: #1f1f1f; width: 8px; margin: 4px 0px 4px 0px; }
             QScrollBar::handle:vertical { background: #555; min-height: 24px; border-radius: 4px; }
             QScrollBar::handle:vertical:hover { background: #666; }
@@ -419,7 +416,7 @@ class ClientApp(QWidget):
 
         # HISTORY column
         col_h = QVBoxLayout()
-        self.list_history = SmoothListWidget()
+        self.list_history = ClipListView(HistoryListModel(self))
         # Keep focus on the search input for keyboard navigation
         self.list_history.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.list_history.setVerticalScrollMode(
@@ -428,13 +425,17 @@ class ClientApp(QWidget):
         self.list_history.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        self.list_history.setResizeMode(SmoothListWidget.ResizeMode.Adjust)
         self.list_history.itemClicked.connect(self.on_item_clicked)
+        self.list_history.rowActivated.connect(self.handle_paste)
+        self.list_history.copyRequested.connect(self.handle_copy_only)
+        self.list_history.pinToggleRequested.connect(self.handle_star)
+        self.list_history.deleteRequested.connect(self.handle_delete)
+        self.list_history.expandToggleRequested.connect(self.handle_toggle_expand)
         col_h.addWidget(self.list_history)
 
         # PINNED column
         col_p = QVBoxLayout()
-        self.list_pinned = SmoothListWidget()
+        self.list_pinned = ClipListView(PinnedListModel(self))
         # Keep focus on the search input for keyboard navigation
         self.list_pinned.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.list_pinned.setVerticalScrollMode(
@@ -443,8 +444,17 @@ class ClientApp(QWidget):
         self.list_pinned.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        self.list_pinned.setResizeMode(SmoothListWidget.ResizeMode.Adjust)
         self.list_pinned.itemClicked.connect(self.on_item_clicked)
+        self.list_pinned.rowActivated.connect(self.handle_paste)
+        self.list_pinned.copyRequested.connect(self.handle_copy_only)
+        self.list_pinned.pinToggleRequested.connect(self.handle_star)
+        self.list_pinned.deleteRequested.connect(self.handle_delete)
+        self.list_pinned.expandToggleRequested.connect(self.handle_toggle_expand)
+        self.list_pinned.groupToggleRequested.connect(
+            lambda group, expanded: self.expand_group(group)
+            if expanded
+            else self.collapse_group(group)
+        )
         col_p.addWidget(self.list_pinned)
 
         # Connect scroll for pagination
@@ -614,7 +624,7 @@ class ClientApp(QWidget):
         )
 
     def _schedule_hidden_ui_refresh(self, clip_id=None, *, full_refresh=False):
-        # Hot path: never rebuild QListWidget rows while the popup is hidden.
+        # Hot path: never rebuild rendered rows while the popup is hidden.
         # Clipboard events can arrive in bursts; rendering the hidden UI on each
         # event is the main reason the app feels progressively laggier.
         self.is_ui_dirty = True
