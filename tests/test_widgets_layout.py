@@ -8,13 +8,14 @@ sys.path.insert(0, ROOT_DIR)
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import Qt, QSize, QEvent, QPoint
-from PyQt6.QtWidgets import QApplication, QLabel, QListWidgetItem, QPushButton, QWidget
+from PyQt6.QtCore import Qt, QSize, QEvent, QPoint, QPointF
+from PyQt6.QtGui import QContextMenuEvent, QMouseEvent
+from PyQt6.QtWidgets import QApplication, QLabel, QListWidgetItem, QMenu, QPushButton, QWidget
 
 from ui.clipboard_browser_controller import ClipboardBrowserController
 from ui.clip_delegate import ClipRowDelegate
 from ui.clip_list_view import ClipListView
-from ui.clip_models import HistoryListModel, ROW_ROLE
+from ui.clip_models import ClipRow, HistoryListModel, ROW_ROLE
 from ui.widgets import (
     COLLAPSED_MAX_LINES,
     ClipItemWidget,
@@ -260,6 +261,103 @@ class WidgetLayoutTests(unittest.TestCase):
             widget.content_container.height(),
             widget.lbl_tag.y() + widget.lbl_tag.height(),
         )
+
+    def test_right_click_does_not_trigger_row_click_action(self):
+        view = ClipListView(HistoryListModel())
+        view.resize(360, 240)
+        view.set_rows([
+            ClipRow(
+                row_kind="clip",
+                clip={"id": 41, "type": "text", "content": "right click me", "tag": ""},
+            )
+        ])
+        view.show()
+        _get_qapp().processEvents()
+
+        calls = []
+        view._emit_action = lambda index, action: calls.append(action)
+        index = view.model().index(0, 0)
+        pos = view.visualRect(index).center()
+        if pos.isNull():
+            pos = QPoint(10, 10)
+        global_pos = view.viewport().mapToGlobal(pos)
+
+        press = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            QPointF(pos),
+            QPointF(global_pos),
+            Qt.MouseButton.RightButton,
+            Qt.MouseButton.RightButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        release = QMouseEvent(
+            QEvent.Type.MouseButtonRelease,
+            QPointF(pos),
+            QPointF(global_pos),
+            Qt.MouseButton.RightButton,
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+
+        view.mousePressEvent(press)
+        view.mouseReleaseEvent(release)
+
+        self.assertEqual(calls, [])
+        self.assertFalse(view._pressed_index.isValid())
+        self.assertIsNone(view._pressed_action)
+
+    def test_context_menu_exposes_tag_and_group_actions(self):
+        class _Storage:
+            def get_groups(self):
+                return ["Work"]
+
+        parent = QWidget()
+        parent.storage = _Storage()
+        parent.handle_add_tag = lambda clip_id, tag: None
+        parent.handle_set_group = lambda clip_id, group: None
+        parent.handle_fix_clip = lambda clip_id, content: None
+        view = ClipListView(HistoryListModel(), parent)
+        view.resize(360, 240)
+        view.set_rows([
+            ClipRow(
+                row_kind="clip",
+                clip={"id": 42, "type": "text", "content": "menu me", "tag": ""},
+            )
+        ])
+        parent.show()
+        view.show()
+        _get_qapp().processEvents()
+
+        seen = []
+        original_exec = QMenu.exec
+
+        def fake_exec(menu, global_pos):
+            for action in menu.actions():
+                seen.append(action.text())
+                submenu = action.menu()
+                if submenu is not None:
+                    seen.extend(sub_action.text() for sub_action in submenu.actions())
+            return None
+
+        index = view.model().index(0, 0)
+        pos = view.visualRect(index).center()
+        if pos.isNull():
+            pos = QPoint(10, 10)
+        event = QContextMenuEvent(
+            QContextMenuEvent.Reason.Mouse,
+            pos,
+            view.viewport().mapToGlobal(pos),
+        )
+
+        QMenu.exec = fake_exec
+        try:
+            view.contextMenuEvent(event)
+        finally:
+            QMenu.exec = original_exec
+
+        self.assertIn("Add to Group", seen)
+        self.assertIn("Work", seen)
+        self.assertIn("Add Tag", seen)
 
     def test_initial_refresh_gives_every_history_row_action_hitboxes(self):
         harness = _BrowserHarness()

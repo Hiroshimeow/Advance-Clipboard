@@ -177,11 +177,21 @@ class ClipListView(QListView):
         return ClipRow(row_kind="group_header", group_name=text, group_count=0)
 
     def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            self._pressed_index = QModelIndex()
+            self._pressed_action = None
+            super().mousePressEvent(event)
+            return
         self._pressed_index = self.indexAt(event.position().toPoint())
         self._pressed_action = self._hit_action(self._pressed_index, event.position().toPoint())
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            self._pressed_index = QModelIndex()
+            self._pressed_action = None
+            super().mouseReleaseEvent(event)
+            return
         index = self.indexAt(event.position().toPoint())
         action = self._hit_action(index, event.position().toPoint())
         if index.isValid() and index == self._pressed_index and action == self._pressed_action:
