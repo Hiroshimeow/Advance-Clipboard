@@ -77,9 +77,6 @@ class _StubStorage:
     def set_backup_callback(self, callback):
         self.backup_callback = callback
 
-    def set_neural_event_callback(self, callback):
-        self.neural_callback = callback
-
     def clear_backup_flag(self):
         self.need_backup = False
 
@@ -89,13 +86,13 @@ class _StubStorage:
         self._clips.insert(0, {"id": clip_id, "type": clip_type, "content": content, "tag": tag})
         return clip_id, True
 
-    def search_history(self, query, limit=None, semantic=True):
+    def search_history(self, query, limit=None, ranked=True):
         return []
 
     def get_history(self, limit=20, offset=0):
         return self._clips[offset : offset + limit]
 
-    def search_pinned(self, query, limit=None, semantic=True):
+    def search_pinned(self, query, limit=None, ranked=True):
         return []
 
     def get_groups(self):

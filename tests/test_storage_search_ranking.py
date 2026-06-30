@@ -52,7 +52,7 @@ class StorageSearchRankingTests(unittest.TestCase):
         old_id = self._insert_clip("deploy server config alpha", base)
         recent_id = self._insert_clip("deploy server config beta", base + timedelta(minutes=5))
 
-        rows = self.storage.search_history("deploy server", limit=10, semantic=False)
+        rows = self.storage.search_history("deploy server", limit=10, ranked=False)
 
         self.assertGreaterEqual(len(rows), 2)
         self.assertEqual(rows[0]["id"], recent_id)
@@ -63,7 +63,7 @@ class StorageSearchRankingTests(unittest.TestCase):
         exact_id = self._insert_clip("token", base)
         self._insert_clip("token renewal script for production", base + timedelta(minutes=5))
 
-        rows = self.storage.search_history("token", limit=10, semantic=False)
+        rows = self.storage.search_history("token", limit=10, ranked=False)
 
         self.assertEqual(rows[0]["id"], exact_id)
 
@@ -71,8 +71,8 @@ class StorageSearchRankingTests(unittest.TestCase):
         base = datetime(2026, 1, 1, 12, 0, 0)
         tagged_id = self._insert_clip("unrelated body", base, tag="linux", group="workspace tools")
 
-        tag_rows = self.storage.search_history("linux", limit=10, semantic=False)
-        group_rows = self.storage.search_history("workspace", limit=10, semantic=False)
+        tag_rows = self.storage.search_history("linux", limit=10, ranked=False)
+        group_rows = self.storage.search_history("workspace", limit=10, ranked=False)
 
         self.assertEqual([row["id"] for row in tag_rows], [tagged_id])
         self.assertEqual([row["id"] for row in group_rows], [tagged_id])
@@ -83,7 +83,7 @@ class StorageSearchRankingTests(unittest.TestCase):
         newer = self._insert_clip("unrelated body", base + timedelta(minutes=5), tag="proxy-tools")
         self._insert_clip("tag word only in content", base + timedelta(minutes=10), tag="")
 
-        rows = self.storage.search_history("tag proxy", limit=10, semantic=False)
+        rows = self.storage.search_history("tag proxy", limit=10, ranked=False)
 
         self.assertEqual([row["id"] for row in rows], [newer, older])
 
@@ -92,7 +92,7 @@ class StorageSearchRankingTests(unittest.TestCase):
         tagged_id = self._insert_clip("unrelated body", base, tag="workspace-tools")
         self._insert_clip("workspace-tools appears only in body", base + timedelta(minutes=5), tag="")
 
-        rows = self.storage.search_history("tags work", limit=10, semantic=False)
+        rows = self.storage.search_history("tags work", limit=10, ranked=False)
 
         self.assertEqual([row["id"] for row in rows], [tagged_id])
 
@@ -101,7 +101,7 @@ class StorageSearchRankingTests(unittest.TestCase):
         literal_id = self._insert_clip("literal 100% proxy_token", base)
         self._insert_clip("ordinary unrelated clip", base + timedelta(minutes=5))
 
-        rows = self.storage.search_history("%", limit=10, semantic=False)
+        rows = self.storage.search_history("%", limit=10, ranked=False)
 
         self.assertEqual([row["id"] for row in rows], [literal_id])
 

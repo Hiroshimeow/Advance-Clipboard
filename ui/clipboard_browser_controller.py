@@ -56,7 +56,7 @@ class ClipboardBrowserController:
         self._layout_refresh_timer.setSingleShot(True)
         self._layout_refresh_timer.timeout.connect(self._refresh_visible_row_layouts)
 
-        self._focus_query_timer = None
+
 
     def bind_viewports(self):
         if hasattr(self.app, "list_history") and hasattr(self.app, "list_pinned"):
@@ -234,7 +234,7 @@ class ClipboardBrowserController:
 
         # Ensure we have a valid selection in the active list
         self._ensure_current_item()
-        self._sync_selection_to_map()
+
 
     def reset_for_hotkey_open(self, refresh=False):
         """Reset transient UI state when user re-opens via hotkey."""
@@ -247,7 +247,7 @@ class ClipboardBrowserController:
         if self.app.list_history.count() > 0:
             self.app.list_history.scrollToTop()
         self._apply_default_selection()
-        self._sync_selection_to_map()
+
 
     def set_active_side(self, side):
         """Switch between history and pinned columns."""
@@ -261,7 +261,7 @@ class ClipboardBrowserController:
             self.app.list_pinned.set_active_visual(side == "pinned")
 
         self._ensure_current_item()
-        self._sync_selection_to_map()
+
 
     def _active_list(self):
         return (
@@ -384,7 +384,7 @@ class ClipboardBrowserController:
             w.setCurrentRow(r)
             w.scrollToSelected()
         self.app.search_input.setFocus()
-        self._sync_selection_to_map()
+
 
     def nav_down(self):
         w = self._active_list()
@@ -396,7 +396,7 @@ class ClipboardBrowserController:
             w.setCurrentRow(r)
             w.scrollToSelected()
         self.app.search_input.setFocus()
-        self._sync_selection_to_map()
+
 
     def nav_left(self):
         self.set_active_side("history")
@@ -427,11 +427,7 @@ class ClipboardBrowserController:
             self.active_side = "history"
             self.app.list_history.setCurrentRow(-1)
             self.app.list_pinned.setCurrentRow(-1)
-        # Sync to sidecar immediately
-        if self.app.sidecar:
-            self.app.sidecar.search_bar.blockSignals(True)
-            self.app.sidecar.search_bar.setText(text)
-            self.app.sidecar.search_bar.blockSignals(False)
+
         # Debounce typing enough to avoid rebuilding QWidget rows for every key.
         # Search still feels live, but avoids UI-thread thrashing.
         self.search_debounce_timer.start(SEARCH_DEBOUNCE_MS)
@@ -454,7 +450,7 @@ class ClipboardBrowserController:
         # result. Clearing search resets to the newest history item.
         self.refresh_lists(maintain_selection=False)
         self._last_search_query = query
-        self._sync_sidecar_query(query)
+
 
     def _start_search_worker(self, query, generation):
         self._search_worker_generation = generation
@@ -473,12 +469,12 @@ class ClipboardBrowserController:
             history_clips = self.storage.search_history(
                 query,
                 limit=SEARCH_PAGE_SIZE_HISTORY,
-                semantic=True,
+                ranked=True,
             )
             pinned_clips = self.storage.search_pinned(
                 query,
                 limit=SEARCH_PAGE_SIZE_PINNED,
-                semantic=True,
+                ranked=True,
             )
             self._search_result_queue.put(
                 (generation, query, history_clips, pinned_clips, None)
@@ -534,45 +530,11 @@ class ClipboardBrowserController:
             self.app.setUpdatesEnabled(True)
             self._is_refreshing = False
         self._last_search_query = query
-        self._sync_sidecar_query(query)
 
-    def _sync_sidecar_query(self, query):
-        # Sync search to sidecar map
-        if self.app.sidecar:
-            # Delayed zoom to matching nodes
-            if not self._focus_query_timer:
-                self._focus_query_timer = QTimer(self.app)
-                self._focus_query_timer.setSingleShot(True)
 
-            self._focus_query_timer.stop()
-            try:
-                self._focus_query_timer.timeout.disconnect()
-            except:
-                pass
-            self._focus_query_timer.timeout.connect(
-                lambda: self.app.sidecar.focus_query(query)
-                if self.app.sidecar
-                else None
-            )
-            self._focus_query_timer.start(300)
 
-    def _sync_selection_to_map(self):
-        """Sync the currently selected clip to the neural map (focus node)."""
-        if (
-            not self.app.sidecar
-            or not hasattr(self.app.sidecar, "isVisible")
-            or not self.app.sidecar.isVisible()
-        ):
-            return
-        w = self._active_list()
-        if not w:
-            return
-        ci = w.currentItem()
-        if not self._is_pasteable_item(ci):
-            return
-        d = ci.data(Qt.ItemDataRole.UserRole)
-        if isinstance(d, dict) and "id" in d:
-            self.app.sidecar.focus_node(d["id"])
+
+
 
     def refresh_lists(self, maintain_selection=True):
         """Refresh both history and pinned lists."""
@@ -613,7 +575,7 @@ class ClipboardBrowserController:
                 history_clips = self.storage.search_history(
                     self.current_search_query,
                     limit=SEARCH_PAGE_SIZE_HISTORY,
-                    semantic=True,
+                    ranked=True,
                 )
                 self.history_has_more = False  # Search returns first fast page
             else:
@@ -657,7 +619,7 @@ class ClipboardBrowserController:
             pinned_clips = self.storage.search_pinned(
                 self.current_search_query,
                 limit=SEARCH_PAGE_SIZE_PINNED,
-                semantic=True,
+                ranked=True,
             )
             self.pinned_has_more = False  # Search returns first fast page
             self.app.list_pinned.set_rows(self.build_pinned_rows(pinned_clips=pinned_clips))
@@ -779,7 +741,7 @@ class ClipboardBrowserController:
 
     def reset_after_delete_refresh(self):
         self._ensure_current_item()
-        self._sync_selection_to_map()
+
 
     def _append_items(self, list_widget, clips, is_pinned):
         list_widget.append_rows(

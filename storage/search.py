@@ -5,13 +5,13 @@ import threading
 from datetime import date
 from typing import List, Dict, Any, Optional
 from .db import get_connection, transaction
-from .rag_search import LightRAGRetriever
+from .hybrid_search import HybridSearchRetriever
 
 
 class SearchService:
     def __init__(self):
         self._search_revision = 0
-        self._retriever = LightRAGRetriever()
+        self._retriever = HybridSearchRetriever()
 
     def add_record(self, namespace: str, record: Dict[str, Any]):
         self._retriever.add_record(namespace, record)
@@ -40,11 +40,11 @@ class SearchService:
         self._search_revision += 1
 
     def trigger_daily_rebuild(self, storage_facade):
-        """Trigger a background RAG index rebuild if not done today."""
+        """Trigger a background search index rebuild if not done today."""
         today = date.today().isoformat()
         # Marker file is in the project root (one level up from package)
         BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        marker_path = os.path.join(BASE_DIR, ".rag_last_rebuild")
+        marker_path = os.path.join(BASE_DIR, ".search_last_rebuild")
 
         last_rebuild = ""
         try:
@@ -55,10 +55,10 @@ class SearchService:
             pass
 
         if last_rebuild == today:
-            print(f"[RAG] Already rebuilt today ({today}), skipping")
+            print(f"[Search] Already rebuilt today ({today}), skipping")
             return
 
-        print(f"[RAG] Daily rebuild triggered (last={last_rebuild}, today={today})")
+        print(f"[Search] Daily rebuild triggered (last={last_rebuild}, today={today})")
 
         def _do_rebuild():
             # Rebuild history index
@@ -83,7 +83,7 @@ class SearchService:
                 pass
 
         threading.Thread(
-            target=_do_rebuild, daemon=True, name="RAG-DailyRebuild"
+            target=_do_rebuild, daemon=True, name="Search-DailyRebuild"
         ).start()
 
     @staticmethod
@@ -101,12 +101,12 @@ class SearchService:
     def merge_ranked_results(
         *,
         ranked_ids: List[int],
-        semantic_rows: List[Dict[str, Any]],
+        indexed_rows: List[Dict[str, Any]],
         lexical_rows: List[Dict[str, Any]],
         limit: int,
     ) -> List[Dict[str, Any]]:
         """Preserve hybrid ranking while keeping lexical fallback coverage."""
-        rows_by_id = {int(row["id"]): row for row in semantic_rows}
+        rows_by_id = {int(row["id"]): row for row in indexed_rows}
         ordered_rows: List[Dict[str, Any]] = []
         seen_ids = set()
 

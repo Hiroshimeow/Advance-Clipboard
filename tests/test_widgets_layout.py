@@ -53,7 +53,6 @@ class _BrowserHarness(QWidget):
         self.list_history = ClipListView(HistoryListModel(self))
         self.list_pinned = ClipListView(HistoryListModel(self))
         self.search_input = SimpleNamespace(setFocus=lambda: None, text=lambda: "")
-        self.sidecar = None
         self._updates_enabled = True
         self.browser = ClipboardBrowserController(self)
 
@@ -71,12 +70,12 @@ class _SearchProbeStorage:
     def __init__(self):
         self.calls = []
 
-    def search_history(self, query, limit=None, semantic=True):
-        self.calls.append(("history", query, limit, semantic))
+    def search_history(self, query, limit=None, ranked=True):
+        self.calls.append(("history", query, limit, ranked))
         return []
 
-    def search_pinned(self, query, limit=None, semantic=True):
-        self.calls.append(("pinned", query, limit, semantic))
+    def search_pinned(self, query, limit=None, ranked=True):
+        self.calls.append(("pinned", query, limit, ranked))
         return []
 
 

@@ -16,12 +16,6 @@ from PyQt6.QtGui import QKeyEvent
 # Ensure headless Qt (caller also sets this env var)
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-# Mock heavy Neural modules BEFORE importing main to avoid WebEngine crash in tests
-sys.modules.setdefault("neural.engine", MagicMock())
-sys.modules.setdefault("neural.ui", MagicMock())
-sys.modules.setdefault("neural.bridge", MagicMock())
-sys.modules.setdefault("PyQt6.QtWebEngineWidgets", MagicMock())
-sys.modules.setdefault("PyQt6.QtWebChannel", MagicMock())
 
 if not hasattr(ctypes, "WINFUNCTYPE"):
     ctypes.WINFUNCTYPE = ctypes.CFUNCTYPE
@@ -32,86 +26,6 @@ _clipboard_monitor_mod.VK_CONTROL = 0x11
 _clipboard_monitor_mod.VK_MENU = 0x12
 _clipboard_monitor_mod.simulate_paste = MagicMock()
 sys.modules["core.clipboard_monitor"] = _clipboard_monitor_mod
-
-# Patch NeuralEngine and SidecarWindow with safe stubs
-
-_neural_engine_mod = types.ModuleType("neural.engine")
-
-
-class _StubEngine:
-    name = "NeuralEngine"
-
-    def __init__(self, *a, **kw):
-        pass
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-
-_neural_engine_mod.NeuralEngine = _StubEngine
-sys.modules["neural.engine"] = _neural_engine_mod
-
-_neural_ui_mod = types.ModuleType("neural.ui")
-
-
-class _StubSidecar:
-    def __init__(self, *a, **kw):
-        self.bridge = MagicMock()
-        self.bridge.node_clicked = MagicMock()
-        self.bridge.node_clicked.connect = MagicMock()
-        self.search_bar = MagicMock()
-        self.search_bar.textChanged = MagicMock()
-        self.search_bar.textChanged.connect = MagicMock()
-
-    def show(self):
-        pass
-
-    def hide(self):
-        pass
-
-    def close(self):
-        pass
-
-    def move(self, *a):
-        pass
-
-    def resize(self, *a):
-        pass
-
-    def setGeometry(self, *a):
-        pass
-
-    def setWindowTitle(self, *a):
-        pass
-
-    def update_data(self, *a):
-        pass
-
-    def focus_node(self, *a):
-        pass
-
-    def focus_query(self, *a):
-        pass
-
-    def reload_config(self, *a):
-        pass
-
-    def grab(self):
-        return MagicMock()
-
-    def isVisible(self):
-        return False
-
-    def isActiveWindow(self):
-        return False
-
-
-_neural_ui_mod.SidecarWindow = _StubSidecar
-sys.modules["neural.ui"] = _neural_ui_mod
-
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication, QListWidgetItem
@@ -206,18 +120,16 @@ class _FakeStorage:
     def set_backup_callback(self, callback):
         return
 
-    def set_neural_event_callback(self, callback):
-        return
 
     def clear_backup_flag(self):
         self.need_backup = False
 
-    def search_history(self, query: str, limit=None, semantic=True):
+    def search_history(self, query: str, limit=None, ranked=True):
         q = (query or "").lower()
         rows = [c for c in self._history if q in str(c.get("content", "")).lower()]
         return rows if limit is None else rows[:limit]
 
-    def search_pinned(self, query: str, limit=None, semantic=True):
+    def search_pinned(self, query: str, limit=None, ranked=True):
         q = (query or "").lower()
         rows = [c for c in self._pinned if q in str(c.get("content", "")).lower()]
         return rows if limit is None else rows[:limit]
@@ -312,23 +224,23 @@ class _SlowFakeStorage(_FakeStorage):
 
 
 class _SlowSearchStorage(_FakeStorage):
-    def search_history(self, query: str, limit=None, semantic=True):
+    def search_history(self, query: str, limit=None, ranked=True):
         time.sleep(0.25)
-        return super().search_history(query, limit, semantic)
+        return super().search_history(query, limit, ranked)
 
-    def search_pinned(self, query: str, limit=None, semantic=True):
+    def search_pinned(self, query: str, limit=None, ranked=True):
         time.sleep(0.25)
-        return super().search_pinned(query, limit, semantic)
+        return super().search_pinned(query, limit, ranked)
 
 
 class _OutOfOrderSearchStorage(_FakeStorage):
-    def search_history(self, query: str, limit=None, semantic=True):
+    def search_history(self, query: str, limit=None, ranked=True):
         if query == "slow":
             time.sleep(0.2)
         rows = [{"id": 1, "type": "text", "content": f"{query} result"}]
         return rows if limit is None else rows[:limit]
 
-    def search_pinned(self, query: str, limit=None, semantic=True):
+    def search_pinned(self, query: str, limit=None, ranked=True):
         if query == "slow":
             time.sleep(0.2)
         return []

@@ -11,7 +11,7 @@ from .db import (
     get_connection,
     transaction,
     init_db,
-    init_neural_tables,
+
     DB_FILE,
 )
 
@@ -22,54 +22,6 @@ _transaction = transaction
 from .clips import ClipRepository, compute_hash
 from .search import SearchService
 
-_NEURAL_REPOSITORY_IMPORT_ERROR: Exception | None = None
-
-try:
-    from .neural import NeuralRepository
-except Exception as exc:
-    _NEURAL_REPOSITORY_IMPORT_ERROR = exc
-
-    class NeuralRepository:
-        """No-op fallback so clipboard core can boot without neural extras."""
-
-        def save_vector(self, clip_id: int, vector_bytes: bytes):
-            return None
-
-        def get_vector(self, clip_id: int) -> Optional[bytes]:
-            return None
-
-        def save_links(self, links_list: List[Tuple[int, int, float]]):
-            return None
-
-        def get_links(self, clip_id_list: List[int]) -> List[Dict[str, Any]]:
-            return []
-
-        def get_unindexed_clip_ids(self, limit: int = 100) -> List[int]:
-            return []
-
-        def get_recent_history_ids(self, limit: int = 200) -> List[int]:
-            return []
-
-        def get_all_pinned_ids(self) -> List[int]:
-            return []
-
-        def get_unindexed_ids_within_window(
-            self, recent_limit: int = 200, include_pinned: bool = True, limit: int = 100
-        ) -> List[int]:
-            return []
-
-        def get_neural_window_totals(
-            self, recent_limit: int = 200, include_pinned: bool = True
-        ) -> Tuple[int, int]:
-            return 0, 0
-
-        def get_all_clip_ids_with_vectors(self, limit: int = 500) -> List[int]:
-            return []
-
-        def get_neural_data(
-            self, clip_ids: List[int]
-        ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-            return [], []
 
 
 def _lexical_rank(row: Dict[str, Any], query: str, *, include_meta: bool = False) -> int:
@@ -157,21 +109,19 @@ class ClipboardStorage:
     def __init__(self):
         self.clips = ClipRepository()
         self.search = SearchService()
-        self.neural = NeuralRepository()
 
-        self._neural_event_callback = None
+
+
 
         # Initialize tables
         init_db()
-        init_neural_tables()
+
 
     def set_backup_callback(self, callback):
         """Set callback to trigger backup when data changes."""
         self._backup_callback = callback
 
-    def set_neural_event_callback(self, callback):
-        """Set callback for lightweight neural enqueue events."""
-        self._neural_event_callback = callback
+
 
     def _mark_dirty(self):
         """Mark that backup is needed."""
@@ -180,12 +130,7 @@ class ClipboardStorage:
         if self._backup_callback:
             self._backup_callback()
 
-    def _emit_neural_event(self, event_type: str, clip_id: int):
-        if self._neural_event_callback:
-            try:
-                self._neural_event_callback(event_type, clip_id)
-            except Exception:
-                pass
+
 
     def trigger_daily_rebuild(self):
         self.search.trigger_daily_rebuild(self)
@@ -213,7 +158,7 @@ class ClipboardStorage:
             clip = self.get_clip_by_id(clip_id)
             if clip and clip.get("type") == "text":
                 self.search.add_record("pinned" if was_pinned else "history", clip)
-            self._emit_neural_event("new_clip", clip_id)
+
 
         return clip_id, is_new
 
@@ -221,14 +166,14 @@ class ClipboardStorage:
         ok = self.clips.pin_clip(clip_id)
         if ok:
             self._mark_dirty()
-            self._emit_neural_event("pin_state_changed", clip_id)
+
         return ok
 
     def unpin_clip(self, clip_id: int) -> bool:
         ok = self.clips.unpin_clip(clip_id)
         if ok:
             self._mark_dirty()
-            self._emit_neural_event("pin_state_changed", clip_id)
+
         return ok
 
     def delete_clip(self, clip_id: int) -> bool:
@@ -320,7 +265,7 @@ class ClipboardStorage:
     # ==================== SEARCH OPERATIONS (delegated) ====================
 
     def search_pinned(
-        self, query: str, limit: int = 20, *, semantic: bool = True
+        self, query: str, limit: int = 20, *, ranked: bool = True
     ) -> List[Dict[str, Any]]:
         tag_query = _parse_tag_search_query(query)
         if tag_query is not None:
@@ -338,7 +283,7 @@ class ClipboardStorage:
             include_meta=True,
             pinned_tiebreaker=True,
         )
-        if not semantic:
+        if not ranked:
             return ranked_lexical_rows[:limit]
         if self.search.has_index("pinned"):
             all_rows = self._get_all_pinned_for_search()
@@ -351,7 +296,7 @@ class ClipboardStorage:
             )
             return self.search.merge_ranked_results(
                 ranked_ids=ranked_ids,
-                semantic_rows=all_rows,
+                indexed_rows=all_rows,
                 lexical_rows=ranked_lexical_rows,
                 limit=limit,
             )
@@ -392,7 +337,7 @@ class ClipboardStorage:
         return [dict(r) for r in rows]
 
     def search_history(
-        self, query: str, limit: int = 20, *, semantic: bool = True
+        self, query: str, limit: int = 20, *, ranked: bool = True
     ) -> List[Dict[str, Any]]:
         tag_query = _parse_tag_search_query(query)
         if tag_query is not None:
@@ -410,7 +355,7 @@ class ClipboardStorage:
             include_meta=True,
             pinned_tiebreaker=False,
         )
-        if not semantic:
+        if not ranked:
             return ranked_lexical_rows[:limit]
         if self.search.has_index("history"):
             all_rows = self._get_all_history_for_search()
@@ -423,7 +368,7 @@ class ClipboardStorage:
             )
             return self.search.merge_ranked_results(
                 ranked_ids=ranked_ids,
-                semantic_rows=all_rows,
+                indexed_rows=all_rows,
                 lexical_rows=ranked_lexical_rows,
                 limit=limit,
             )
@@ -486,56 +431,14 @@ class ClipboardStorage:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    # ==================== NEURAL OPERATIONS (delegated) ====================
 
-    def save_vector(self, clip_id: int, vector_bytes: bytes):
-        self.neural.save_vector(clip_id, vector_bytes)
-
-    def get_vector(self, clip_id: int) -> Optional[bytes]:
-        return self.neural.get_vector(clip_id)
-
-    def save_links(self, links_list: List[Tuple[int, int, float]]):
-        self.neural.save_links(links_list)
-
-    def get_links(self, clip_id_list: List[int]) -> List[Dict[str, Any]]:
-        return self.neural.get_links(clip_id_list)
-
-    def get_unindexed_clip_ids(self, limit: int = 100) -> List[int]:
-        return self.neural.get_unindexed_clip_ids(limit)
-
-    def get_recent_history_ids(self, limit: int = 200) -> List[int]:
-        return self.neural.get_recent_history_ids(limit)
-
-    def get_all_pinned_ids(self) -> List[int]:
-        return self.neural.get_all_pinned_ids()
-
-    def get_unindexed_ids_within_window(
-        self, recent_limit: int = 200, include_pinned: bool = True, limit: int = 100
-    ) -> List[int]:
-        return self.neural.get_unindexed_ids_within_window(
-            recent_limit, include_pinned, limit
-        )
-
-    def get_neural_window_totals(
-        self, recent_limit: int = 200, include_pinned: bool = True
-    ) -> Tuple[int, int]:
-        return self.neural.get_neural_window_totals(recent_limit, include_pinned)
-
-    def get_all_clip_ids_with_vectors(self, limit: int = 500) -> List[int]:
-        return self.neural.get_all_clip_ids_with_vectors(limit)
-
-    def get_neural_data(
-        self, clip_ids: List[int]
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        return self.neural.get_neural_data(clip_ids)
 
 
 # Global instance
 _storage: Optional[ClipboardStorage] = None
 
 
-def get_neural_support_error() -> Exception | None:
-    return _NEURAL_REPOSITORY_IMPORT_ERROR
+
 
 
 def get_storage() -> ClipboardStorage:

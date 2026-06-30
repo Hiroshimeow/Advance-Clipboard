@@ -1,71 +1,51 @@
 # Advance Clipboard Manager
 
-A powerful clipboard manager for Windows with SQLite storage, group organization, hybrid search, and an AI-powered **Neural Memory Map** that visualizes semantic relationships between your clips as an interactive galaxy.
+A lightweight Windows clipboard manager with SQLite storage, pinned clips, groups, tags, image support, and fast local search. The app is intentionally dependency-light and runs without WebEngine or local embedding models.
 
-![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
+![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)
 ![PyQt6](https://img.shields.io/badge/PyQt6-6.4+-green.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey.svg)
-![AI](https://img.shields.io/badge/AI-SentenceTransformers-orange.svg)
-
-## Screenshots
-
-**Main UI with Neural Memory Map — hover a node to inspect clip content:**
-
-![Neural Map with Hover Tooltip](docs/screenshots/neural-map-hover.png)
-
-**Galaxy overview — zoomed out to see the full clip network:**
-
-![Main UI and Map Overview](docs/screenshots/main-ui-map-overview.png)
 
 ## Features
 
 ### Clipboard Manager
-- **History & Pinned**: Separate lists for recent clips and pinned favorites
-- **Text & Image Support**: Store both text snippets and images
-- **Duplicate Detection**: MD5 hash prevents duplicate entries
-- **Tagging**: Add custom tags to pinned items
-- **Groups**: Organize pinned clips into collapsible groups (e.g., `docker`, `ssh`)
-- **Quick Paste**: Click or Enter to paste directly into active window
-- **SQLite Storage**: Fast, reliable database with WAL mode
-- **Auto Backup**: JSON backup every 30 seconds with checksum validation
-- **Disaster Recovery**: Auto-restore from backup if database corrupts
 
-### Hybrid Search
-- **Real-time lexical + light RAG retrieval** across pinned and history
-- Incremental RAG index — new clips added instantly, full rebuild once per day in background
-- Search **never blocks** the UI — falls back to instant SQL if RAG index isn't ready
+- History and pinned lists for recent clips and favorites.
+- Text and image clip support.
+- Duplicate detection by content hash.
+- Tags for pinned items.
+- Collapsible groups for pinned clips.
+- Click or press Enter to paste into the active window.
+- SQLite storage with WAL mode.
+- Debounced JSON backups with checksum validation.
+- Recovery from valid backup if the database is missing or corrupt.
 
-### Neural Memory Map
+### Search
 
-An AI-powered visualization that maps semantic relationships between your clipboard clips:
+- Debounced search across history and pinned clips.
+- SQL lexical matching with local dependency-free hybrid ranking.
+- Tag search via `tag <keyword>` or `tags <keyword>`.
+- Search is asynchronous so typing does not block the UI.
+- Triple-click or clear buttons reset the search box.
 
-- **AI Indexing**: Uses `sentence-transformers/all-MiniLM-L6-v2` to encode clip embeddings on CPU
-- **Background Processing**: Daemon thread — never lags the UI
-- **Bounded Window**: Only indexes pinned clips + N most recent clips (configurable), not your entire history
-- **Lexical Boosting**: Commands with shared prefixes (e.g., `/acp spawn codex`, `/acp spawn gemini`) get similarity boosts even when cosine similarity alone is low
-- **Galaxy Visualization**: D3.js force-directed graph with:
-  - Rainbow node colors by degree (red → violet)
-  - Twinkling star animation
-  - HTML tooltips showing up to 900 characters on hover
-  - Always-visible labels
-  - Config-driven visual settings (colors, sizes, forces, thresholds)
-- **Two display modes**:
-  - **Neural** button → floating independent window with its own search bar
-  - **Map ON/OFF** button → docked to main UI, hides together with Ctrl+Alt+V
-- **Live config reload**: Edit `neural/config.json` → close/reopen map → changes apply instantly
+### Pinned Clip Editor
+
+- Pinned clips can be opened in a small native popup window.
+- The popup can be moved and resized by the OS window frame.
+- The title uses the clip tag when present.
+- In-popup search jumps between highlighted matches.
 
 ## Installation
 
 ```bash
-# Clone repository
 git clone https://github.com/Hiroshimeow/Advance-Clipboard.git
 cd Advance-Clipboard
 
-# Option A: using uv (recommended)
+# uv
 uv sync
 uv run main.py
 
-# Option B: using pip
+# pip
 pip install -r requirements.txt
 python main.py
 ```
@@ -73,7 +53,7 @@ python main.py
 ## Usage
 
 | Hotkey | Action |
-|--------|--------|
+| --- | --- |
 | `Ctrl+Alt+V` | Toggle clipboard manager |
 | `Esc` | Hide window |
 | `Enter` | Paste selected item |
@@ -82,137 +62,60 @@ python main.py
 ### Item Actions
 
 | Button | Action |
-|--------|--------|
-| `❐` | Copy to clipboard (no paste) |
-| `☆/★` | Pin/Unpin item |
-| `✕` | Delete item |
-| `▲/▼` | Move item up/down |
+| --- | --- |
+| `Copy` | Copy to clipboard without pasting |
+| `Star` | Pin or unpin item |
+| `Delete` | Delete item |
+| `Up/Down` | Move pinned item order |
+| `Expand` | Show more clip content inline |
 
-### Context Menu (Right-click on pinned item)
+### Context Menu
 
-| Action | Description |
-|--------|-------------|
-| `📁 Add to Group` | Add clip to existing group |
-| `➕ New Group...` | Create new group and add clip |
-| `❌ Remove from 'group'` | Remove clip from current group |
-| `🏷️ Add Tag` | Add/edit tag |
+Right-click a pinned clip to:
 
-### Neural Memory Map
-
-| Button | Behavior |
-|--------|----------|
-| **Neural** | Opens a floating map window (independent, stays open) |
-| **Map ON/OFF** | Docks map to main UI (hides together with Ctrl+Alt+V) |
-
-- **Search in map**: Use the search bar inside the map window to highlight matching nodes
-- **Hover nodes**: Shows tooltip with clip content (up to 900 chars)
-- **Click nodes**: Searches for that clip in the main UI
-
-### Search
-
-- Type to filter pinned clips in real-time (200ms debounce)
-- Hybrid retrieval combines SQL matching with local semantic reranking
-- **Triple-click** or **Clear button** to clear search text
-- Search is cleared after paste
-
-### Groups
-
-- Click group header to expand/collapse
-- Group state persists across hide/show
-- Clips in same group are visually grouped together
+- add it to an existing group,
+- create a new group,
+- remove it from a group,
+- add or edit a tag.
 
 ## Architecture
 
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  Clipboard   │────▶│   SQLite    │────▶│  Light RAG  │────▶│     UI      │
-│  Monitor     │     │  (storage)  │     │ (retrieval) │     │   (PyQt6)   │
-└─────────────┘     └──────┬──────┘     └─────────────┘     └──────┬──────┘
-                           │                                       │
-                    ┌──────┴──────┐                         ┌──────┴──────┐
-                    │ JSON Backup │                         │   Sidecar   │
-                    │ (30s cycle) │                         │ Neural Map  │
-                    └─────────────┘                         │  (D3.js)   │
-                                                            └──────┬──────┘
-                                                                   │
-                                                            ┌──────┴──────┐
-                                                            │   Neural    │
-                                                            │   Engine    │
-                                                            │ (AI thread) │
-                                                            └─────────────┘
+```text
+Clipboard Monitor -> SQLite Storage -> Search/Ranking -> PyQt6 UI
+                         |
+                         -> JSON Backup
 ```
 
 ### Data Flow
 
-- **Read**: UI ← hybrid retrieval ← SQLite (pagination, 20 items/page)
-- **Write**: Clipboard change → SQLite (immediate, <5ms) → incremental neural index
-- **Search**: SQL lexical + local semantic reranking (no external API)
-- **Neural**: Background thread encodes embeddings → computes cosine similarity + lexical boosts → stores links in SQLite
-- **Backup**: SQLite → JSON (every 30s or on exit)
-- **Recovery**: JSON → SQLite (on corrupt DB)
+- Read: UI requests paged history or pinned rows from SQLite.
+- Write: clipboard changes are stored immediately and mark backups dirty.
+- Search: SQL filtering plus local lightweight ranking, with asynchronous UI updates.
+- Backup: SQLite data is exported to JSON on debounce or app exit.
+- Recovery: valid backup JSON can repopulate SQLite when needed.
 
 ## File Structure
 
-```
+```text
 advance-clipboard/
-├── main.py               # UI and app logic (PyQt6)
-├── storage.py            # SQLite storage layer + neural tables
-├── rag_search.py         # Lightweight local RAG / hybrid retriever
-├── backup.py             # Backup utilities
-├── backup_manager.py     # JSON backup with checksum
-├── win32_monitor.py      # Windows clipboard monitoring
-├── neural/
-│   ├── engine.py         # Background AI indexing (SentenceTransformer)
-│   ├── ui.py             # SidecarWindow (floating/docked map modes)
-│   ├── config.json       # All engine + visual settings (config-driven)
-│   └── graph/
-│       ├── index.html    # D3.js galaxy visualization
-│       └── d3.v7.min.js  # D3 v7 (bundled offline)
-├── docs/
-│   └── screenshots/      # README screenshots
-├── test_neural_index.py  # Test AI indexing on real DB
-├── test_neural_show.py   # Test map display standalone
-├── test_restore_db.py    # Restore DB from backup JSON
-├── pyproject.toml        # Project config (uv sync)
-├── requirements.txt
-├── FUTURE.md             # Roadmap and deferred improvements
-├── LICENSE
-└── .gitignore
+|-- core/                 # Win32 clipboard monitor and paste helpers
+|-- storage/              # SQLite storage, backup, and search services
+|-- ui/                   # PyQt6 views, rows, delegates, widgets
+|-- tests/                # Unit and UI behavior tests
+|-- main.py               # Application entry point and main window
+|-- pyproject.toml        # uv project config
+|-- requirements.txt      # pip dependency list
+|-- FUTURE.md             # Roadmap
+`-- README.md
 ```
 
-> **Note:** Runtime artifacts (`clipboard.db`, `images/`, `backups/`, `logs/`) are excluded via `.gitignore`.
-
-## Configuration
-
-### Neural Memory Map (`neural/config.json`)
-
-All settings are config-driven with `_doc_*` descriptions. Key settings:
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `max_recent_index` | 300 | Recent clips to index (bounded window) |
-| `similarity_threshold` | 0.45 | Min cosine similarity to create a link |
-| `max_neighbors` | 5 | Max links per clip |
-| `lexical_prefix_boost` | 0.30 | Boost for shared command prefixes |
-| `graph.rainbow_mode` | true | Rainbow colors by node degree |
-| `graph.twinkle_enabled` | true | Twinkling star animation |
-| `graph.tooltip_max_chars` | 900 | Max chars shown on hover |
-
-### App Settings (`main.py`)
-
-```python
-PAGE_SIZE_HISTORY = 20    # Items per page (history)
-PAGE_SIZE_PINNED = 50     # Items per page (pinned)
-MAX_DISPLAY_CHARS = 300   # Text truncation limit
-```
+Runtime artifacts such as `storage/clipboard.db`, `images/`, `backups/`, and `logs/` are ignored by git.
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.11+
 - Windows 10/11
-- PyQt6, PyQt6-WebEngine
-- sentence-transformers (CPU only, ~90MB model download on first run)
-- scikit-learn, pynput
+- PyQt6
 
 ## License
 

@@ -1,6 +1,5 @@
 import os
 import sys
-import types
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -9,89 +8,9 @@ sys.path.insert(0, ROOT_DIR)
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-sys.modules.setdefault("neural.engine", MagicMock())
-sys.modules.setdefault("neural.ui", MagicMock())
-sys.modules.setdefault("neural.bridge", MagicMock())
-sys.modules.setdefault("PyQt6.QtWebEngineWidgets", MagicMock())
-sys.modules.setdefault("PyQt6.QtWebChannel", MagicMock())
 sys.modules.setdefault("core.clipboard_monitor", MagicMock())
 
-_neural_engine_mod = types.ModuleType("neural.engine")
 
-
-class _StubEngine:
-    name = "NeuralEngine"
-
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-
-_neural_engine_mod.NeuralEngine = _StubEngine
-sys.modules["neural.engine"] = _neural_engine_mod
-
-_neural_ui_mod = types.ModuleType("neural.ui")
-
-
-class _StubSidecar:
-    def __init__(self, *args, **kwargs):
-        self.bridge = MagicMock()
-        self.bridge.node_clicked = MagicMock()
-        self.bridge.node_clicked.connect = MagicMock()
-        self.search_bar = MagicMock()
-        self.search_bar.textChanged = MagicMock()
-        self.search_bar.textChanged.connect = MagicMock()
-
-    def show(self):
-        pass
-
-    def hide(self):
-        pass
-
-    def close(self):
-        pass
-
-    def move(self, *args):
-        pass
-
-    def resize(self, *args):
-        pass
-
-    def setGeometry(self, *args):
-        pass
-
-    def setWindowTitle(self, *args):
-        pass
-
-    def update_data(self, *args):
-        pass
-
-    def focus_node(self, *args):
-        pass
-
-    def focus_query(self, *args):
-        pass
-
-    def reload_config(self, *args):
-        pass
-
-    def grab(self):
-        return MagicMock()
-
-    def isVisible(self):
-        return False
-
-    def isActiveWindow(self):
-        return False
-
-
-_neural_ui_mod.SidecarWindow = _StubSidecar
-sys.modules["neural.ui"] = _neural_ui_mod
 
 with patch("ctypes.WINFUNCTYPE", create=True, new=MagicMock()), \
     patch("ctypes.windll", create=True, new=MagicMock()):
@@ -135,9 +54,6 @@ class _StubStorage:
 
     def set_backup_callback(self, callback):
         self.backup_callback = callback
-
-    def set_neural_event_callback(self, callback):
-        self.neural_callback = callback
 
     def clear_backup_flag(self):
         self.need_backup = False

@@ -73,20 +73,4 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_group ON clips(group_name)")
 
 
-def init_neural_tables():
-    """Initialize neural search tables."""
-    with transaction() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS neural_vectors (
-                clip_id INTEGER PRIMARY KEY,
-                vector BLOB
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS neural_links (
-                source_id INTEGER,
-                target_id INTEGER,
-                weight REAL,
-                PRIMARY KEY (source_id, target_id)
-            )
-        """)
+

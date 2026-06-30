@@ -1,10 +1,10 @@
 """
-Lightweight local RAG-style retriever for clipboard search.
+Lightweight local hybrid retriever for clipboard search.
 
 The goal is not to introduce a full LLM stack. Instead, we build a tiny
 hybrid retriever that combines:
 - token-based lexical matching
-- character n-gram similarity for fuzzy/semantic-ish recall
+- character n-gram similarity for fuzzy recall
 - TF-IDF cosine similarity for relevance ranking
 
 This keeps the app dependency-free and fast enough for an interactive
@@ -71,7 +71,7 @@ class IndexedDocument:
     ngram_norm: float
 
 
-class LightRAGRetriever:
+class HybridSearchRetriever:
     """Dependency-free hybrid retriever with background rebuilds."""
 
     def __init__(self):
@@ -154,7 +154,7 @@ class LightRAGRetriever:
 
                 t0 = time.time()
                 print(
-                    f"[RAG] Background rebuild starting for '{namespace}' ({len(records)} records)..."
+                    f"[Search] Background rebuild starting for '{namespace}' ({len(records)} records)..."
                 )
                 documents, token_doc_freq, ngram_doc_freq = self._build_index(records)
                 with self._rebuild_lock:
@@ -162,14 +162,14 @@ class LightRAGRetriever:
                     self._doc_freq[namespace] = (token_doc_freq, ngram_doc_freq)
                     self._indexed_ids[namespace] = {d.clip_id for d in documents}
                 print(
-                    f"[RAG] Background rebuild done in {time.time() - t0:.1f}s ({len(documents)} docs)"
+                    f"[Search] Background rebuild done in {time.time() - t0:.1f}s ({len(documents)} docs)"
                 )
                 if on_done:
                     on_done()
             finally:
                 self._rebuilding = False
 
-        threading.Thread(target=_worker, daemon=True, name="RAG-Rebuild").start()
+        threading.Thread(target=_worker, daemon=True, name="Search-Rebuild").start()
 
     def search(
         self,
