@@ -413,6 +413,35 @@ class WidgetLayoutTests(unittest.TestCase):
         )
         self.assertEqual(popup.windowTitle(), "")
 
+    def test_fix_popup_search_highlights_and_moves_between_matches(self):
+        popup = ClipEditPopup(
+            {
+                "id": 45,
+                "type": "text",
+                "content": "alpha\n" + "middle\n" * 30 + "target one\nmore\ntarget two",
+                "tag": "todo",
+            },
+            parent_list=SimpleNamespace(handle_fix_clip=lambda clip_id, content: None),
+        )
+        popup.show()
+        _get_qapp().processEvents()
+
+        popup.search_input.setText("target")
+        _get_qapp().processEvents()
+
+        self.assertEqual(len(popup._search_matches), 2)
+        self.assertEqual(popup.editor.textCursor().selectedText(), "target")
+        self.assertEqual(len(popup.editor.extraSelections()), 2)
+        self.assertEqual(popup._current_search_index, 0)
+
+        popup._next_search_match()
+        self.assertEqual(popup.editor.textCursor().selectedText(), "target")
+        self.assertEqual(popup._current_search_index, 1)
+
+        popup.search_input.clear()
+        self.assertEqual(popup._search_matches, [])
+        self.assertEqual(popup.editor.extraSelections(), [])
+
     def test_context_menu_exposes_tag_and_group_actions(self):
         class _Storage:
             def get_groups(self):

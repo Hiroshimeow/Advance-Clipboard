@@ -2,7 +2,7 @@ import math
 import os
 
 from PyQt6.QtCore import Qt, QTimer, QPoint, QSize
-from PyQt6.QtGui import QFont, QFontMetrics, QPixmap
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPixmap, QTextCharFormat, QTextCursor
 from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QApplication,
+    QTextEdit,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -263,6 +264,8 @@ class ClipEditPopup(QWidget):
         self.parent_list = parent_list
         self.clip_id = clip_data.get("id")
         self._fitting_to_screen = False
+        self._search_matches = []
+        self._current_search_index = -1
         self.setWindowFlags(Qt.WindowType.Tool)
         self.setWindowTitle(str(clip_data.get("tag") or ""))
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
@@ -283,6 +286,15 @@ class ClipEditPopup(QWidget):
                 selection-background-color: #aa8030;
                 font: 10pt 'Segoe UI';
             }
+            QLineEdit {
+                background: #252525;
+                border: 1px solid #444;
+                border-radius: 4px;
+                color: #f0f0f0;
+                padding: 4px 8px;
+                selection-background-color: #aa8030;
+            }
+            QLineEdit:focus { border-color: #aa8030; }
             QPushButton {
                 background: #333;
                 color: #eee;
@@ -310,8 +322,19 @@ class ClipEditPopup(QWidget):
         layout.setContentsMargins(10, 10, 10, 8)
         layout.setSpacing(8)
 
+        search_row = QHBoxLayout()
+        search_row.setContentsMargins(0, 0, 0, 0)
+        search_row.setSpacing(6)
+        self.search_input = QLineEdit(chrome)
+        self.search_input.setPlaceholderText("Search in clip")
+        self.search_input.textChanged.connect(self._apply_search)
+        self.search_input.returnPressed.connect(self._next_search_match)
+        search_row.addWidget(self.search_input)
+        layout.addLayout(search_row)
+
         self.editor = QPlainTextEdit(chrome)
         self.editor.setPlainText(str(clip_data.get("content", "")))
+        self.editor.textChanged.connect(lambda: self._apply_search(self.search_input.text()))
         layout.addWidget(self.editor, stretch=1)
 
         self.lbl_error = QLabel("")
@@ -376,6 +399,51 @@ class ClipEditPopup(QWidget):
                 self.move(self.pos() + (QPoint(frame_x, frame_y) - frame.topLeft()))
         finally:
             self._fitting_to_screen = False
+
+    def _apply_search(self, query):
+        self._search_matches = []
+        self._current_search_index = -1
+        self.editor.setExtraSelections([])
+        query = str(query or "")
+        if not query:
+            return
+
+        cursor = QTextCursor(self.editor.document())
+        while True:
+            cursor = self.editor.document().find(query, cursor)
+            if cursor.isNull():
+                break
+            self._search_matches.append(QTextCursor(cursor))
+
+        self._highlight_search_matches()
+        if self._search_matches:
+            self._current_search_index = 0
+            self._show_search_match(0)
+
+    def _highlight_search_matches(self):
+        highlight_format = QTextCharFormat()
+        highlight_format.setBackground(QColor("#5a4318"))
+        highlight_format.setForeground(QColor("#ffffff"))
+        selections = []
+        for cursor in self._search_matches:
+            selection = QTextEdit.ExtraSelection()
+            selection.cursor = QTextCursor(cursor)
+            selection.format = highlight_format
+            selections.append(selection)
+        self.editor.setExtraSelections(selections)
+
+    def _show_search_match(self, index):
+        if not self._search_matches:
+            return
+        index %= len(self._search_matches)
+        self._current_search_index = index
+        self.editor.setTextCursor(QTextCursor(self._search_matches[index]))
+        self.editor.ensureCursorVisible()
+
+    def _next_search_match(self):
+        if not self._search_matches:
+            return
+        self._show_search_match(self._current_search_index + 1)
 
     def _save(self):
         if not self.parent_list or not self.clip_id:
