@@ -132,9 +132,6 @@ class ClipboardStorage:
 
 
 
-    def trigger_daily_rebuild(self):
-        self.search.trigger_daily_rebuild(self)
-
     @property
     def need_backup(self) -> bool:
         return ClipboardStorage._need_backup
@@ -152,12 +149,6 @@ class ClipboardStorage:
         clip_id, is_new, was_pinned = self.clips.add_clip(clip_type, content, tag)
         if is_new or True:  # always mark dirty for updated_at changes
             self._mark_dirty()
-
-        if is_new:
-            # Incrementally add to search index
-            clip = self.get_clip_by_id(clip_id)
-            if clip and clip.get("type") == "text":
-                self.search.add_record("pinned" if was_pinned else "history", clip)
 
 
         return clip_id, is_new
@@ -283,23 +274,6 @@ class ClipboardStorage:
             include_meta=True,
             pinned_tiebreaker=True,
         )
-        if not ranked:
-            return ranked_lexical_rows[:limit]
-        if self.search.has_index("pinned"):
-            all_rows = self._get_all_pinned_for_search()
-            ranked_ids = self.search.search(
-                "pinned",
-                query,
-                all_rows,
-                max(limit * 3, 20),
-                [r["id"] for r in ranked_lexical_rows],
-            )
-            return self.search.merge_ranked_results(
-                ranked_ids=ranked_ids,
-                indexed_rows=all_rows,
-                lexical_rows=ranked_lexical_rows,
-                limit=limit,
-            )
         return ranked_lexical_rows[:limit]
 
     def _search_pinned_sql(self, query: str, limit: int) -> List[Dict[str, Any]]:
@@ -355,23 +329,6 @@ class ClipboardStorage:
             include_meta=True,
             pinned_tiebreaker=False,
         )
-        if not ranked:
-            return ranked_lexical_rows[:limit]
-        if self.search.has_index("history"):
-            all_rows = self._get_all_history_for_search()
-            ranked_ids = self.search.search(
-                "history",
-                query,
-                all_rows,
-                max(limit * 3, 20),
-                [r["id"] for r in ranked_lexical_rows],
-            )
-            return self.search.merge_ranked_results(
-                ranked_ids=ranked_ids,
-                indexed_rows=all_rows,
-                lexical_rows=ranked_lexical_rows,
-                limit=limit,
-            )
         return ranked_lexical_rows[:limit]
 
     def _search_history_sql(self, query: str, limit: int) -> List[Dict[str, Any]]:
@@ -414,23 +371,6 @@ class ClipboardStorage:
             params + [limit],
         ).fetchall()
         return [dict(r) for r in rows]
-
-    def _get_all_pinned_for_search(self) -> List[Dict[str, Any]]:
-        conn = get_connection()
-        rows = conn.execute(
-            "SELECT * FROM clips WHERE is_pinned = 1 ORDER BY pin_order DESC"
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    def _get_all_history_for_search(self) -> List[Dict[str, Any]]:
-        conn = get_connection()
-        rows = conn.execute(
-            """SELECT * FROM clips
-               WHERE is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at)
-               ORDER BY updated_at DESC"""
-        ).fetchall()
-        return [dict(r) for r in rows]
-
 
 
 

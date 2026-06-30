@@ -207,9 +207,6 @@ class _FakeStorage:
                 return True
         return False
 
-    def trigger_daily_rebuild(self):
-        pass
-
 
     def delete_clip(self, clip_id):
         self._history = [c for c in self._history if c.get("id") != clip_id]
@@ -567,6 +564,25 @@ class KeyboardNavigationTests(unittest.TestCase):
         self.assertEqual(app.list_history.count(), 0)
         self.assertEqual(app.storage.delete_calls, [])
         self.assertTrue(_wait_until(lambda: app.storage.delete_calls == [1]))
+        app.backup_scheduler.cancel()
+        app.close()
+        QApplication.processEvents()
+
+    def test_repeated_delete_clicks_for_same_clip_are_coalesced(self):
+        _get_qapp()
+        app = _TestClientApp()
+        history = [{"id": 1, "type": "text", "content": "rapid delete"}]
+        app.storage = _SlowDeleteStorage(history=history)
+        app.refresh_lists()
+
+        app.handle_delete(1)
+        app.handle_delete(1)
+        app.handle_delete(1)
+
+        self.assertEqual(app.list_history.count(), 0)
+        self.assertEqual(app.storage.delete_calls, [])
+        self.assertTrue(_wait_until(lambda: app.storage.delete_calls == [1]))
+        self.assertEqual(app.storage.delete_calls, [1])
         app.backup_scheduler.cancel()
         app.close()
         QApplication.processEvents()

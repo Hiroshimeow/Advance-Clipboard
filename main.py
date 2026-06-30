@@ -155,6 +155,10 @@ class ClientApp(QWidget):
         self._hidden_refresh_timer = QTimer(self)
         self._hidden_refresh_timer.setSingleShot(True)
         self._hidden_refresh_timer.timeout.connect(self._refresh_hidden_ui_cache)
+        self._pending_delete_clip_ids = set()
+        self._delete_flush_timer = QTimer(self)
+        self._delete_flush_timer.setSingleShot(True)
+        self._delete_flush_timer.timeout.connect(self._flush_pending_deletes)
 
         # Browser Controller (Search, Nav, Pagination)
         self.browser = ClipboardBrowserController(self)
@@ -170,9 +174,7 @@ class ClientApp(QWidget):
             self._init_data()
             self.is_ui_dirty = False
 
-        # Build the lightweight search index in background when needed.
-        if os.getenv("ADV_CLIP_DISABLE_SEARCH_REBUILD") != "1":
-            self.storage.trigger_daily_rebuild()
+
 
         # Qt clipboard object — used to READ clipboard content only
         self.clipboard = QApplication.clipboard()
@@ -981,14 +983,24 @@ class ClientApp(QWidget):
         self.refresh_lists()
 
     def handle_delete(self, clip_id):
-        """Delete a clip."""
+        """Delete a clip, coalescing rapid delete clicks into one backend flush."""
+        if not clip_id or clip_id in self._pending_delete_clip_ids:
+            return
+        self._pending_delete_clip_ids.add(clip_id)
         self.browser.remove_clip_from_ui(clip_id)
-        QTimer.singleShot(25, lambda: self._delete_clip_backend(clip_id))
+        if not self._delete_flush_timer.isActive():
+            self._delete_flush_timer.start(25)
 
-    def _delete_clip_backend(self, clip_id):
-        self.storage.delete_clip(clip_id)
+    def _flush_pending_deletes(self):
+        clip_ids = list(self._pending_delete_clip_ids)
+        if not clip_ids:
+            return
+        self._pending_delete_clip_ids.clear()
+        for clip_id in clip_ids:
+            self.storage.delete_clip(clip_id)
         self.refresh_lists()
         self.browser.reset_after_delete_refresh()
+
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key.Key_Escape:

@@ -49,8 +49,6 @@ class _StubStorage:
     def get_clip_count(self):
         return len(self.clips)
 
-    def trigger_daily_rebuild(self):
-        pass
 
     def set_backup_callback(self, callback):
         self.backup_callback = callback
