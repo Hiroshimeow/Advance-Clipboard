@@ -18,7 +18,7 @@ from ui.clipboard_browser_controller import ClipboardBrowserController
 from ui.clip_delegate import ClipRowDelegate
 from ui.clip_list_view import ClipListView
 from ui.clip_models import ClipRow, HistoryListModel, ROW_ROLE
-from ui.clip_row import ROW_FRAME_INSET_X
+from ui.clip_row import ClipRowWidget, ROW_FRAME_INSET_X
 from ui.widgets import (
     COLLAPSED_MAX_LINES,
     ClipEditPopup,
@@ -339,6 +339,57 @@ class WidgetLayoutTests(unittest.TestCase):
 
         self.assertEqual(button_texts, [])
         self.assertEqual(bright_text_pixels, 0)
+
+    def test_short_expanded_clip_keeps_editor_geometry_after_toggle(self):
+        harness = _BrowserHarness()
+        clip = {"id": 46, "type": "text", "content": "docker rm -f $(docker ps -aq)\ndocker compose up --build", "tag": ""}
+        harness.list_history.resize(520, 220)
+        harness.list_history.set_rows(harness.browser.build_history_rows([clip]))
+        harness.list_history.show()
+        _get_qapp().processEvents()
+
+        harness.browser.toggle_clip_expanded(46)
+        _get_qapp().processEvents()
+
+        row = harness.list_history.model().row_at(0)
+        editors = [
+            editor for editor in harness.list_history.findChildren(ClipRowWidget)
+            if editor.isVisible()
+        ]
+        visual_rect = harness.list_history.visualRect(harness.list_history.model().index(0, 0))
+
+        self.assertTrue(row.is_expanded)
+        self.assertEqual(len(editors), 1)
+        self.assertEqual(editors[0].geometry(), visual_rect)
+        self.assertIn("docker compose", editors[0].lbl_content.text())
+
+    def test_delete_image_rebinds_remaining_expanded_editor(self):
+        harness = _BrowserHarness()
+        image_clip = {"id": 50, "type": "image", "content": "missing-image.png", "tag": ""}
+        text_clip = {"id": 51, "type": "text", "content": "line one\nline two", "tag": ""}
+        harness.browser.expanded_clip_ids.add(51)
+        harness.list_history.resize(520, 260)
+        harness.list_history.set_rows(harness.browser.build_history_rows([image_clip, text_clip]))
+        harness.browser._reopen_expanded_editors(harness.list_history)
+        harness.list_history.show()
+        _get_qapp().processEvents()
+
+        harness.browser.remove_clip_from_ui(50)
+        _get_qapp().processEvents()
+
+        row = harness.list_history.model().row_at(0)
+        editors = [
+            editor for editor in harness.list_history.findChildren(ClipRowWidget)
+            if editor.isVisible()
+        ]
+        visual_rect = harness.list_history.visualRect(harness.list_history.model().index(0, 0))
+
+        self.assertEqual(harness.list_history.count(), 1)
+        self.assertEqual(row.clip_id, 51)
+        self.assertTrue(row.is_expanded)
+        self.assertEqual(len(editors), 1)
+        self.assertEqual(editors[0].geometry(), visual_rect)
+        self.assertIn("line two", editors[0].lbl_content.text())
 
     def test_delegate_still_paints_expand_button_for_collapsed_rows(self):
         view = ClipListView(HistoryListModel())

@@ -217,6 +217,8 @@ class ClipboardBrowserController:
             self.pinned_offset = 0
             self.history_has_more = len(history_clips) >= PAGE_SIZE_HISTORY
             self.pinned_has_more = False
+            self._close_expanded_editors(self.app.list_history)
+            self._close_expanded_editors(self.app.list_pinned)
             self.app.list_history.set_rows(self.build_history_rows(history_clips))
             self.app.list_pinned.set_rows(self.build_pinned_rows(groups, ungrouped))
             self._reopen_expanded_editors(self.app.list_history)
@@ -294,14 +296,27 @@ class ClipboardBrowserController:
             r += step
         return None
 
+    def _close_expanded_editors(self, list_widget, clip_ids=None):
+        """Close persistent editors before rows are reset, removed, or replaced."""
+        target_ids = set(clip_ids) if clip_ids is not None else None
+        for row_idx in range(list_widget.model().rowCount()):
+            row_data = list_widget.model().row_at(row_idx)
+            if not row_data or not row_data.is_expanded:
+                continue
+            if target_ids is not None and row_data.clip_id not in target_ids:
+                continue
+            list_widget.closePersistentEditor(list_widget.model().index(row_idx, 0))
+
     def _reopen_expanded_editors(self, list_widget):
-        """Reopen persistent editors for expanded clips after a model reset."""
+        """Reopen persistent editors for expanded clips after a row layout change."""
+        list_widget.doItemsLayout()
         for row_idx in range(list_widget.model().rowCount()):
             row_data = list_widget.model().row_at(row_idx)
             if row_data and row_data.is_expanded:
                 list_widget.openPersistentEditor(
                     list_widget.model().index(row_idx, 0)
                 )
+        list_widget.viewport().update()
 
     def _apply_default_selection(self):
         h_list = self.app.list_history
@@ -523,8 +538,12 @@ class ClipboardBrowserController:
             self.pinned_offset = 0
             self.history_has_more = False
             self.pinned_has_more = False
+            self._close_expanded_editors(self.app.list_history)
+            self._close_expanded_editors(self.app.list_pinned)
             self.app.list_history.set_rows(self.build_history_rows(history_clips))
             self.app.list_pinned.set_rows(self.build_pinned_rows(pinned_clips=pinned_clips))
+            self._reopen_expanded_editors(self.app.list_history)
+            self._reopen_expanded_editors(self.app.list_pinned)
             self._apply_default_selection()
         finally:
             self.app.setUpdatesEnabled(True)
@@ -584,11 +603,14 @@ class ClipboardBrowserController:
                 )
                 self.history_has_more = len(history_clips) >= PAGE_SIZE_HISTORY
 
+            self._close_expanded_editors(self.app.list_history)
+            self._close_expanded_editors(self.app.list_pinned)
             self.app.list_history.set_rows(self.build_history_rows(history_clips))
             self.history_offset = len(history_clips)
 
             # 2. Refresh Pinned
             self.refresh_pinned_list()
+            self._reopen_expanded_editors(self.app.list_history)
 
             # 3. Maintain/Set selection
             if maintain_selection:
@@ -622,7 +644,9 @@ class ClipboardBrowserController:
                 ranked=True,
             )
             self.pinned_has_more = False  # Search returns first fast page
+            self._close_expanded_editors(self.app.list_pinned)
             self.app.list_pinned.set_rows(self.build_pinned_rows(pinned_clips=pinned_clips))
+            self._reopen_expanded_editors(self.app.list_pinned)
         else:
             groups = []
             for group_name in self.storage.get_groups():
@@ -630,7 +654,9 @@ class ClipboardBrowserController:
                 if clips:
                     groups.append((group_name, clips))
             ungrouped = self.storage.get_ungrouped_pinned()
+            self._close_expanded_editors(self.app.list_pinned)
             self.app.list_pinned.set_rows(self.build_pinned_rows(groups, ungrouped))
+            self._reopen_expanded_editors(self.app.list_pinned)
             self.pinned_has_more = False
 
     def remove_clip_from_ui(self, clip_id):
@@ -638,7 +664,9 @@ class ClipboardBrowserController:
         self.expanded_clip_ids.discard(clip_id)
         for list_widget in (self.app.list_history, self.app.list_pinned):
             list_widget._clear_hover()
+            self._close_expanded_editors(list_widget)
             list_widget.model().remove_rows_by_clip_id(clip_id)
+            self._reopen_expanded_editors(list_widget)
 
     def toggle_clip_expanded(self, clip_id):
         if clip_id in self.expanded_clip_ids:
@@ -669,28 +697,34 @@ class ClipboardBrowserController:
                 list_widget.setUpdatesEnabled(False)
                 scroll_blocker = QSignalBlocker(scroll_bar)
                 horizontal_blocker = QSignalBlocker(horizontal_bar)
+                should_expand = clip_id in self.expanded_clip_ids
                 try:
+                    self._close_expanded_editors(list_widget, [clip_id])
                     list_widget.model().replace_row(
                         row,
                         self.build_clip_row(
-                        clip,
-                        is_pinned,
-                        is_grouped=bool(group_name),
-                        group_name=group_name or "",
-                        search_query=self.current_search_query,
+                            clip,
+                            is_pinned,
+                            is_grouped=bool(group_name),
+                            group_name=group_name or "",
+                            search_query=self.current_search_query,
                         ),
                     )
-                    idx = list_widget.model().index(row, 0)
-                    if clip_id in self.expanded_clip_ids:
-                        list_widget.openPersistentEditor(idx)
-                    else:
-                        list_widget.closePersistentEditor(idx)
+                    list_widget.doItemsLayout()
                     scroll_bar.setValue(min(scroll_value, scroll_bar.maximum()))
                     horizontal_bar.setValue(min(horizontal_value, horizontal_bar.maximum()))
                 finally:
                     del scroll_blocker
                     del horizontal_blocker
                     list_widget.setUpdatesEnabled(True)
+
+                idx = list_widget.model().index(row, 0)
+                list_widget.doItemsLayout()
+                if should_expand:
+                    list_widget.openPersistentEditor(idx)
+                else:
+                    list_widget.closePersistentEditor(idx)
+                list_widget.viewport().update()
 
                 def restore_scroll():
                     scroll_bar.setValue(min(scroll_value, scroll_bar.maximum()))
