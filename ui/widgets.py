@@ -1,7 +1,7 @@
 import math
 import os
 
-from PyQt6.QtCore import Qt, QTimer, QPoint, QSize
+from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QEvent
 from PyQt6.QtGui import QFont, QFontMetrics, QPixmap
 from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtWidgets import (
@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QApplication,
+    QSizeGrip,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -255,17 +256,33 @@ class SearchLineEdit(QLineEdit):
 
 
 class ClipEditPopup(QWidget):
+    SCREEN_MARGIN = 12
+
     def __init__(self, clip_data, parent_list=None, parent=None):
         super().__init__(parent)
         self.clip_data = clip_data
         self.parent_list = parent_list
         self.clip_id = clip_data.get("id")
+        self._drag_offset = None
+        self._fitting_to_screen = False
         self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
-        self.resize(520, 320)
+        self.setMinimumSize(360, 220)
+        self.resize(560, 360)
         self.setStyleSheet("""
             QWidget { background: #1f1f1f; color: #e0e0e0; }
             QLabel { color: #d18616; font-size: 9pt; font-weight: bold; }
+            QFrame#popupChrome {
+                background: #1f1f1f;
+                border: 1px solid #3daee9;
+                border-radius: 6px;
+            }
+            QFrame#popupTitleBar {
+                background: #26394a;
+                border: none;
+                border-top-left-radius: 5px;
+                border-top-right-radius: 5px;
+            }
             QPlainTextEdit {
                 background: #2a2a2a;
                 border: 1px solid #444;
@@ -286,16 +303,47 @@ class ClipEditPopup(QWidget):
                 border-color: #aa8030;
                 color: white;
             }
+            QPushButton#closeButton {
+                background: transparent;
+                border: none;
+                color: #e0e0e0;
+                font-size: 11pt;
+                padding: 0px;
+            }
+            QPushButton#closeButton:hover { color: white; background: #752b2b; }
         """)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        chrome = QFrame(self)
+        chrome.setObjectName("popupChrome")
+        root.addWidget(chrome)
+
+        layout = QVBoxLayout(chrome)
+        layout.setContentsMargins(10, 10, 10, 8)
         layout.setSpacing(8)
 
-        title = QLabel("Fix pinned clip")
-        layout.addWidget(title)
+        self.title_bar = QFrame(chrome)
+        self.title_bar.setObjectName("popupTitleBar")
+        self.title_bar.setCursor(Qt.CursorShape.SizeAllCursor)
+        title_layout = QHBoxLayout(self.title_bar)
+        title_layout.setContentsMargins(8, 4, 4, 4)
+        title_layout.setSpacing(6)
+        self.title_label = QLabel("Fix pinned clip")
+        title_layout.addWidget(self.title_label)
+        title_layout.addStretch()
+        btn_close = QPushButton("x", self.title_bar)
+        btn_close.setObjectName("closeButton")
+        btn_close.setFixedSize(24, 22)
+        btn_close.clicked.connect(self.close)
+        title_layout.addWidget(btn_close)
+        layout.addWidget(self.title_bar)
+        self.title_bar.installEventFilter(self)
+        self.title_label.installEventFilter(self)
 
-        self.editor = QPlainTextEdit(self)
+        self.editor = QPlainTextEdit(chrome)
         self.editor.setPlainText(str(clip_data.get("content", "")))
         layout.addWidget(self.editor, stretch=1)
 
@@ -304,16 +352,71 @@ class ClipEditPopup(QWidget):
         self.lbl_error.hide()
         layout.addWidget(self.lbl_error)
 
-        buttons = QHBoxLayout()
-        buttons.addStretch()
-        btn_cancel = QPushButton("Cancel", self)
+        footer = QHBoxLayout()
+        footer.addStretch()
+        btn_cancel = QPushButton("Cancel", chrome)
         btn_cancel.clicked.connect(self.close)
-        buttons.addWidget(btn_cancel)
-        btn_save = QPushButton("Save", self)
+        footer.addWidget(btn_cancel)
+        btn_save = QPushButton("Save", chrome)
         btn_save.setObjectName("saveButton")
         btn_save.clicked.connect(self._save)
-        buttons.addWidget(btn_save)
-        layout.addLayout(buttons)
+        footer.addWidget(btn_save)
+        grip = QSizeGrip(chrome)
+        grip.setFixedSize(18, 18)
+        footer.addWidget(grip)
+        layout.addLayout(footer)
+
+    def eventFilter(self, watched, event):
+        if watched in (self.title_bar, self.title_label):
+            if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                event.accept()
+                return True
+            if event.type() == QEvent.Type.MouseMove and self._drag_offset is not None:
+                self.move(event.globalPosition().toPoint() - self._drag_offset)
+                self._fit_to_screen()
+                event.accept()
+                return True
+            if event.type() == QEvent.Type.MouseButtonRelease:
+                self._drag_offset = None
+        return super().eventFilter(watched, event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._fit_to_screen()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not self._fitting_to_screen:
+            QTimer.singleShot(0, self._fit_to_screen)
+
+    def _screen_geometry(self):
+        screen = QApplication.screenAt(self.frameGeometry().center()) or QApplication.primaryScreen()
+        return screen.availableGeometry() if screen else None
+
+    def _fit_to_screen(self):
+        screen = self._screen_geometry()
+        if screen is None:
+            return
+        self._fitting_to_screen = True
+        try:
+            max_width = max(self.minimumWidth(), screen.width() - (self.SCREEN_MARGIN * 2))
+            max_height = max(self.minimumHeight(), screen.height() - (self.SCREEN_MARGIN * 2))
+            width = min(self.width(), max_width)
+            height = min(self.height(), max_height)
+            if width != self.width() or height != self.height():
+                self.resize(width, height)
+
+            x_min = screen.left() + self.SCREEN_MARGIN
+            y_min = screen.top() + self.SCREEN_MARGIN
+            x_max = screen.right() - self.width() - self.SCREEN_MARGIN + 1
+            y_max = screen.bottom() - self.height() - self.SCREEN_MARGIN + 1
+            x = min(max(self.x(), x_min), max(x_min, x_max))
+            y = min(max(self.y(), y_min), max(y_min, y_max))
+            if x != self.x() or y != self.y():
+                self.move(x, y)
+        finally:
+            self._fitting_to_screen = False
 
     def _save(self):
         if not self.parent_list or not self.clip_id:

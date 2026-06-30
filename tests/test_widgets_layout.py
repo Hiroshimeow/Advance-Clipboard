@@ -10,16 +10,18 @@ sys.path.insert(0, ROOT_DIR)
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import Qt, QSize, QEvent, QPoint, QPointF
-from PyQt6.QtGui import QColor, QContextMenuEvent, QImage, QMouseEvent
-from PyQt6.QtWidgets import QApplication, QLabel, QListWidgetItem, QMenu, QPushButton, QWidget
+from PyQt6.QtCore import Qt, QSize, QEvent, QPoint, QPointF, QRect
+from PyQt6.QtGui import QColor, QContextMenuEvent, QImage, QMouseEvent, QPainter
+from PyQt6.QtWidgets import QApplication, QLabel, QListWidgetItem, QMenu, QPushButton, QWidget, QPlainTextEdit, QSizeGrip, QStyle, QStyleOptionViewItem
 
 from ui.clipboard_browser_controller import ClipboardBrowserController
 from ui.clip_delegate import ClipRowDelegate
 from ui.clip_list_view import ClipListView
 from ui.clip_models import ClipRow, HistoryListModel, ROW_ROLE
+from ui.clip_row import ROW_FRAME_INSET_X
 from ui.widgets import (
     COLLAPSED_MAX_LINES,
+    ClipEditPopup,
     ClipItemWidget,
     SmoothListWidget,
     TEXT_FONT,
@@ -264,6 +266,45 @@ class WidgetLayoutTests(unittest.TestCase):
             widget.lbl_tag.y() + widget.lbl_tag.height(),
         )
 
+    def test_expanded_scroll_text_editor_has_opaque_viewport(self):
+        item = {
+            "id": 40,
+            "type": "text",
+            "content": "\n".join(f"line {idx}" for idx in range(30)),
+            "tag": "",
+            "group_name": "",
+        }
+        widget = ClipItemWidget(item, is_pinned=False, parent_list=None, expanded=True, available_width=360)
+        widget.show()
+        _get_qapp().processEvents()
+
+        self.assertIsInstance(widget.lbl_content, QPlainTextEdit)
+        self.assertTrue(widget.lbl_content.testAttribute(Qt.WidgetAttribute.WA_StyledBackground))
+        self.assertTrue(widget.lbl_content.viewport().testAttribute(Qt.WidgetAttribute.WA_StyledBackground))
+        self.assertIn("QPlainTextEdit::viewport { background: #1f1f1f; }", widget.lbl_content.styleSheet())
+
+    def test_delegate_selected_frame_is_not_clipped_at_left_edge(self):
+        view = ClipListView(HistoryListModel())
+        row = ClipRow(
+            row_kind="clip",
+            clip={"id": 40, "type": "text", "content": "selected frame", "tag": ""},
+        )
+        view.set_rows([row])
+        delegate = view.itemDelegate()
+        height = delegate.measure_row(row, 340).row_height
+        image = QImage(340, height, QImage.Format.Format_RGB32)
+        image.fill(QColor("#000000"))
+        painter = QPainter(image)
+        option = QStyleOptionViewItem()
+        option.rect = QRect(0, 0, 340, height)
+        option.state = QStyle.StateFlag.State_Selected
+        delegate.paint(painter, option, view.model().index(0, 0))
+        painter.end()
+
+        border_y = height // 2
+        self.assertNotEqual(image.pixelColor(0, border_y), QColor("#3daee9"))
+        self.assertEqual(image.pixelColor(ROW_FRAME_INSET_X, border_y), QColor("#3daee9"))
+
     def test_right_click_does_not_trigger_row_click_action(self):
         view = ClipListView(HistoryListModel())
         view.resize(360, 240)
@@ -339,6 +380,28 @@ class WidgetLayoutTests(unittest.TestCase):
                 os.remove(path)
             except OSError:
                 pass
+
+    def test_fix_popup_can_resize_drag_and_fit_inside_screen(self):
+        popup = ClipEditPopup(
+            {"id": 43, "type": "text", "content": "editable pinned text"},
+            parent_list=SimpleNamespace(handle_fix_clip=lambda clip_id, content: None),
+        )
+        screen = QApplication.primaryScreen().availableGeometry()
+        popup.resize(screen.width() + 500, screen.height() + 500)
+        popup.move(screen.right() + 500, screen.bottom() + 500)
+        popup.show()
+        _get_qapp().processEvents()
+        popup._fit_to_screen()
+
+        geometry = popup.frameGeometry()
+        self.assertLessEqual(geometry.width(), screen.width() - (popup.SCREEN_MARGIN * 2))
+        self.assertLessEqual(geometry.height(), screen.height() - (popup.SCREEN_MARGIN * 2))
+        self.assertGreaterEqual(geometry.left(), screen.left() + popup.SCREEN_MARGIN)
+        self.assertGreaterEqual(geometry.top(), screen.top() + popup.SCREEN_MARGIN)
+        self.assertLessEqual(geometry.right(), screen.right() - popup.SCREEN_MARGIN)
+        self.assertLessEqual(geometry.bottom(), screen.bottom() - popup.SCREEN_MARGIN)
+        self.assertEqual(popup.title_bar.cursor().shape(), Qt.CursorShape.SizeAllCursor)
+        self.assertIsNotNone(popup.findChild(QSizeGrip))
 
     def test_context_menu_exposes_tag_and_group_actions(self):
         class _Storage:

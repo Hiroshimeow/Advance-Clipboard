@@ -20,6 +20,7 @@ from .clip_row import (
     ROW_MARGIN_RIGHT,
     ROW_MARGIN_TOP,
     ROW_SPACING,
+    ROW_FRAME_INSET_X,
     ClipRowMetrics,
     ClipRowState,
 )
@@ -156,7 +157,7 @@ class ClipRowDelegate(QStyledItemDelegate):
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
         bg = "#26394a" if selected else ("#2a3a4a" if hovered else "#1f1f1f")
         border = "#3daee9" if selected else ("#3a7abf" if hovered else "#333333")
-        frame = option.rect.adjusted(0, 3, -1, -3)
+        frame = option.rect.adjusted(ROW_FRAME_INSET_X, 3, -ROW_FRAME_INSET_X, -3)
 
         # 1. Fill background (no border yet)
         painter.setPen(Qt.PenStyle.NoPen)

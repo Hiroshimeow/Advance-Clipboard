@@ -34,6 +34,7 @@ ROW_MARGIN_LEFT = 8
 ROW_GROUP_INDENT = 14
 ROW_MARGIN_RIGHT = 2
 ROW_SPACING = 4
+ROW_FRAME_INSET_X = 2
 META_COLUMN_WIDTH = 36
 ACTION_COLUMN_WIDTH = 32
 ACTION_BUTTON_HEIGHT = 22
@@ -185,8 +186,11 @@ class ClipContentView(QWidget):
             label.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
             label.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             label.setStyleSheet(
-                "QPlainTextEdit { color: #e0e0e0; background: transparent; padding: 0px; }"
+                "QPlainTextEdit { color: #e0e0e0; background: #1f1f1f; padding: 0px; }"
+                "QPlainTextEdit::viewport { background: #1f1f1f; }"
             )
+            label.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            label.viewport().setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         else:
             label = QLabel(display_text, self)
             label.setWordWrap(True)
