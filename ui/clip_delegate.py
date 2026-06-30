@@ -181,27 +181,27 @@ class ClipRowDelegate(QStyledItemDelegate):
             text_flags = int(Qt.TextFlag.TextWordWrap | Qt.TextFlag.TextExpandTabs | Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
             painter.drawText(rects.content, text_flags, display_text)
 
-        # 4. Meta column (line count + expand button)
-        painter.setFont(TAG_FONT)
-        painter.setPen(QColor("#e6c36a"))
-        line_count = len(str(clip.get("content", "")).splitlines()) if clip.get("type") == "text" else 1
-        painter.drawText(QRect(rects.meta.left(), rects.meta.top(), rects.meta.width(), 18), Qt.AlignmentFlag.AlignCenter, str(line_count))
-        if clip.get("type") == "text":
-            self._paint_button(painter, rects.expand, "▲" if row.is_expanded else "▼", "#333333", "#888888")
+        if not row.is_expanded:
+            # Expanded rows are covered by a persistent editor; painting these below it
+            # leaks duplicate arrows through transparent gaps in the editor controls.
+            painter.setFont(TAG_FONT)
+            painter.setPen(QColor("#e6c36a"))
+            line_count = len(str(clip.get("content", "")).splitlines()) if clip.get("type") == "text" else 1
+            painter.drawText(QRect(rects.meta.left(), rects.meta.top(), rects.meta.width(), 18), Qt.AlignmentFlag.AlignCenter, str(line_count))
+            if clip.get("type") == "text":
+                self._paint_button(painter, rects.expand, "▼", "#333333", "#888888")
 
-        # 5. Action buttons
-        self._paint_button(painter, rects.copy, "❐", "#2b5c75", "#dddddd")
-        self._paint_button(painter, rects.pin, "★" if row.is_pinned else "☆", "#7a5c20" if row.is_pinned else "#3a3a3a", "#ffd700" if row.is_pinned else "#dddddd")
-        self._paint_button(painter, rects.delete, "✕", "#752b2b", "#dddddd")
+            self._paint_button(painter, rects.copy, "❐", "#2b5c75", "#dddddd")
+            self._paint_button(painter, rects.pin, "★" if row.is_pinned else "☆", "#7a5c20" if row.is_pinned else "#3a3a3a", "#ffd700" if row.is_pinned else "#dddddd")
+            self._paint_button(painter, rects.delete, "✕", "#752b2b", "#dddddd")
 
-        # 6. Tag label -- bottom-right, below delete button, italic
-        tag_text = self._badge_text(row)
-        if tag_text and not rects.tag.isNull():
-            tag_font = QFont(TAG_FONT)
-            tag_font.setItalic(True)
-            painter.setFont(tag_font)
-            painter.setPen(QColor("#aa8030"))
-            painter.drawText(rects.tag, int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter), tag_text)
+            tag_text = self._badge_text(row)
+            if tag_text and not rects.tag.isNull():
+                tag_font = QFont(TAG_FONT)
+                tag_font.setItalic(True)
+                painter.setFont(tag_font)
+                painter.setPen(QColor("#aa8030"))
+                painter.drawText(rects.tag, int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter), tag_text)
 
         # 7. Frame border LAST -- always on top of all content
         painter.setClipping(False)

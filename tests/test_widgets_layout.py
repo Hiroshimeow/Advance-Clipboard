@@ -306,6 +306,53 @@ class WidgetLayoutTests(unittest.TestCase):
         self.assertNotEqual(image.pixelColor(0, border_y), QColor("#3daee9"))
         self.assertEqual(image.pixelColor(ROW_FRAME_INSET_X, border_y), QColor("#3daee9"))
 
+
+    def test_delegate_does_not_paint_expand_button_under_expanded_editor(self):
+        view = ClipListView(HistoryListModel())
+        row = ClipRow(
+            row_kind="clip",
+            clip={"id": 41, "type": "text", "content": "line1\nline2\nline3", "tag": ""},
+            is_expanded=True,
+        )
+        view.set_rows([row])
+        delegate = view.itemDelegate()
+        button_texts = []
+        delegate._paint_button = lambda painter, rect, text, bg, fg: button_texts.append(text)
+
+        height = delegate.measure_row(row, 340).row_height
+        image = QImage(340, height, QImage.Format.Format_RGB32)
+        image.fill(QColor("#000000"))
+        painter = QPainter(image)
+        option = QStyleOptionViewItem()
+        option.rect = QRect(0, 0, 340, height)
+        delegate.paint(painter, option, view.model().index(0, 0))
+        painter.end()
+
+        self.assertEqual(button_texts, [])
+
+    def test_delegate_still_paints_expand_button_for_collapsed_rows(self):
+        view = ClipListView(HistoryListModel())
+        row = ClipRow(
+            row_kind="clip",
+            clip={"id": 42, "type": "text", "content": "line1\nline2\nline3", "tag": ""},
+            is_expanded=False,
+        )
+        view.set_rows([row])
+        delegate = view.itemDelegate()
+        button_texts = []
+        delegate._paint_button = lambda painter, rect, text, bg, fg: button_texts.append(text)
+
+        height = delegate.measure_row(row, 340).row_height
+        image = QImage(340, height, QImage.Format.Format_RGB32)
+        image.fill(QColor("#000000"))
+        painter = QPainter(image)
+        option = QStyleOptionViewItem()
+        option.rect = QRect(0, 0, 340, height)
+        delegate.paint(painter, option, view.model().index(0, 0))
+        painter.end()
+
+        self.assertIn("▼", button_texts)
+
     def test_right_click_does_not_trigger_row_click_action(self):
         view = ClipListView(HistoryListModel())
         view.resize(360, 240)
