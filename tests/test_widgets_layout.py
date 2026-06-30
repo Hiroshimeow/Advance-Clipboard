@@ -311,7 +311,7 @@ class WidgetLayoutTests(unittest.TestCase):
         view = ClipListView(HistoryListModel())
         row = ClipRow(
             row_kind="clip",
-            clip={"id": 41, "type": "text", "content": "line1\nline2\nline3", "tag": ""},
+            clip={"id": 41, "type": "text", "content": "feat/fix-popup-search", "tag": ""},
             is_expanded=True,
         )
         view.set_rows([row])
@@ -325,10 +325,20 @@ class WidgetLayoutTests(unittest.TestCase):
         painter = QPainter(image)
         option = QStyleOptionViewItem()
         option.rect = QRect(0, 0, 340, height)
+        content_rect = delegate.rects_for(option, row).content
         delegate.paint(painter, option, view.model().index(0, 0))
         painter.end()
 
+        bright_text_pixels = 0
+        sample_rect = content_rect.adjusted(0, 0, -1, -1)
+        for x in range(sample_rect.left(), min(sample_rect.right() + 1, sample_rect.left() + 180)):
+            for y in range(sample_rect.top(), min(sample_rect.bottom() + 1, sample_rect.top() + 36)):
+                color = image.pixelColor(x, y)
+                if color.red() > 140 and color.green() > 140 and color.blue() > 140:
+                    bright_text_pixels += 1
+
         self.assertEqual(button_texts, [])
+        self.assertEqual(bright_text_pixels, 0)
 
     def test_delegate_still_paints_expand_button_for_collapsed_rows(self):
         view = ClipListView(HistoryListModel())

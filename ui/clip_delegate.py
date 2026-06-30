@@ -169,21 +169,20 @@ class ClipRowDelegate(QStyledItemDelegate):
 
         rects = self.rects_for(option, row)
 
-        # 3. Paint text / image content
-        painter.setFont(TEXT_FONT)
-        painter.setPen(QColor("#e0e0e0"))
-        if clip.get("type") == "image":
-            self._paint_image(painter, clip, rects.content)
-        else:
-            display_text = str(clip.get("content", ""))
-            if not row.is_expanded and len(display_text) > MAX_DISPLAY_CHARS:
-                display_text = display_text[:MAX_DISPLAY_CHARS] + "..."
-            text_flags = int(Qt.TextFlag.TextWordWrap | Qt.TextFlag.TextExpandTabs | Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-            painter.drawText(rects.content, text_flags, display_text)
-
         if not row.is_expanded:
-            # Expanded rows are covered by a persistent editor; painting these below it
-            # leaks duplicate arrows through transparent gaps in the editor controls.
+            # Expanded rows use a persistent editor; keep the delegate underlay to
+            # frame-only so short clips do not double-paint text or controls.
+            painter.setFont(TEXT_FONT)
+            painter.setPen(QColor("#e0e0e0"))
+            if clip.get("type") == "image":
+                self._paint_image(painter, clip, rects.content)
+            else:
+                display_text = str(clip.get("content", ""))
+                if len(display_text) > MAX_DISPLAY_CHARS:
+                    display_text = display_text[:MAX_DISPLAY_CHARS] + "..."
+                text_flags = int(Qt.TextFlag.TextWordWrap | Qt.TextFlag.TextExpandTabs | Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+                painter.drawText(rects.content, text_flags, display_text)
+
             painter.setFont(TAG_FONT)
             painter.setPen(QColor("#e6c36a"))
             line_count = len(str(clip.get("content", "")).splitlines()) if clip.get("type") == "text" else 1
