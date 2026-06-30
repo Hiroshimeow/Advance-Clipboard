@@ -3,18 +3,16 @@ from __future__ import annotations
 import math
 
 from PyQt6.QtCore import QModelIndex, QPoint, Qt, pyqtSignal
-from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
-    QInputDialog,
     QListView,
-    QMenu,
     QStyleOptionViewItem,
 )
 
 from .clip_delegate import ClipRowDelegate
 from .clip_models import ClipListItem, ClipListModel, ClipRow, ROW_ROLE
+from .clip_context_menu import show_clip_context_menu
 
 
 class ClipListView(QListView):
@@ -218,58 +216,7 @@ class ClipListView(QListView):
         row = index.data(ROW_ROLE) if index.isValid() else None
         if not isinstance(row, ClipRow) or not row.is_clip:
             return
-        parent = self.window()
-        menu = QMenu(self)
-        menu.setStyleSheet(
-            "QMenu { background-color: #2d2d2d; color: #eee; border: 1px solid #444; }"
-            "QMenu::item:selected { background-color: #d18616; color: white; }"
-        )
-        group_menu = menu.addMenu("Add to Group")
-        if hasattr(parent, "storage"):
-            groups = parent.storage.get_groups()
-            for group in groups:
-                action = group_menu.addAction(group)
-                action.setData(("group", group))
-            if groups:
-                group_menu.addSeparator()
-            new_group_action = group_menu.addAction("New Group...")
-            new_group_action.setData(("new_group", None))
-            current_group = row.clip.get("group_name", "")
-            if current_group:
-                remove_action = menu.addAction(f"Remove from '{current_group}'")
-                remove_action.setData(("remove_group", None))
-            menu.addSeparator()
-        add_tag_action = menu.addAction("Add Tag")
-        add_tag_action.setData(("tag", None))
-        if row.is_pinned and row.clip.get("type") == "text":
-            fix_action = menu.addAction("Fix")
-            fix_action.setData(("fix", None))
-        selected = menu.exec(event.globalPos())
-        if not selected or not selected.data() or not hasattr(parent, "handle_add_tag"):
-            return
-        action_type, value = selected.data()
-        clip_id = row.clip_id
-        if not clip_id:
-            return
-        if action_type == "tag":
-            tag, ok = QInputDialog.getText(self, "Add Tag", "Enter tag name:", text=row.clip.get("tag", ""))
-            if ok:
-                parent.handle_add_tag(clip_id, tag)
-        elif action_type == "group":
-            parent.handle_set_group(clip_id, value)
-        elif action_type == "new_group":
-            group_name, ok = QInputDialog.getText(self, "New Group", "Enter group name:")
-            if ok and group_name.strip():
-                parent.handle_set_group(clip_id, group_name.strip())
-        elif action_type == "remove_group":
-            parent.handle_set_group(clip_id, "")
-        elif action_type == "fix":
-            from .widgets import ClipEditPopup
-
-            popup = ClipEditPopup(row.clip, parent, self)
-            popup.move(event.globalPos())
-            popup.show()
-            self._edit_popup = popup
+        show_clip_context_menu(self, row.clip, row.is_pinned, self.window(), event.globalPos())
 
     def wheelEvent(self, event):
         bar = self.verticalScrollBar()

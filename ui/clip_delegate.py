@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections import OrderedDict
 from dataclasses import dataclass
 
 from PyQt6.QtCore import QRect, QSize, Qt
@@ -19,7 +20,6 @@ from .clip_row import (
     ROW_MARGIN_RIGHT,
     ROW_MARGIN_TOP,
     ROW_SPACING,
-    TAG_SPACING,
     ClipRowMetrics,
     ClipRowState,
 )
@@ -40,6 +40,12 @@ class RowRects:
 
 
 class ClipRowDelegate(QStyledItemDelegate):
+    MAX_THUMBNAIL_CACHE_ENTRIES = 128
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._thumbnail_cache = OrderedDict()
+
     def sizeHint(self, option, index):
         row = index.data(ROW_ROLE)
         width = max(240, option.rect.width() or option.widget.viewport().width())
@@ -208,13 +214,36 @@ class ClipRowDelegate(QStyledItemDelegate):
         painter.setBrush(QColor("#000000"))
         painter.drawRoundedRect(image_rect, 4, 4)
         path = os.path.join(IMAGE_DIR, str(clip.get("content", "")))
-        if os.path.exists(path):
-            pixmap = QPixmap(path)
-            if not pixmap.isNull():
-                scaled = pixmap.scaled(THUMB_SIZE, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)
-                target = QRect(0, 0, scaled.width(), scaled.height())
-                target.moveCenter(image_rect.center())
-                painter.drawPixmap(target, scaled)
+        scaled = self._thumbnail_for_path(path)
+        if scaled is None:
+            return
+        target = QRect(0, 0, scaled.width(), scaled.height())
+        target.moveCenter(image_rect.center())
+        painter.drawPixmap(target, scaled)
+
+    def _thumbnail_for_path(self, path):
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return None
+        key = (path, stat.st_mtime_ns, stat.st_size)
+        cached = self._thumbnail_cache.get(key)
+        if cached is not None:
+            self._thumbnail_cache.move_to_end(key)
+            return cached
+
+        pixmap = QPixmap(path)
+        if pixmap.isNull():
+            return None
+        scaled = pixmap.scaled(
+            THUMB_SIZE,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.FastTransformation,
+        )
+        self._thumbnail_cache[key] = scaled
+        while len(self._thumbnail_cache) > self.MAX_THUMBNAIL_CACHE_ENTRIES:
+            self._thumbnail_cache.popitem(last=False)
+        return scaled
 
     def _paint_button(self, painter, rect, text, bg, fg):
         painter.setPen(Qt.PenStyle.NoPen)

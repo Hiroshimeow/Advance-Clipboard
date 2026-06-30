@@ -754,6 +754,12 @@ class ClipItemWidget(QWidget):
         self.edit_popup.show()
 
 
-from .clip_row import ClipRowWidget
+try:
+    from .clip_row import ClipRowWidget
 
-ClipItemWidget = ClipRowWidget
+    ClipItemWidget = ClipRowWidget
+except ImportError:
+    def ClipItemWidget(*args, **kwargs):
+        from .clip_row import ClipRowWidget
+
+        return ClipRowWidget(*args, **kwargs)

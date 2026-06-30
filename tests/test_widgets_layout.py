@@ -1,5 +1,7 @@
 import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 
@@ -9,7 +11,7 @@ sys.path.insert(0, ROOT_DIR)
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import Qt, QSize, QEvent, QPoint, QPointF
-from PyQt6.QtGui import QContextMenuEvent, QMouseEvent
+from PyQt6.QtGui import QColor, QContextMenuEvent, QImage, QMouseEvent
 from PyQt6.QtWidgets import QApplication, QLabel, QListWidgetItem, QMenu, QPushButton, QWidget
 
 from ui.clipboard_browser_controller import ClipboardBrowserController
@@ -305,6 +307,38 @@ class WidgetLayoutTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertFalse(view._pressed_index.isValid())
         self.assertIsNone(view._pressed_action)
+
+    def test_clip_list_view_imports_without_widgets_import_order_dependency(self):
+        env = os.environ.copy()
+        env.setdefault("QT_QPA_PLATFORM", "offscreen")
+        result = subprocess.run(
+            [sys.executable, "-c", "import ui.clip_list_view; print('ok')"],
+            cwd=ROOT_DIR,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ok", result.stdout)
+
+    def test_delegate_reuses_thumbnail_cache_for_same_image(self):
+        path = os.path.join(tempfile.gettempdir(), "advance_clipboard_thumb_cache_test.png")
+        image = QImage(32, 20, QImage.Format.Format_RGB32)
+        image.fill(QColor("#2b5c75"))
+        self.assertTrue(image.save(path))
+        try:
+            delegate = ClipRowDelegate()
+            first = delegate._thumbnail_for_path(path)
+            second = delegate._thumbnail_for_path(path)
+            self.assertIsNotNone(first)
+            self.assertIs(first, second)
+            self.assertEqual(len(delegate._thumbnail_cache), 1)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
     def test_context_menu_exposes_tag_and_group_actions(self):
         class _Storage:

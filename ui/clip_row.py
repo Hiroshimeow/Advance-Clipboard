@@ -7,9 +7,7 @@ from PyQt6.QtGui import QFontMetrics, QPixmap
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
-    QMenu,
     QPlainTextEdit,
     QPushButton,
     QSizePolicy,
@@ -17,6 +15,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .clip_context_menu import show_clip_context_menu
 from .widgets import (
     CLIP_TEXT_BOTTOM_PADDING,
     COLLAPSED_MAX_LINES,
@@ -455,70 +454,10 @@ class ClipRowWidget(QWidget):
             self.parent_list.handle_delete(self.clip_id)
 
     def contextMenuEvent(self, event):
-        menu = QMenu(self)
-        menu.setStyleSheet(
-            """
-            QMenu { background-color: #2d2d2d; color: #eee; border: 1px solid #444; }
-            QMenu::item:selected { background-color: #d18616; color: white; }
-            """
+        show_clip_context_menu(
+            self,
+            self.item_data,
+            self.is_pinned,
+            self.parent_list,
+            self.mapToGlobal(event.pos()),
         )
-
-        group_menu = menu.addMenu("Add to Group")
-        if self.parent_list:
-            groups = self.parent_list.storage.get_groups()
-            for group in groups:
-                action = group_menu.addAction(group)
-                action.setData(("group", group))
-            if groups:
-                group_menu.addSeparator()
-            new_group_action = group_menu.addAction("New Group...")
-            new_group_action.setData(("new_group", None))
-            current_group = self.item_data.get("group_name", "")
-            if current_group:
-                remove_action = menu.addAction(f"Remove from '{current_group}'")
-                remove_action.setData(("remove_group", None))
-            menu.addSeparator()
-        add_tag_action = menu.addAction("Add Tag")
-        add_tag_action.setData(("tag", None))
-        if self.is_pinned and self.item_data.get("type") == "text":
-            fix_action = menu.addAction("Fix")
-            fix_action.setData(("fix", None))
-
-        action = menu.exec(self.mapToGlobal(event.pos()))
-        if not action or not action.data():
-            return
-        action_type, value = action.data()
-        if action_type == "tag":
-            self.on_add_tag()
-        elif action_type == "group":
-            self.on_set_group(value)
-        elif action_type == "new_group":
-            self.on_new_group()
-        elif action_type == "remove_group":
-            self.on_set_group("")
-        elif action_type == "fix":
-            self.on_fix_clip()
-
-    def on_add_tag(self):
-        current_tag = self.item_data.get("tag", "")
-        tag, ok = QInputDialog.getText(self, "Add Tag", "Enter tag name:", text=current_tag)
-        if ok and self.clip_id and self.parent_list:
-            self.parent_list.handle_add_tag(self.clip_id, tag)
-
-    def on_set_group(self, group_name):
-        if self.clip_id and self.parent_list:
-            self.parent_list.handle_set_group(self.clip_id, group_name)
-
-    def on_new_group(self):
-        group_name, ok = QInputDialog.getText(self, "New Group", "Enter group name:")
-        if ok and group_name.strip() and self.clip_id and self.parent_list:
-            self.parent_list.handle_set_group(self.clip_id, group_name.strip())
-
-    def on_fix_clip(self):
-        if not self.parent_list or not self.clip_id:
-            return
-        from .widgets import ClipEditPopup
-
-        self.edit_popup = ClipEditPopup(self.item_data, self.parent_list, self)
-        self.edit_popup.move(self.mapToGlobal(QPoint(10, 10)))
-        self.edit_popup.show()

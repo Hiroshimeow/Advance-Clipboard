@@ -24,7 +24,6 @@ class ClipboardBrowserController:
 
         # Group expansion state
         self.expanded_groups = set()
-        self.group_headers = {}
         self.expanded_clip_ids = set()
 
         # UI state
@@ -58,8 +57,6 @@ class ClipboardBrowserController:
         self._layout_refresh_timer.timeout.connect(self._refresh_visible_row_layouts)
 
         self._focus_query_timer = None
-        self._last_history_layout_width = None
-        self._last_pinned_layout_width = None
 
     def bind_viewports(self):
         if hasattr(self.app, "list_history") and hasattr(self.app, "list_pinned"):
@@ -216,7 +213,6 @@ class ClipboardBrowserController:
             self.app.setUpdatesEnabled(False)
             self.app.list_history._clear_hover()
             self.app.list_pinned._clear_hover()
-            self.group_headers = {}
             self.history_offset = 0
             self.pinned_offset = 0
             self.history_has_more = len(history_clips) >= PAGE_SIZE_HISTORY
@@ -229,9 +225,6 @@ class ClipboardBrowserController:
         finally:
             self.app.setUpdatesEnabled(True)
             self._is_refreshing = False
-
-    def _refresh_list_row_layouts(self, list_widget, is_pinned):
-        list_widget.doItemsLayout()
 
     def on_ui_opened(self):
         """Called when the UI window is shown/toggled open."""
@@ -530,7 +523,6 @@ class ClipboardBrowserController:
             self.app.setUpdatesEnabled(False)
             self.app.list_history._clear_hover()
             self.app.list_pinned._clear_hover()
-            self.group_headers = {}
             self.history_offset = 0
             self.pinned_offset = 0
             self.history_has_more = False
@@ -563,11 +555,6 @@ class ClipboardBrowserController:
                 else None
             )
             self._focus_query_timer.start(300)
-
-    def _list_content_width(self, list_widget):
-        """Return a conservative row width that leaves room for list padding/scrollbar."""
-        viewport_width = list_widget.viewport().width() or ((self.app.width() // 2) - 25)
-        return max(240, viewport_width - 2)
 
     def _sync_selection_to_map(self):
         """Sync the currently selected clip to the neural map (focus node)."""
@@ -663,7 +650,6 @@ class ClipboardBrowserController:
 
     def refresh_pinned_list(self):
         """Refresh only the pinned list, preserving group expansion state."""
-        self.group_headers = {}
         self.pinned_offset = 0
 
         if self.current_search_query:
