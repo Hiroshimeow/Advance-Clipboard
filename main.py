@@ -1,11 +1,10 @@
-import os
 # /// script
 # requires-python = ">=3.11,<3.14"
 # dependencies = [
 #     "PyQt6",
-
 # ]
 # ///
+import os
 import sys
 import hashlib
 import ctypes
