@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import Qt, QSize, QEvent, QPoint, QPointF, QRect
 from PyQt6.QtGui import QColor, QContextMenuEvent, QImage, QMouseEvent, QPainter
-from PyQt6.QtWidgets import QApplication, QLabel, QListWidgetItem, QMenu, QPushButton, QWidget, QPlainTextEdit, QSizeGrip, QStyle, QStyleOptionViewItem
+from PyQt6.QtWidgets import QApplication, QLabel, QListWidgetItem, QMenu, QPushButton, QWidget, QPlainTextEdit, QStyle, QStyleOptionViewItem
 
 from ui.clipboard_browser_controller import ClipboardBrowserController
 from ui.clip_delegate import ClipRowDelegate
@@ -282,6 +282,8 @@ class WidgetLayoutTests(unittest.TestCase):
         self.assertTrue(widget.lbl_content.testAttribute(Qt.WidgetAttribute.WA_StyledBackground))
         self.assertTrue(widget.lbl_content.viewport().testAttribute(Qt.WidgetAttribute.WA_StyledBackground))
         self.assertIn("QPlainTextEdit::viewport { background: #1f1f1f; }", widget.lbl_content.styleSheet())
+        self.assertTrue(widget.lbl_line_count.testAttribute(Qt.WidgetAttribute.WA_StyledBackground))
+        self.assertIn("background: #1f1f1f", widget.lbl_line_count.styleSheet())
 
     def test_delegate_selected_frame_is_not_clipped_at_left_edge(self):
         view = ClipListView(HistoryListModel())
@@ -381,11 +383,14 @@ class WidgetLayoutTests(unittest.TestCase):
             except OSError:
                 pass
 
-    def test_fix_popup_can_resize_drag_and_fit_inside_screen(self):
+    def test_fix_popup_uses_native_resize_and_fits_inside_screen(self):
         popup = ClipEditPopup(
-            {"id": 43, "type": "text", "content": "editable pinned text"},
+            {"id": 43, "type": "text", "content": "editable pinned text", "tag": "todo"},
             parent_list=SimpleNamespace(handle_fix_clip=lambda clip_id, content: None),
         )
+        self.assertEqual(popup.windowTitle(), "todo")
+        self.assertFalse(bool(popup.windowFlags() & Qt.WindowType.FramelessWindowHint))
+
         screen = QApplication.primaryScreen().availableGeometry()
         popup.resize(screen.width() + 500, screen.height() + 500)
         popup.move(screen.right() + 500, screen.bottom() + 500)
@@ -400,8 +405,13 @@ class WidgetLayoutTests(unittest.TestCase):
         self.assertGreaterEqual(geometry.top(), screen.top() + popup.SCREEN_MARGIN)
         self.assertLessEqual(geometry.right(), screen.right() - popup.SCREEN_MARGIN)
         self.assertLessEqual(geometry.bottom(), screen.bottom() - popup.SCREEN_MARGIN)
-        self.assertEqual(popup.title_bar.cursor().shape(), Qt.CursorShape.SizeAllCursor)
-        self.assertIsNotNone(popup.findChild(QSizeGrip))
+
+    def test_fix_popup_has_blank_title_without_tag(self):
+        popup = ClipEditPopup(
+            {"id": 44, "type": "text", "content": "editable pinned text", "tag": ""},
+            parent_list=SimpleNamespace(handle_fix_clip=lambda clip_id, content: None),
+        )
+        self.assertEqual(popup.windowTitle(), "")
 
     def test_context_menu_exposes_tag_and_group_actions(self):
         class _Storage:

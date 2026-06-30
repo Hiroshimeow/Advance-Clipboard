@@ -279,8 +279,9 @@ class ClipMetaColumn(QWidget):
         self.lbl_line_count.setToolTip("So dong")
         self.lbl_line_count.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_line_count.setStyleSheet(
-            "QLabel { color: #e6c36a; background: transparent; font-size: 8pt; font-weight: 600; }"
+            "QLabel { color: #e6c36a; background: #1f1f1f; font-size: 8pt; font-weight: 600; }"
         )
+        self.lbl_line_count.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout.addWidget(self.lbl_line_count)
 
         self.btn_expand = None

@@ -1,7 +1,7 @@
 import math
 import os
 
-from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QEvent
+from PyQt6.QtCore import Qt, QTimer, QPoint, QSize
 from PyQt6.QtGui import QFont, QFontMetrics, QPixmap
 from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtWidgets import (
@@ -17,7 +17,6 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QApplication,
-    QSizeGrip,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -263,9 +262,9 @@ class ClipEditPopup(QWidget):
         self.clip_data = clip_data
         self.parent_list = parent_list
         self.clip_id = clip_data.get("id")
-        self._drag_offset = None
         self._fitting_to_screen = False
-        self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
+        self.setWindowFlags(Qt.WindowType.Tool)
+        self.setWindowTitle(str(clip_data.get("tag") or ""))
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.setMinimumSize(360, 220)
         self.resize(560, 360)
@@ -276,12 +275,6 @@ class ClipEditPopup(QWidget):
                 background: #1f1f1f;
                 border: 1px solid #3daee9;
                 border-radius: 6px;
-            }
-            QFrame#popupTitleBar {
-                background: #26394a;
-                border: none;
-                border-top-left-radius: 5px;
-                border-top-right-radius: 5px;
             }
             QPlainTextEdit {
                 background: #2a2a2a;
@@ -303,14 +296,6 @@ class ClipEditPopup(QWidget):
                 border-color: #aa8030;
                 color: white;
             }
-            QPushButton#closeButton {
-                background: transparent;
-                border: none;
-                color: #e0e0e0;
-                font-size: 11pt;
-                padding: 0px;
-            }
-            QPushButton#closeButton:hover { color: white; background: #752b2b; }
         """)
 
         root = QVBoxLayout(self)
@@ -324,24 +309,6 @@ class ClipEditPopup(QWidget):
         layout = QVBoxLayout(chrome)
         layout.setContentsMargins(10, 10, 10, 8)
         layout.setSpacing(8)
-
-        self.title_bar = QFrame(chrome)
-        self.title_bar.setObjectName("popupTitleBar")
-        self.title_bar.setCursor(Qt.CursorShape.SizeAllCursor)
-        title_layout = QHBoxLayout(self.title_bar)
-        title_layout.setContentsMargins(8, 4, 4, 4)
-        title_layout.setSpacing(6)
-        self.title_label = QLabel("Fix pinned clip")
-        title_layout.addWidget(self.title_label)
-        title_layout.addStretch()
-        btn_close = QPushButton("x", self.title_bar)
-        btn_close.setObjectName("closeButton")
-        btn_close.setFixedSize(24, 22)
-        btn_close.clicked.connect(self.close)
-        title_layout.addWidget(btn_close)
-        layout.addWidget(self.title_bar)
-        self.title_bar.installEventFilter(self)
-        self.title_label.installEventFilter(self)
 
         self.editor = QPlainTextEdit(chrome)
         self.editor.setPlainText(str(clip_data.get("content", "")))
@@ -361,25 +328,7 @@ class ClipEditPopup(QWidget):
         btn_save.setObjectName("saveButton")
         btn_save.clicked.connect(self._save)
         footer.addWidget(btn_save)
-        grip = QSizeGrip(chrome)
-        grip.setFixedSize(18, 18)
-        footer.addWidget(grip)
         layout.addLayout(footer)
-
-    def eventFilter(self, watched, event):
-        if watched in (self.title_bar, self.title_label):
-            if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
-                self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-                event.accept()
-                return True
-            if event.type() == QEvent.Type.MouseMove and self._drag_offset is not None:
-                self.move(event.globalPosition().toPoint() - self._drag_offset)
-                self._fit_to_screen()
-                event.accept()
-                return True
-            if event.type() == QEvent.Type.MouseButtonRelease:
-                self._drag_offset = None
-        return super().eventFilter(watched, event)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -400,21 +349,31 @@ class ClipEditPopup(QWidget):
             return
         self._fitting_to_screen = True
         try:
-            max_width = max(self.minimumWidth(), screen.width() - (self.SCREEN_MARGIN * 2))
-            max_height = max(self.minimumHeight(), screen.height() - (self.SCREEN_MARGIN * 2))
+            frame = self.frameGeometry()
+            frame_extra_width = max(0, frame.width() - self.width())
+            frame_extra_height = max(0, frame.height() - self.height())
+            max_width = max(
+                self.minimumWidth(),
+                screen.width() - (self.SCREEN_MARGIN * 2) - frame_extra_width,
+            )
+            max_height = max(
+                self.minimumHeight(),
+                screen.height() - (self.SCREEN_MARGIN * 2) - frame_extra_height,
+            )
             width = min(self.width(), max_width)
             height = min(self.height(), max_height)
             if width != self.width() or height != self.height():
                 self.resize(width, height)
+                frame = self.frameGeometry()
 
             x_min = screen.left() + self.SCREEN_MARGIN
             y_min = screen.top() + self.SCREEN_MARGIN
-            x_max = screen.right() - self.width() - self.SCREEN_MARGIN + 1
-            y_max = screen.bottom() - self.height() - self.SCREEN_MARGIN + 1
-            x = min(max(self.x(), x_min), max(x_min, x_max))
-            y = min(max(self.y(), y_min), max(y_min, y_max))
-            if x != self.x() or y != self.y():
-                self.move(x, y)
+            x_max = screen.right() - frame.width() - self.SCREEN_MARGIN + 1
+            y_max = screen.bottom() - frame.height() - self.SCREEN_MARGIN + 1
+            frame_x = min(max(frame.left(), x_min), max(x_min, x_max))
+            frame_y = min(max(frame.top(), y_min), max(y_min, y_max))
+            if frame_x != frame.left() or frame_y != frame.top():
+                self.move(self.pos() + (QPoint(frame_x, frame_y) - frame.topLeft()))
         finally:
             self._fitting_to_screen = False
 
