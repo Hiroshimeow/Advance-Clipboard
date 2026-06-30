@@ -46,6 +46,12 @@ def _get_qapp() -> QApplication:
     return _APP
 
 
+def _content_text(widget):
+    if hasattr(widget, "toPlainText"):
+        return widget.toPlainText()
+    return widget.text()
+
+
 class _BrowserHarness(QWidget):
     def __init__(self):
         super().__init__()
@@ -217,6 +223,7 @@ class WidgetLayoutTests(unittest.TestCase):
         widget.show()
         _get_qapp().processEvents()
 
+        self.assertIsInstance(widget.lbl_content, QPlainTextEdit)
         self.assertEqual(widget.content_container.width(), widget.metrics.content_width)
         self.assertEqual(widget.lbl_content.width(), widget.metrics.content_width)
         self.assertEqual(widget.lbl_content.width(), widget.content_container.width())
@@ -399,8 +406,9 @@ class WidgetLayoutTests(unittest.TestCase):
         self.assertEqual(len(editors), 1)
         self.assertGreater(visual_rect.height(), before_rect.height())
         self.assertEqual(editors[0].geometry(), visual_rect)
+        self.assertIsInstance(editors[0].lbl_content, QPlainTextEdit)
         self.assertEqual(editors[0].lbl_content.width(), editors[0].metrics.content_width)
-        self.assertIn("docker compose", editors[0].lbl_content.text())
+        self.assertIn("docker compose", _content_text(editors[0].lbl_content))
 
     def test_delete_image_rebinds_remaining_expanded_editor(self):
         harness = _BrowserHarness()
@@ -428,7 +436,8 @@ class WidgetLayoutTests(unittest.TestCase):
         self.assertTrue(row.is_expanded)
         self.assertEqual(len(editors), 1)
         self.assertEqual(editors[0].geometry(), visual_rect)
-        self.assertIn("line two", editors[0].lbl_content.text())
+        self.assertIsInstance(editors[0].lbl_content, QPlainTextEdit)
+        self.assertIn("line two", _content_text(editors[0].lbl_content))
 
     def test_delegate_still_paints_expand_button_for_collapsed_rows(self):
         view = ClipListView(HistoryListModel())

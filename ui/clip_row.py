@@ -185,11 +185,13 @@ class ClipContentView(QWidget):
         if not self.state.expanded and len(text) > MAX_DISPLAY_CHARS:
             display_text = text[:MAX_DISPLAY_CHARS] + "..."
 
-        if self.state.expanded and self.metrics.rendered_lines > EXPANDED_MAX_LINES:
+        if self.state.expanded:
             label = QPlainTextEdit(self)
             label.setPlainText(display_text)
             label.setReadOnly(True)
             label.setFrameStyle(QFrame.Shape.NoFrame)
+            label.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+            label.document().setDocumentMargin(0)
             label.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
             label.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             label.setStyleSheet(
@@ -205,7 +207,7 @@ class ClipContentView(QWidget):
             label.setStyleSheet("color: #e0e0e0; background: transparent;")
         label.setFont(TEXT_FONT)
         label.setFixedWidth(self.metrics.content_width)
-        label.setMinimumHeight(self.metrics.text_height)
+        label.setFixedHeight(self.metrics.text_height)
         label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         return label
 
