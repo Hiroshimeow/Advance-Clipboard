@@ -18,7 +18,7 @@ from ui.clipboard_browser_controller import ClipboardBrowserController
 from ui.clip_delegate import ClipRowDelegate
 from ui.clip_list_view import ClipListView
 from ui.clip_models import ClipRow, HistoryListModel, ROW_ROLE
-from ui.clip_row import ClipRowWidget, ROW_FRAME_INSET_X
+from ui.clip_row import ClipRowMetrics, ClipRowState, ClipRowWidget, ROW_FRAME_INSET_X
 from ui.widgets import (
     COLLAPSED_MAX_LINES,
     ClipEditPopup,
@@ -185,6 +185,24 @@ class WidgetLayoutTests(unittest.TestCase):
         self.assertGreaterEqual(widget.height(), widget.btn_v_widget.minimumHeight() + 10)
         self.assertLessEqual(widget.btn_v_widget.width(), 36)
 
+    def test_expanded_short_text_rows_grow_beyond_collapsed_height(self):
+        cases = [
+            "_parse_legacy_xls",
+            "backend/app/services/document_service.py",
+            "huong develop\nvoi ToC + [BEGIN DIAGRAM CONTEXT] drawing region",
+        ]
+        for content in cases:
+            item = {"type": "text", "content": content, "tag": ""}
+            collapsed = ClipRowMetrics.for_clip(
+                item, ClipRowState(expanded=False), available_width=430
+            )
+            expanded = ClipRowMetrics.for_clip(
+                item, ClipRowState(expanded=True), available_width=430
+            )
+            with self.subTest(content=content):
+                self.assertGreater(expanded.row_height, collapsed.row_height)
+                self.assertGreater(expanded.content_height, collapsed.content_height)
+
     def test_actions_stay_in_right_side_column(self):
         item = {
             "id": 3,
@@ -347,6 +365,7 @@ class WidgetLayoutTests(unittest.TestCase):
         harness.list_history.set_rows(harness.browser.build_history_rows([clip]))
         harness.list_history.show()
         _get_qapp().processEvents()
+        before_rect = harness.list_history.visualRect(harness.list_history.model().index(0, 0))
 
         harness.browser.toggle_clip_expanded(46)
         _get_qapp().processEvents()
@@ -360,6 +379,7 @@ class WidgetLayoutTests(unittest.TestCase):
 
         self.assertTrue(row.is_expanded)
         self.assertEqual(len(editors), 1)
+        self.assertGreater(visual_rect.height(), before_rect.height())
         self.assertEqual(editors[0].geometry(), visual_rect)
         self.assertIn("docker compose", editors[0].lbl_content.text())
 

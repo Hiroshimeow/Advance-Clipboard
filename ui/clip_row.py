@@ -41,6 +41,7 @@ ACTION_BUTTON_HEIGHT = 22
 ACTION_BUTTON_SPACING = 4
 TEXT_MAX_WIDTH = 520
 TEXT_MIN_WIDTH = 120
+EXPANDED_MIN_VISIBLE_LINES = 6
 TAG_SPACING = 4
 
 
@@ -92,6 +93,12 @@ class ClipRowMetrics:
                 display_text = text[:MAX_DISPLAY_CHARS] + "..."
             max_lines = EXPANDED_MAX_LINES if state.expanded else COLLAPSED_MAX_LINES
             rendered_lines, text_height = measure_visible_text(display_text, content_width, max_lines)
+            if state.expanded:
+                line_spacing = QFontMetrics(TEXT_FONT).lineSpacing()
+                min_text_height = (
+                    EXPANDED_MIN_VISIBLE_LINES * line_spacing
+                ) + CLIP_TEXT_BOTTOM_PADDING + 2
+                text_height = max(text_height, min_text_height)
             content_height = text_height
         else:
             rendered_lines = 1
