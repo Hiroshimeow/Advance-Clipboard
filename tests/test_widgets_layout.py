@@ -203,6 +203,24 @@ class WidgetLayoutTests(unittest.TestCase):
                 self.assertGreater(expanded.row_height, collapsed.row_height)
                 self.assertGreater(expanded.content_height, collapsed.content_height)
 
+    def test_expanded_short_text_uses_full_content_width(self):
+        item = {
+            "id": 43,
+            "type": "text",
+            "content": "--------------\n2 files changed, 68 insertions(+), 21 deletions(-)",
+            "tag": "",
+            "group_name": "",
+        }
+        widget = ClipItemWidget(
+            item, is_pinned=False, parent_list=None, expanded=True, available_width=560
+        )
+        widget.show()
+        _get_qapp().processEvents()
+
+        self.assertEqual(widget.content_container.width(), widget.metrics.content_width)
+        self.assertEqual(widget.lbl_content.width(), widget.metrics.content_width)
+        self.assertEqual(widget.lbl_content.width(), widget.content_container.width())
+
     def test_actions_stay_in_right_side_column(self):
         item = {
             "id": 3,
@@ -381,6 +399,7 @@ class WidgetLayoutTests(unittest.TestCase):
         self.assertEqual(len(editors), 1)
         self.assertGreater(visual_rect.height(), before_rect.height())
         self.assertEqual(editors[0].geometry(), visual_rect)
+        self.assertEqual(editors[0].lbl_content.width(), editors[0].metrics.content_width)
         self.assertIn("docker compose", editors[0].lbl_content.text())
 
     def test_delete_image_rebinds_remaining_expanded_editor(self):

@@ -165,14 +165,14 @@ class ClipContentView(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        self.setMinimumWidth(0)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setFixedWidth(metrics.content_width)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
         if item_data.get("type") == "text":
             self.lbl_content = self._build_text_content()
         else:
             self.lbl_content = self._build_image_content()
-        layout.addWidget(self.lbl_content, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self.lbl_content, 0, Qt.AlignmentFlag.AlignTop)
         self.lbl_tag = self._build_tag()
         if self.lbl_tag is not None:
             layout.addSpacing(TAG_SPACING)
@@ -204,10 +204,9 @@ class ClipContentView(QWidget):
             label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
             label.setStyleSheet("color: #e0e0e0; background: transparent;")
         label.setFont(TEXT_FONT)
-        label.setMinimumWidth(0)
-        label.setMaximumWidth(self.metrics.content_width)
+        label.setFixedWidth(self.metrics.content_width)
         label.setMinimumHeight(self.metrics.text_height)
-        label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         return label
 
     def _build_image_content(self):
