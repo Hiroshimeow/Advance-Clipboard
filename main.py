@@ -57,7 +57,7 @@ from core.clipboard_monitor import (
 # Import storage and backup modules
 from storage import get_storage
 from storage.backup import (
-    create_backup,
+    create_backup_in_subprocess,
     find_valid_backup,
     import_legacy_json,
     BackupScheduler,
@@ -152,6 +152,14 @@ class ClientApp(QWidget):
         self._ui_opening_until = 0.0
         self._paste_in_progress = False
         self._last_clipboard_capture_at = 0.0
+        self._last_ingested_clipboard_key = None
+        self._last_ingested_clipboard_at = 0.0
+        self._clipboard_capture_timer = QTimer(self)
+        self._clipboard_capture_timer.setSingleShot(True)
+        self._clipboard_capture_timer.setInterval(35)
+        self._clipboard_capture_timer.timeout.connect(
+            lambda: self._process_clipboard_data_retry(0)
+        )
         self._hidden_refresh_timer = QTimer(self)
         self._hidden_refresh_timer.setSingleShot(True)
         self._hidden_refresh_timer.timeout.connect(self._refresh_hidden_ui_cache)
@@ -230,10 +238,9 @@ class ClientApp(QWidget):
         self.refresh_lists()
 
     def _perform_backup(self):
-        """Create backup from current SQLite data."""
-        clips = self.storage.get_all_clips()
-        create_backup(clips)
-        self.storage.clear_backup_flag()
+        """Create backup outside the UI process to avoid GIL stalls."""
+        if create_backup_in_subprocess():
+            self.storage.clear_backup_flag()
 
 
     def _cleanup_on_exit(self):
@@ -1008,9 +1015,10 @@ class ClientApp(QWidget):
         super().keyPressEvent(e)
 
     def on_clipboard_change_delayed(self):
-        """Delay reading clipboard slightly so source apps can finish publishing data."""
-        self._last_clipboard_capture_at = time.perf_counter()
-        QTimer.singleShot(5, lambda: self._process_clipboard_data_retry(0))
+        """Coalesce clipboard format bursts before reading the final payload."""
+        if not self._clipboard_capture_timer.isActive():
+            self._last_clipboard_capture_at = time.perf_counter()
+        self._clipboard_capture_timer.start()
 
     def _process_clipboard_data(self):
         self._process_clipboard_data_retry(0)
@@ -1052,7 +1060,19 @@ class ClientApp(QWidget):
                 content = t
         if not clip_type or not content:
             return
+
+        now = time.monotonic()
+        clipboard_key = (clip_type, content)
+        if (
+            clipboard_key == self._last_ingested_clipboard_key
+            and now - self._last_ingested_clipboard_at < 1.0
+        ):
+            logger.debug("clipboard_ingest_skipped reason=duplicate_burst")
+            return
+
         clip_id, is_new = self.storage.add_clip(clip_type, content)
+        self._last_ingested_clipboard_key = clipboard_key
+        self._last_ingested_clipboard_at = now
         if self.isVisible():
             self.browser.apply_pending_history_updates([clip_id]) or self.refresh_lists()
         else:

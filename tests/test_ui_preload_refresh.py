@@ -170,6 +170,32 @@ class UiPreloadRefreshTests(unittest.TestCase):
         ]
         self.assertEqual([50], refresh_delays)
 
+    def test_clipboard_change_events_are_coalesced(self):
+        app = self._make_app()
+        calls = []
+        app._process_clipboard_data_retry = lambda attempt: calls.append(attempt)
+
+        app.on_clipboard_change_delayed()
+        app.on_clipboard_change_delayed()
+        app.on_clipboard_change_delayed()
+
+        self.assertTrue(_wait_until(lambda: len(calls) == 1))
+        self.assertEqual([0], calls)
+
+    def test_duplicate_clipboard_payload_is_ingested_once_per_burst(self):
+        app = self._make_app()
+        mime = QMimeData()
+        mime.setText("same clipboard payload")
+        app.clipboard.mimeData = lambda: mime
+
+        app._process_clipboard_data_retry(0)
+        app._process_clipboard_data_retry(0)
+
+        self.assertEqual(
+            [("text", "same clipboard payload", "")],
+            self.storage.added,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

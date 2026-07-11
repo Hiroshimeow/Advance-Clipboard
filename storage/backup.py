@@ -11,6 +11,8 @@ import json
 import hashlib
 import os
 import glob
+import subprocess
+import sys
 import threading
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
@@ -65,24 +67,21 @@ def create_backup(clips: List[Dict[Any, Any]]) -> Optional[str]:
     filepath = os.path.join(BACKUP_DIR, filename)
     temp_filepath = filepath + ".tmp"
 
-    # Prepare backup data with checksum (v2 format for consistency)
-    backup_data = {
-        "version": 2,
-        "created_at": datetime.now().isoformat(),
-        "clips": clips,  # v1 compatibility field name used in some logic
-        "history": [c for c in clips if not c.get("is_pinned")],
-        "pinned": [c for c in clips if c.get("is_pinned")],
-    }
-
-    # Serialize and compute checksum
+    # Serialize clips once. Older backups duplicated the full dataset into
+    # clips/history/pinned, doubling file size and JSON CPU cost.
     clips_json = json.dumps(clips, ensure_ascii=False, sort_keys=True)
     checksum = compute_checksum(clips_json)
-    backup_data["checksum"] = checksum
-    backup_data["clip_count"] = len(clips)
+    created_at = datetime.now().isoformat()
 
     try:
         with open(temp_filepath, "w", encoding="utf-8") as f:
-            json.dump(backup_data, f, ensure_ascii=False, indent=2)
+            f.write('{"version":2,"created_at":')
+            json.dump(created_at, f, ensure_ascii=False)
+            f.write(',"clips":')
+            f.write(clips_json)
+            f.write(',"checksum":')
+            json.dump(checksum, f)
+            f.write(f',"clip_count":{len(clips)}}}')
 
         os.replace(temp_filepath, filepath)
         rotate_backups()
@@ -95,6 +94,31 @@ def create_backup(clips: List[Dict[Any, Any]]) -> Optional[str]:
                 pass
         print(f"[Backup] Failed: {e}")
         return None
+
+
+def create_backup_in_subprocess(db_file: Optional[str] = None) -> bool:
+    """Create a backup outside the UI process to avoid JSON/GIL stalls."""
+    if db_file is None:
+        from .db import DB_FILE
+
+        db_file = DB_FILE
+
+    command = [sys.executable, "-m", "storage.backup_worker", db_file]
+    kwargs = {
+        "cwd": BASE_DIR,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "timeout": 120,
+        "check": False,
+    }
+    if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+    try:
+        result = subprocess.run(command, **kwargs)
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def validate_backup(filepath: str) -> Tuple[bool, Optional[List[Dict[str, Any]]]]:

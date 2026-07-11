@@ -113,11 +113,17 @@ class ClipRepository:
             if not clip:
                 return False
             existing = conn.execute(
-                "SELECT id FROM clips WHERE hash = ? AND id != ?",
+                "SELECT id, is_pinned FROM clips WHERE hash = ? AND id != ?",
                 (content_hash, clip_id),
             ).fetchone()
             if existing:
-                raise ValueError("Clip content already exists.")
+                if clip["is_pinned"] and not existing["is_pinned"]:
+                    # Editing a pinned clip may converge on content that was
+                    # already captured in history. Keep the pinned record and
+                    # remove the redundant history row before updating it.
+                    conn.execute("DELETE FROM clips WHERE id = ?", (existing["id"],))
+                else:
+                    raise ValueError("Another pinned clip already has this content.")
             updated_at = now
             if clip["is_pinned"]:
                 # Keep current history visibility semantics for pinned edits.
@@ -234,7 +240,7 @@ class ClipRepository:
         conn = get_connection()
         rows = conn.execute(
             """SELECT id, type, content, hash, tag, group_name, pinned_at, created_at, updated_at
-               FROM clips
+               FROM clips INDEXED BY idx_updated
                WHERE is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at)
                ORDER BY updated_at DESC
                LIMIT ? OFFSET ?""",

@@ -343,7 +343,7 @@ class ClipboardStorage:
             where_clauses.append("(content LIKE ? ESCAPE '\\' OR tag LIKE ? ESCAPE '\\' OR group_name LIKE ? ESCAPE '\\')")
             params.extend([pattern, pattern, pattern])
         rows = conn.execute(
-            f"""SELECT * FROM clips
+            f"""SELECT * FROM clips INDEXED BY idx_updated
                 WHERE ({' AND '.join(where_clauses)})
                   AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
                 ORDER BY updated_at DESC LIMIT ?""",
