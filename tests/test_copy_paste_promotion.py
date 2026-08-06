@@ -42,6 +42,7 @@ class _StubStorage:
     def __init__(self, clips):
         self.clips = {clip["id"]: dict(clip) for clip in clips}
         self.need_backup = False
+        self.add_clip_calls = []
 
     def is_db_valid(self):
         return True
@@ -63,6 +64,13 @@ class _StubStorage:
     def get_clip_by_id(self, clip_id):
         clip = self.clips.get(clip_id)
         return dict(clip) if clip else None
+
+    def add_clip(self, clip_type, content, tag=""):
+        self.add_clip_calls.append((clip_type, content, tag))
+        for clip in self.clips.values():
+            if clip.get("content") == content:
+                return clip["id"], False
+        raise AssertionError(f"missing stub clip for content: {content}")
 
     def search_history(self, query):
         return []
@@ -118,6 +126,7 @@ class CopyPastePromotionTests(unittest.TestCase):
 
         self.assertEqual([2, 1], self._history_ids(app))
         self.assertEqual(0, app.list_history.currentRow())
+        self.assertEqual([("text", "newer", "")], self.storage.add_clip_calls)
 
     def test_paste_schedules_promotion_after_paste_request(self):
         app = self._make_app()
@@ -125,6 +134,14 @@ class CopyPastePromotionTests(unittest.TestCase):
 
         def fake_prepare(data, attempt_index):
             events.append(("prepare", data["id"], attempt_index))
+
+        original_add_clip = self.storage.add_clip
+
+        def fake_add_clip(clip_type, content, tag=""):
+            events.append(("persist", content))
+            return original_add_clip(clip_type, content, tag)
+
+        self.storage.add_clip = fake_add_clip
 
         def fake_timer(delay, callback):
             events.append(("timer", delay))
@@ -139,9 +156,10 @@ class CopyPastePromotionTests(unittest.TestCase):
             app.handle_paste({"id": 2, "type": "text", "content": "newer"})
 
         self.assertEqual(
-            [("prepare", 2, 0), ("timer", 0), ("promote", 2)],
+            [("prepare", 2, 0), ("persist", "newer"), ("timer", 0), ("promote", 2)],
             events,
         )
+        self.assertEqual([("text", "newer", "")], self.storage.add_clip_calls)
 
     def test_pinned_image_paste_defers_history_promotion_until_after_paste(self):
         app = self._make_app(
@@ -155,6 +173,26 @@ class CopyPastePromotionTests(unittest.TestCase):
             app.handle_paste({"id": 9, "type": "image", "content": "missing-test-image.png", "is_pinned": 1})
 
         self.assertEqual([("prepare", 9, 0), ("dirty", 9)], events)
+        self.assertEqual([("image", "missing-test-image.png", "")], self.storage.add_clip_calls)
+
+    def test_pinned_image_copy_persists_recency_before_hidden_refresh(self):
+        app = self._make_app(
+            clips=[{"id": 9, "type": "image", "content": "missing-test-image.png", "is_pinned": 1}]
+        )
+        events = []
+        original_add_clip = self.storage.add_clip
+
+        def fake_add_clip(clip_type, content, tag=""):
+            events.append(("persist", content))
+            return original_add_clip(clip_type, content, tag)
+
+        self.storage.add_clip = fake_add_clip
+        with patch("main.os.path.exists", return_value=False), \
+            patch.object(app, "_schedule_hidden_ui_refresh", side_effect=lambda clip_id: events.append(("dirty", clip_id))):
+            app.handle_copy_only({"id": 9, "type": "image", "content": "missing-test-image.png", "is_pinned": 1})
+
+        self.assertEqual([("persist", "missing-test-image.png"), ("dirty", 9)], events)
+        self.assertEqual([("image", "missing-test-image.png", "")], self.storage.add_clip_calls)
 
     def test_image_clipboard_write_does_not_hash_roundtrip_image_data(self):
         app = self._make_app()

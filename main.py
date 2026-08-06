@@ -600,6 +600,11 @@ class ClientApp(QWidget):
         clip_id = data.get("id") if data else None
         if clip_id is None:
             return
+        clip_id, _ = self.storage.add_clip(
+            data["type"],
+            data["content"],
+            data.get("tag", ""),
+        )
         if data.get("type") == "image" and data.get("is_pinned"):
             self._schedule_hidden_ui_refresh(clip_id)
             return

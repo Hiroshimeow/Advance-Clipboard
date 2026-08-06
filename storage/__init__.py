@@ -24,51 +24,38 @@ from .search import SearchService
 
 
 
-def _lexical_rank(row: Dict[str, Any], query: str, *, include_meta: bool = False) -> int:
-    """Fast deterministic UI-search ranking.
-
-    Ranking policy for clipboard UX:
-    1. exact content match
-    2. prefix content match
-    3. phrase/content containment
-    4. all-token content match
-    5. optional tag/group metadata match
-    Recency is handled as a stable tie-breaker by updated_at.
-    """
-    normalized_query = " ".join((query or "").lower().split())
+def _lexical_tier(row: Dict[str, Any], query: str, *, include_meta: bool = False) -> int:
+    """Return the deterministic relevance tier for one search row."""
+    raw_query = query or ""
+    normalized_query = " ".join(raw_query.lower().split())
     if not normalized_query:
-        return 0
+        return 9
 
-    content = " ".join(str(row.get("content", "")).lower().split())
+    raw_content = str(row.get("content", ""))
+    tag_query_cmp = raw_query.strip().lower()
+    tag_cmp = str(row.get("tag", "")).strip().lower()
+    content = " ".join(raw_content.lower().split())
     tag = " ".join(str(row.get("tag", "")).lower().split())
     group = " ".join(str(row.get("group_name", "")).lower().split())
-    terms = [t for t in normalized_query.split() if t]
+    terms = normalized_query.split()
 
-    score = 0
-    if content == normalized_query:
-        score += 10000
+    if include_meta and tag_cmp == tag_query_cmp:
+        return 1
+    if raw_content == raw_query:
+        return 2
+    if include_meta and tag_cmp.startswith(tag_query_cmp):
+        return 3
+    if include_meta and terms and all(term in tag for term in terms):
+        return 4
     if content.startswith(normalized_query):
-        score += 7000
+        return 5
     if normalized_query in content:
-        score += 4500
+        return 6
     if terms and all(term in content for term in terms):
-        score += 2500
-    if terms:
-        score += sum(250 for term in terms if term in content)
-
-    if include_meta:
-        meta = f"{tag} {group}".strip()
-        if meta:
-            if normalized_query in meta:
-                score += 1800
-            if terms and all(term in meta for term in terms):
-                score += 900
-            score += sum(120 for term in terms if term in meta)
-
-    # Prefer text clips for text queries; image filenames should not outrank text.
-    if row.get("type") == "text":
-        score += 100
-    return score
+        return 7
+    if include_meta and terms and all(term in group for term in terms):
+        return 8
+    return 9
 
 
 def _rank_lexical_rows(
@@ -79,15 +66,17 @@ def _rank_lexical_rows(
     include_meta: bool = False,
     pinned_tiebreaker: bool = False,
 ) -> List[Dict[str, Any]]:
-    def sort_key(row: Dict[str, Any]):
-        return (
-            _lexical_rank(row, query, include_meta=include_meta),
+    ranked = sorted(
+        rows,
+        key=lambda row: (
             str(row.get("updated_at") or ""),
             int(row.get("pin_order") or 0) if pinned_tiebreaker else 0,
             int(row.get("id") or 0),
-        )
-
-    return sorted(rows, key=sort_key, reverse=True)[:limit]
+        ),
+        reverse=True,
+    )
+    ranked.sort(key=lambda row: _lexical_tier(row, query, include_meta=include_meta))
+    return ranked[:limit]
 
 
 def _parse_tag_search_query(query: str) -> Optional[str]:
@@ -267,14 +256,19 @@ class ClipboardStorage:
             return []
 
         lexical_rows = self._search_pinned_sql(query, max(limit * 8, 80))
-        ranked_lexical_rows = _rank_lexical_rows(
-            lexical_rows,
+        priority_rows = self._search_pinned_priority_tags_sql(query, limit)
+        exact_row = self.get_clip_by_hash(compute_hash(query))
+        if exact_row and exact_row.get("content") == query and exact_row.get("is_pinned"):
+            priority_rows.append(exact_row)
+        merged = {row["id"]: row for row in lexical_rows}
+        merged.update({row["id"]: row for row in priority_rows})
+        return _rank_lexical_rows(
+            list(merged.values()),
             query,
-            limit=max(limit * 3, 20),
+            limit=limit,
             include_meta=True,
             pinned_tiebreaker=True,
         )
-        return ranked_lexical_rows[:limit]
 
     def _search_pinned_sql(self, query: str, limit: int) -> List[Dict[str, Any]]:
         terms = self.search.split_search_terms(query)
@@ -288,8 +282,32 @@ class ClipboardStorage:
             where_clauses.append("(content LIKE ? ESCAPE '\\' OR tag LIKE ? ESCAPE '\\' OR group_name LIKE ? ESCAPE '\\')")
             params.extend([pattern, pattern, pattern])
         rows = conn.execute(
-            f"SELECT * FROM clips WHERE is_pinned = 1 AND ({' AND '.join(where_clauses)}) ORDER BY pin_order DESC LIMIT ?",
+            f"SELECT * FROM clips WHERE is_pinned = 1 AND ({' AND '.join(where_clauses)}) ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ?",
             params + [limit],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _search_pinned_priority_tags_sql(self, query: str, limit: int) -> List[Dict[str, Any]]:
+        terms = self.search.split_search_terms(query)
+        if not terms:
+            return []
+        tag_query_cmp = (query or "").strip().lower()
+        prefix_pattern = self.search.like_pattern(tag_query_cmp)[1:]
+        where_clauses = []
+        params = []
+        for term in terms:
+            where_clauses.append("tag LIKE ? ESCAPE '\\'")
+            params.append(self.search.like_pattern(term))
+        conn = get_connection()
+        rows = conn.execute(
+            f"""SELECT * FROM clips INDEXED BY idx_pinned
+                WHERE is_pinned = 1 AND tag <> '' AND ({' AND '.join(where_clauses)})
+                ORDER BY CASE
+                    WHEN LOWER(TRIM(tag)) = ? THEN 0
+                    WHEN LOWER(TRIM(tag)) LIKE ? ESCAPE '\\' THEN 1
+                    ELSE 2
+                END, updated_at DESC, pin_order DESC, id DESC LIMIT ?""",
+            params + [tag_query_cmp, prefix_pattern, limit],
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -322,14 +340,24 @@ class ClipboardStorage:
             return []
 
         lexical_rows = self._search_history_sql(query, max(limit * 8, 80))
-        ranked_lexical_rows = _rank_lexical_rows(
-            lexical_rows,
+        priority_rows = self._search_history_priority_tags_sql(query, limit)
+        exact_row = self.get_clip_by_hash(compute_hash(query))
+        if exact_row and exact_row.get("content") == query:
+            is_history = not exact_row.get("is_pinned") or (
+                exact_row.get("pinned_at") is not None
+                and str(exact_row.get("updated_at") or "") > str(exact_row.get("pinned_at") or "")
+            )
+            if is_history:
+                priority_rows.append(exact_row)
+        merged = {row["id"]: row for row in lexical_rows}
+        merged.update({row["id"]: row for row in priority_rows})
+        return _rank_lexical_rows(
+            list(merged.values()),
             query,
-            limit=max(limit * 3, 20),
+            limit=limit,
             include_meta=True,
             pinned_tiebreaker=False,
         )
-        return ranked_lexical_rows[:limit]
 
     def _search_history_sql(self, query: str, limit: int) -> List[Dict[str, Any]]:
         terms = self.search.split_search_terms(query)
@@ -348,6 +376,31 @@ class ClipboardStorage:
                   AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
                 ORDER BY updated_at DESC LIMIT ?""",
             params + [limit],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _search_history_priority_tags_sql(self, query: str, limit: int) -> List[Dict[str, Any]]:
+        terms = self.search.split_search_terms(query)
+        if not terms:
+            return []
+        tag_query_cmp = (query or "").strip().lower()
+        prefix_pattern = self.search.like_pattern(tag_query_cmp)[1:]
+        where_clauses = []
+        params = []
+        for term in terms:
+            where_clauses.append("tag LIKE ? ESCAPE '\\'")
+            params.append(self.search.like_pattern(term))
+        conn = get_connection()
+        rows = conn.execute(
+            f"""SELECT * FROM clips
+                WHERE tag <> '' AND ({' AND '.join(where_clauses)})
+                  AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
+                ORDER BY CASE
+                    WHEN LOWER(TRIM(tag)) = ? THEN 0
+                    WHEN LOWER(TRIM(tag)) LIKE ? ESCAPE '\\' THEN 1
+                    ELSE 2
+                END, updated_at DESC, id DESC LIMIT ?""",
+            params + [tag_query_cmp, prefix_pattern, limit],
         ).fetchall()
         return [dict(r) for r in rows]
 
