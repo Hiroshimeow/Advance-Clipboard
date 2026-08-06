@@ -246,6 +246,8 @@ class ClientApp(QWidget):
     def _cleanup_on_exit(self):
         """Cleanup when app exits."""
         logger.info("cleanup_on_exit storage_need_backup=%s", self.storage.need_backup)
+        if getattr(self, "browser", None):
+            self.browser.shutdown_search()
         # Stop Win32 monitor thread
         if getattr(self, "win32_monitor", None):
             monitor = self.win32_monitor
@@ -1120,15 +1122,6 @@ def main():
     palette.setColor(QPalette.ColorRole.Window, QColor(30, 30, 30))
     palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
     app.setPalette(palette)
-
-    # Allow Ctrl+C in terminal to kill the app
-    import signal
-
-    signal.signal(signal.SIGINT, lambda *args: app.quit())
-    # Timer to let Python process signals (Qt blocks the Python signal handler otherwise)
-    _signal_timer = QTimer()
-    _signal_timer.start(200)
-    _signal_timer.timeout.connect(lambda: None)
 
     window = ClientApp()
     exit_code = app.exec()

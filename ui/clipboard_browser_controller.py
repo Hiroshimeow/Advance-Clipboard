@@ -32,8 +32,9 @@ class ClipboardBrowserController:
         self._search_generation = 0
         self._queued_search_after_refresh = False
         self._search_result_queue = queue.Queue()
-        self._search_worker_generation = 0
-        self._pending_search_generations = set()
+        self._search_worker_running = False
+        self._pending_search = None
+        self._search_shutdown = False
         self._refresh_result_queue = queue.Queue()
         self._refresh_worker_generation = 0
         self._pending_refresh_generations = set()
@@ -434,9 +435,13 @@ class ClipboardBrowserController:
 
     def on_search_text_changed(self, text):
         """Debounced search optimized for interactive typing."""
+        if self._search_shutdown:
+            return
         previous_query = self.current_search_query
         self.current_search_query = text.strip()
         if previous_query and not self.current_search_query:
+            self._search_generation += 1
+            self._pending_search = None
             # Clearing search is a navigation reset, not a filtered-refresh.
             # Drop stale selection state so Enter returns to newest history.
             self.active_side = "history"
@@ -449,6 +454,8 @@ class ClipboardBrowserController:
 
     def _do_search(self):
         """Execute the actual search query."""
+        if self._search_shutdown:
+            return
         query = self.current_search_query
         if query == self._last_search_query and not self._queued_search_after_refresh:
             return
@@ -461,6 +468,8 @@ class ClipboardBrowserController:
         if query:
             self._start_search_worker(query, self._search_generation)
             return
+
+        self._pending_search = None
         # Search result ordering is the selection contract: focus the first ranked
         # result. Clearing search resets to the newest history item.
         self.refresh_lists(maintain_selection=False)
@@ -468,8 +477,13 @@ class ClipboardBrowserController:
 
 
     def _start_search_worker(self, query, generation):
-        self._search_worker_generation = generation
-        self._pending_search_generations.add(generation)
+        if self._search_shutdown:
+            return
+        if self._search_worker_running:
+            self._pending_search = (query, generation)
+            return
+
+        self._search_worker_running = True
         if not self._search_result_timer.isActive():
             self._search_result_timer.start(15)
         worker = threading.Thread(
@@ -501,28 +515,47 @@ class ClipboardBrowserController:
         latest = None
         while True:
             try:
-                item = self._search_result_queue.get_nowait()
-                self._pending_search_generations.discard(item[0])
-                latest = item
+                latest = self._search_result_queue.get_nowait()
             except queue.Empty:
                 break
 
         if latest is None:
-            if not self._pending_search_generations:
+            if not self._search_worker_running and self._pending_search is None:
                 self._search_result_timer.stop()
             return
 
+        self._search_worker_running = False
+        pending = self._pending_search
+        self._pending_search = None
         generation, query, history_clips, pinned_clips, error = latest
-        if generation != self._search_generation or query != self.current_search_query:
-            if not self._pending_search_generations:
-                self._search_result_timer.stop()
-            return
-        if error is not None:
-            self._last_search_query = query
-            self._search_result_timer.stop()
-            return
+        is_current = (
+            not self._search_shutdown
+            and pending is None
+            and generation == self._search_generation
+            and query == self.current_search_query
+        )
+        if is_current:
+            if error is not None:
+                self._last_search_query = query
+            elif self._is_refreshing:
+                self._queued_search_after_refresh = True
+            else:
+                self._apply_search_results(query, history_clips, pinned_clips)
 
-        self._apply_search_results(query, history_clips, pinned_clips)
+        if not self._search_shutdown and pending is not None:
+            self._start_search_worker(*pending)
+        elif not self._search_worker_running and self._pending_search is None:
+            self._search_result_timer.stop()
+
+    def shutdown_search(self):
+        """Invalidate search work without blocking on a daemon SQLite worker."""
+        if self._search_shutdown:
+            return
+        self._search_shutdown = True
+        self._search_generation += 1
+        self._pending_search = None
+        self._queued_search_after_refresh = False
+        self.search_debounce_timer.stop()
         self._search_result_timer.stop()
 
     def _apply_search_results(self, query, history_clips, pinned_clips):
@@ -559,6 +592,9 @@ class ClipboardBrowserController:
         """Refresh both history and pinned lists."""
         if self._is_refreshing:
             return
+        if self.current_search_query:
+            self._search_generation += 1
+            self._pending_search = None
         self._is_refreshing = True
 
         # Capture selection before refresh

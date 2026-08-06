@@ -48,8 +48,6 @@ Thumbs.db
 
 # Neural runtime artifacts
 .rag_last_rebuild
-neural/graph/test_data.json
-neural/graph/test_preview.html
 
 # Design docs (internal only)
 docs/superpowers/
