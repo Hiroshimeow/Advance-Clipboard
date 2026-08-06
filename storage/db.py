@@ -120,6 +120,3 @@ def init_db():
 
         if user_version < CURRENT_SCHEMA_VERSION:
             conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
-
-
-
