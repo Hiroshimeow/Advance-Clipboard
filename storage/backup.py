@@ -9,11 +9,13 @@ Backup Manager for Clipboard Manager
 
 import json
 import hashlib
+import logging
 import os
 import glob
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -24,11 +26,42 @@ BACKUP_PREFIX = "clipboard_backup_"
 BACKUP_SUFFIX = ".json"
 MAX_BACKUPS = 10
 DEBOUNCE_SECONDS = 30
+TEMP_BACKUP_MAX_AGE_SECONDS = 24 * 60 * 60
+MIN_BACKUP_INTERVAL_SECONDS = 5 * 60
+
+logger = logging.getLogger(__name__)
 
 
 def ensure_backup_dir():
     """Ensure backup directory exists."""
     os.makedirs(BACKUP_DIR, exist_ok=True)
+
+
+def cleanup_stale_temp_backups(*, now=None):
+    """Remove only abandoned backup temp files older than 24 hours."""
+    ensure_backup_dir()
+    current = time.time() if now is None else now
+    pattern = os.path.join(BACKUP_DIR, f"{BACKUP_PREFIX}*{BACKUP_SUFFIX}.tmp")
+    removed = []
+    removed_bytes = 0
+    for path in glob.glob(pattern):
+        try:
+            if os.path.islink(path):
+                continue
+            if current - os.path.getmtime(path) <= TEMP_BACKUP_MAX_AGE_SECONDS:
+                continue
+            size = os.path.getsize(path)
+            os.remove(path)
+            removed.append(path)
+            removed_bytes += size
+        except OSError:
+            continue
+    logger.info(
+        "backup_temp_cleanup removed_count=%s removed_bytes=%s",
+        len(removed),
+        removed_bytes,
+    )
+    return removed
 
 
 def compute_checksum(data: str) -> str:
@@ -200,42 +233,104 @@ def _normalize_clip_item(item: Any) -> Dict[str, Any]:
 
 
 class BackupScheduler:
-    """Handles debounced backup scheduling."""
+    """Debounce backups, enforce cooldown, and serialize all runs."""
 
-    def __init__(self, backup_func):
+    def __init__(self, backup_func, *, clock=time.monotonic, timer_factory=threading.Timer):
         self._backup_func = backup_func
-        self._timer: Optional[threading.Timer] = None
-        self._lock = threading.Lock()
-        self._debounce_seconds = 30
+        self._clock = clock
+        self._timer_factory = timer_factory
+        self._timer = None
+        self._condition = threading.Condition()
+        self._running = False
+        self._dirty_during_run = False
+        self._last_completed_at = None
+        self._cancelled = False
+
+    def _next_delay_locked(self):
+        if self._last_completed_at is None:
+            return float(DEBOUNCE_SECONDS)
+        cooldown_remaining = max(
+            0.0,
+            MIN_BACKUP_INTERVAL_SECONDS
+            - (self._clock() - self._last_completed_at),
+        )
+        return max(float(DEBOUNCE_SECONDS), cooldown_remaining)
+
+    def _arm_timer_locked(self):
+        delay = self._next_delay_locked()
+        timer = self._timer_factory(delay, self._execute_backup)
+        timer.daemon = True
+        self._timer = timer
+        timer.start()
 
     def schedule(self):
-        with self._lock:
+        with self._condition:
+            if self._cancelled:
+                return
+            if self._running:
+                self._dirty_during_run = True
+                return
             if self._timer is not None:
                 self._timer.cancel()
-            self._timer = threading.Timer(self._debounce_seconds, self._execute_backup)
-            self._timer.daemon = True
-            self._timer.start()
+            self._arm_timer_locked()
 
     def _execute_backup(self):
-        with self._lock:
+        with self._condition:
+            if self._cancelled:
+                self._timer = None
+                return
             self._timer = None
+            if self._running:
+                self._dirty_during_run = True
+                return
+            self._running = True
         try:
             self._backup_func()
         except Exception:
             pass
+        finally:
+            with self._condition:
+                self._last_completed_at = self._clock()
+                self._running = False
+                if self._dirty_during_run and not self._cancelled:
+                    self._dirty_during_run = False
+                    self._arm_timer_locked()
+                self._condition.notify_all()
 
     def force_now(self):
-        with self._lock:
+        with self._condition:
+            if self._cancelled:
+                return
             if self._timer is not None:
                 self._timer.cancel()
                 self._timer = None
+            while self._running and not self._cancelled:
+                self._condition.wait()
+            if self._cancelled:
+                return
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            self._dirty_during_run = False
+            self._running = True
         try:
             self._backup_func()
         except Exception:
             pass
+        finally:
+            with self._condition:
+                self._last_completed_at = self._clock()
+                self._running = False
+                if self._dirty_during_run and not self._cancelled:
+                    self._dirty_during_run = False
+                    self._arm_timer_locked()
+                self._condition.notify_all()
 
     def cancel(self):
-        with self._lock:
+        with self._condition:
+            self._cancelled = True
+            self._dirty_during_run = False
             if self._timer is not None:
                 self._timer.cancel()
                 self._timer = None
+            self._condition.notify_all()

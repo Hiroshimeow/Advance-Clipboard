@@ -56,6 +56,7 @@ from core.clipboard_ingest import CaptureJob, ClipboardIngestBridge, ClipboardIn
 from storage import get_storage
 from storage.backup import (
     create_backup_in_subprocess,
+    cleanup_stale_temp_backups,
     find_valid_backup,
     import_legacy_json,
     BackupScheduler,
@@ -186,6 +187,7 @@ class ClientApp(QWidget):
 
         # Load data with disaster recovery
         if init_data:
+            cleanup_stale_temp_backups()
             self._init_data()
             self.is_ui_dirty = False
 
