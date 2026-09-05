@@ -53,6 +53,7 @@ from core.clipboard_monitor import (
     VK_MENU,
     simulate_paste,
 )
+from core.single_instance import SingleInstanceCoordinator
 
 # Import storage and backup modules
 from storage import get_storage
@@ -452,6 +453,13 @@ class ClientApp(QWidget):
             self.hide()
         else:
             self.show_at_cursor()
+
+    def activate_from_secondary(self):
+        if not self.isVisible():
+            self.show_at_cursor()
+            return
+        self.raise_()
+        self.activateWindow()
 
     def show_at_cursor(self):
         self.input_locked = True
@@ -1128,8 +1136,17 @@ def main():
     palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
     app.setPalette(palette)
 
+    coordinator = SingleInstanceCoordinator()
+    if not coordinator.acquire_or_notify():
+        coordinator.close()
+        logger.info("secondary_instance_notified_primary")
+        _fault_log_handle.flush()
+        return 0
+
     window = ClientApp()
+    coordinator.activate_requested.connect(window.activate_from_secondary)
     exit_code = app.exec()
+    coordinator.close()
     logger.info("main_exit exit_code=%s", exit_code)
     _fault_log_handle.flush()
     sys.exit(exit_code)
