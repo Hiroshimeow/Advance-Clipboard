@@ -261,14 +261,17 @@ class ClipboardStorage:
 
     # ==================== SEARCH OPERATIONS (delegated) ====================
 
+    def is_filter_query(self, query: str) -> bool:
+        return _parse_tag_search_query(query) is not None or _is_image_filter_query(query)
+
     def search_pinned(
-        self, query: str, limit: int = 20, *, ranked: bool = True
+        self, query: str, limit: int = 20, *, offset: int = 0, ranked: bool = True
     ) -> List[Dict[str, Any]]:
         tag_query = _parse_tag_search_query(query)
         if tag_query is not None:
-            return self._search_pinned_tags_sql(tag_query, limit)
+            return self._search_pinned_tags_sql(tag_query, limit, offset)
         if _is_image_filter_query(query):
-            return self._search_pinned_images_sql(limit)
+            return self._search_pinned_images_sql(limit, offset)
 
         terms = self.search.split_search_terms(query)
         if not terms:
@@ -289,10 +292,10 @@ class ClipboardStorage:
             pinned_tiebreaker=True,
         )
 
-    def _search_pinned_images_sql(self, limit: int) -> List[Dict[str, Any]]:
+    def _search_pinned_images_sql(self, limit: int, offset: int = 0) -> List[Dict[str, Any]]:
         rows = get_connection().execute(
-            "SELECT * FROM clips WHERE is_pinned = 1 AND type = 'image' ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ?",
-            (limit,),
+            "SELECT * FROM clips WHERE is_pinned = 1 AND type = 'image' ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ? OFFSET ?",
+            (limit, offset),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -361,7 +364,7 @@ class ClipboardStorage:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def _search_pinned_tags_sql(self, query: str, limit: int) -> List[Dict[str, Any]]:
+    def _search_pinned_tags_sql(self, query: str, limit: int, offset: int = 0) -> List[Dict[str, Any]]:
         terms = self.search.split_search_terms(query)
         if not terms:
             return []
@@ -372,8 +375,8 @@ class ClipboardStorage:
                 """SELECT * FROM clips
                    WHERE is_pinned = 1 AND tag <> ''
                      AND id IN (SELECT rowid FROM clips_fts WHERE clips_fts MATCH ?)
-                   ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ?""",
-                (fts_query, limit),
+                   ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ? OFFSET ?""",
+                (fts_query, limit, offset),
             ).fetchall()
             return [dict(r) for r in rows]
         where_clauses = []
@@ -383,19 +386,19 @@ class ClipboardStorage:
             where_clauses.append("tag LIKE ? ESCAPE '\\'")
             params.append(pattern)
         rows = conn.execute(
-            f"SELECT * FROM clips WHERE is_pinned = 1 AND tag <> '' AND ({' AND '.join(where_clauses)}) ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ?",
-            params + [limit],
+            f"SELECT * FROM clips WHERE is_pinned = 1 AND tag <> '' AND ({' AND '.join(where_clauses)}) ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ? OFFSET ?",
+            params + [limit, offset],
         ).fetchall()
         return [dict(r) for r in rows]
 
     def search_history(
-        self, query: str, limit: int = 20, *, ranked: bool = True
+        self, query: str, limit: int = 20, *, offset: int = 0, ranked: bool = True
     ) -> List[Dict[str, Any]]:
         tag_query = _parse_tag_search_query(query)
         if tag_query is not None:
-            return self._search_history_tags_sql(tag_query, limit)
+            return self._search_history_tags_sql(tag_query, limit, offset)
         if _is_image_filter_query(query):
-            return self._search_history_images_sql(limit)
+            return self._search_history_images_sql(limit, offset)
 
         terms = self.search.split_search_terms(query)
         if not terms:
@@ -421,13 +424,13 @@ class ClipboardStorage:
             pinned_tiebreaker=False,
         )
 
-    def _search_history_images_sql(self, limit: int) -> List[Dict[str, Any]]:
+    def _search_history_images_sql(self, limit: int, offset: int = 0) -> List[Dict[str, Any]]:
         rows = get_connection().execute(
             """SELECT * FROM clips INDEXED BY idx_updated
                WHERE type = 'image'
                  AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
-               ORDER BY updated_at DESC, id DESC LIMIT ?""",
-            (limit,),
+               ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?""",
+            (limit, offset),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -501,7 +504,7 @@ class ClipboardStorage:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def _search_history_tags_sql(self, query: str, limit: int) -> List[Dict[str, Any]]:
+    def _search_history_tags_sql(self, query: str, limit: int, offset: int = 0) -> List[Dict[str, Any]]:
         terms = self.search.split_search_terms(query)
         if not terms:
             return []
@@ -513,8 +516,8 @@ class ClipboardStorage:
                    WHERE tag <> ''
                      AND id IN (SELECT rowid FROM clips_fts WHERE clips_fts MATCH ?)
                      AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
-                   ORDER BY updated_at DESC, id DESC LIMIT ?""",
-                (fts_query, limit),
+                   ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?""",
+                (fts_query, limit, offset),
             ).fetchall()
             return [dict(r) for r in rows]
         where_clauses = []
@@ -528,8 +531,8 @@ class ClipboardStorage:
                 WHERE tag <> ''
                   AND ({' AND '.join(where_clauses)})
                   AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
-                ORDER BY updated_at DESC, id DESC LIMIT ?""",
-            params + [limit],
+                ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?""",
+            params + [limit, offset],
         ).fetchall()
         return [dict(r) for r in rows]
 

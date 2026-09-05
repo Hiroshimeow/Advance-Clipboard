@@ -250,6 +250,61 @@ class StorageSearchRankingTests(unittest.TestCase):
                 self.assertEqual([row["id"] for row in self.storage.search_history(query)], [history_image])
                 self.assertEqual([row["id"] for row in self.storage.search_pinned(query)], [pinned_image])
 
+    def test_filter_search_supports_offset_paging_for_tag_and_image(self):
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        history_tagged = []
+        history_images = []
+        pinned_tagged = []
+        pinned_images = []
+        for idx in range(15):
+            history_tagged.append(
+                self._insert_clip(
+                    f"history tagged {idx}",
+                    base + timedelta(minutes=idx),
+                    tag="work",
+                )
+            )
+            history_images.append(
+                self._insert_clip(
+                    f"history-{idx}.png",
+                    base + timedelta(hours=1, minutes=idx),
+                    clip_type="image",
+                )
+            )
+            pinned_tagged.append(
+                self._insert_clip(
+                    f"pinned tagged {idx}",
+                    base + timedelta(hours=2, minutes=idx),
+                    pinned=True,
+                    tag="work",
+                )
+            )
+            pinned_images.append(
+                self._insert_clip(
+                    f"pinned-{idx}.png",
+                    base + timedelta(hours=3, minutes=idx),
+                    pinned=True,
+                    clip_type="image",
+                )
+            )
+
+        self.assertEqual(
+            [row["id"] for row in self.storage.search_history("tag:work", limit=3, offset=12)],
+            list(reversed(history_tagged))[12:15],
+        )
+        self.assertEqual(
+            [row["id"] for row in self.storage.search_history("type img", limit=3, offset=12)],
+            list(reversed(history_images))[12:15],
+        )
+        self.assertEqual(
+            [row["id"] for row in self.storage.search_pinned("tag:work", limit=3, offset=12)],
+            list(reversed(pinned_tagged))[12:15],
+        )
+        self.assertEqual(
+            [row["id"] for row in self.storage.search_pinned("type img", limit=3, offset=12)],
+            list(reversed(pinned_images))[12:15],
+        )
+
     def test_image_filter_preserves_history_visibility_for_reused_pinned_clip(self):
         base = datetime(2026, 1, 1, 12, 0, 0)
         clip_id = self._insert_clip("reused.png", base, pinned=True, clip_type="image")

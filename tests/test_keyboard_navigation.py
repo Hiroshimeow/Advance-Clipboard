@@ -221,6 +221,23 @@ class _FakeStorage:
         return True
 
 
+class _PagedFilterStorage(_FakeStorage):
+    def is_filter_query(self, query: str) -> bool:
+        return query in {"type img", "tag:work"}
+
+    def search_history(self, query: str, limit=None, offset=0, ranked=True):
+        rows = list(self._history)
+        if limit is None:
+            return rows[offset:]
+        return rows[offset : offset + limit]
+
+    def search_pinned(self, query: str, limit=None, offset=0, ranked=True):
+        rows = list(self._pinned)
+        if limit is None:
+            return rows[offset:]
+        return rows[offset : offset + limit]
+
+
 class _SlowFakeStorage(_FakeStorage):
     def get_history(self, limit=20, offset=0):
         time.sleep(0.25)
@@ -873,6 +890,60 @@ class KeyboardNavigationTests(unittest.TestCase):
         app.backup_scheduler.cancel()
         app.close()
         QApplication.processEvents()
+
+    def test_filter_search_scroll_loads_past_first_twelve_for_type_and_tag(self):
+        _get_qapp()
+        history = [
+            {"id": idx + 1, "type": "image", "content": f"history-{idx}.png"}
+            for idx in range(27)
+        ]
+        pinned = [
+            {"id": 100 + idx, "type": "image", "content": f"pinned-{idx}.png", "group_name": ""}
+            for idx in range(27)
+        ]
+
+        for query in ("type img", "tag:work"):
+            with self.subTest(query=query):
+                app = _TestClientApp()
+                app.storage = _PagedFilterStorage(history=history, pinned=pinned)
+                try:
+                    _submit_search(app, query)
+                    self.assertTrue(
+                        _wait_until(
+                            lambda: app.list_history.count() == 12
+                            and app.list_pinned.count() == 12
+                        )
+                    )
+                    self.assertTrue(app.browser.history_has_more)
+                    self.assertTrue(app.browser.pinned_has_more)
+
+                    app.browser.on_history_scroll(
+                        app.list_history.verticalScrollBar().maximum()
+                    )
+                    app.browser.on_pinned_scroll(
+                        app.list_pinned.verticalScrollBar().maximum()
+                    )
+
+                    self.assertEqual(app.list_history.count(), 24)
+                    self.assertEqual(app.list_pinned.count(), 24)
+                    self.assertTrue(app.browser.history_has_more)
+                    self.assertTrue(app.browser.pinned_has_more)
+
+                    app.browser.on_history_scroll(
+                        app.list_history.verticalScrollBar().maximum()
+                    )
+                    app.browser.on_pinned_scroll(
+                        app.list_pinned.verticalScrollBar().maximum()
+                    )
+
+                    self.assertEqual(app.list_history.count(), 27)
+                    self.assertEqual(app.list_pinned.count(), 27)
+                    self.assertFalse(app.browser.history_has_more)
+                    self.assertFalse(app.browser.pinned_has_more)
+                finally:
+                    app.backup_scheduler.cancel()
+                    app.close()
+                    QApplication.processEvents()
 
     def test_rapid_search_replacement_runs_one_worker_and_only_latest_pending(self):
         _get_qapp()
