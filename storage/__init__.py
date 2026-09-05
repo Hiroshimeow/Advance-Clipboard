@@ -89,6 +89,14 @@ def _parse_tag_search_query(query: str) -> Optional[str]:
     return keyword
 
 
+def _fts_match_expression(terms: List[str], *, column: Optional[str] = None) -> Optional[str]:
+    """Build a literal trigram FTS candidate query, or None when LIKE fallback is required."""
+    if not terms or any(len(term) < 3 for term in terms):
+        return None
+    prefix = f"{column} : " if column else ""
+    return " AND ".join(f'{prefix}"{term.replace(chr(34), chr(34) * 2)}"' for term in terms)
+
+
 class ClipboardStorage:
     """Facade for clipboard storage subsystem."""
 
@@ -275,6 +283,16 @@ class ClipboardStorage:
         if not terms:
             return []
         conn = get_connection()
+        fts_query = _fts_match_expression(terms)
+        if fts_query is not None:
+            rows = conn.execute(
+                """SELECT * FROM clips INDEXED BY idx_pinned_search
+                   WHERE is_pinned = 1
+                     AND id IN (SELECT rowid FROM clips_fts WHERE clips_fts MATCH ?)
+                   ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ?""",
+                (fts_query, limit),
+            ).fetchall()
+            return [dict(r) for r in rows]
         where_clauses = []
         params = []
         for term in terms:
@@ -293,12 +311,26 @@ class ClipboardStorage:
             return []
         tag_query_cmp = (query or "").strip().lower()
         prefix_pattern = self.search.like_pattern(tag_query_cmp)[1:]
+        conn = get_connection()
+        fts_query = _fts_match_expression(terms, column="tag")
+        if fts_query is not None:
+            rows = conn.execute(
+                """SELECT * FROM clips INDEXED BY idx_pinned
+                   WHERE is_pinned = 1 AND tag <> ''
+                     AND id IN (SELECT rowid FROM clips_fts WHERE clips_fts MATCH ?)
+                   ORDER BY CASE
+                       WHEN LOWER(TRIM(tag)) = ? THEN 0
+                       WHEN LOWER(TRIM(tag)) LIKE ? ESCAPE '\\' THEN 1
+                       ELSE 2
+                   END, updated_at DESC, pin_order DESC, id DESC LIMIT ?""",
+                (fts_query, tag_query_cmp, prefix_pattern, limit),
+            ).fetchall()
+            return [dict(r) for r in rows]
         where_clauses = []
         params = []
         for term in terms:
             where_clauses.append("tag LIKE ? ESCAPE '\\'")
             params.append(self.search.like_pattern(term))
-        conn = get_connection()
         rows = conn.execute(
             f"""SELECT * FROM clips INDEXED BY idx_pinned
                 WHERE is_pinned = 1 AND tag <> '' AND ({' AND '.join(where_clauses)})
@@ -316,6 +348,16 @@ class ClipboardStorage:
         if not terms:
             return []
         conn = get_connection()
+        fts_query = _fts_match_expression(terms, column="tag")
+        if fts_query is not None:
+            rows = conn.execute(
+                """SELECT * FROM clips
+                   WHERE is_pinned = 1 AND tag <> ''
+                     AND id IN (SELECT rowid FROM clips_fts WHERE clips_fts MATCH ?)
+                   ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ?""",
+                (fts_query, limit),
+            ).fetchall()
+            return [dict(r) for r in rows]
         where_clauses = []
         params = []
         for term in terms:
@@ -364,6 +406,16 @@ class ClipboardStorage:
         if not terms:
             return []
         conn = get_connection()
+        fts_query = _fts_match_expression(terms)
+        if fts_query is not None:
+            rows = conn.execute(
+                """SELECT * FROM clips INDEXED BY idx_updated
+                   WHERE id IN (SELECT rowid FROM clips_fts WHERE clips_fts MATCH ?)
+                     AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
+                   ORDER BY updated_at DESC LIMIT ?""",
+                (fts_query, limit),
+            ).fetchall()
+            return [dict(r) for r in rows]
         where_clauses = []
         params = []
         for term in terms:
@@ -385,12 +437,27 @@ class ClipboardStorage:
             return []
         tag_query_cmp = (query or "").strip().lower()
         prefix_pattern = self.search.like_pattern(tag_query_cmp)[1:]
+        conn = get_connection()
+        fts_query = _fts_match_expression(terms, column="tag")
+        if fts_query is not None:
+            rows = conn.execute(
+                """SELECT * FROM clips
+                   WHERE tag <> ''
+                     AND id IN (SELECT rowid FROM clips_fts WHERE clips_fts MATCH ?)
+                     AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
+                   ORDER BY CASE
+                       WHEN LOWER(TRIM(tag)) = ? THEN 0
+                       WHEN LOWER(TRIM(tag)) LIKE ? ESCAPE '\\' THEN 1
+                       ELSE 2
+                   END, updated_at DESC, id DESC LIMIT ?""",
+                (fts_query, tag_query_cmp, prefix_pattern, limit),
+            ).fetchall()
+            return [dict(r) for r in rows]
         where_clauses = []
         params = []
         for term in terms:
             where_clauses.append("tag LIKE ? ESCAPE '\\'")
             params.append(self.search.like_pattern(term))
-        conn = get_connection()
         rows = conn.execute(
             f"""SELECT * FROM clips
                 WHERE tag <> '' AND ({' AND '.join(where_clauses)})
@@ -409,6 +476,17 @@ class ClipboardStorage:
         if not terms:
             return []
         conn = get_connection()
+        fts_query = _fts_match_expression(terms, column="tag")
+        if fts_query is not None:
+            rows = conn.execute(
+                """SELECT * FROM clips INDEXED BY idx_updated
+                   WHERE tag <> ''
+                     AND id IN (SELECT rowid FROM clips_fts WHERE clips_fts MATCH ?)
+                     AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
+                   ORDER BY updated_at DESC, id DESC LIMIT ?""",
+                (fts_query, limit),
+            ).fetchall()
+            return [dict(r) for r in rows]
         where_clauses = []
         params = []
         for term in terms:

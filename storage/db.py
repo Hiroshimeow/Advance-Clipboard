@@ -9,7 +9,7 @@ DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clipboard.db
 # Thread-local storage for connections
 _local = threading.local()
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 def get_connection() -> sqlite3.Connection:
@@ -84,6 +84,7 @@ def init_db():
             "idx_pinned": "CREATE INDEX idx_pinned ON clips(is_pinned)",
             "idx_updated": "CREATE INDEX idx_updated ON clips(updated_at DESC)",
             "idx_group": "CREATE INDEX idx_group ON clips(group_name)",
+            "idx_pinned_search": "CREATE INDEX idx_pinned_search ON clips(is_pinned, updated_at DESC, pin_order DESC, id DESC)",
         }
         for name, sql in required_indexes.items():
             if name not in indexes:
@@ -104,6 +105,40 @@ def init_db():
                 conn.execute("DROP TABLE IF EXISTS neural_vectors")
             if legacy_neural_tables:
                 schema_changed = True
+
+        fts_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'clips_fts'"
+        ).fetchone() is not None
+        if not fts_exists:
+            conn.execute("""
+                CREATE VIRTUAL TABLE clips_fts USING fts5(
+                    content,
+                    tag,
+                    group_name,
+                    content='clips',
+                    content_rowid='id',
+                    tokenize='trigram'
+                )
+            """)
+            conn.execute("INSERT INTO clips_fts(clips_fts) VALUES ('rebuild')")
+            schema_changed = True
+
+        conn.executescript("""
+            CREATE TRIGGER IF NOT EXISTS clips_fts_ai AFTER INSERT ON clips BEGIN
+                INSERT INTO clips_fts(rowid, content, tag, group_name)
+                VALUES (new.id, new.content, new.tag, new.group_name);
+            END;
+            CREATE TRIGGER IF NOT EXISTS clips_fts_ad AFTER DELETE ON clips BEGIN
+                INSERT INTO clips_fts(clips_fts, rowid, content, tag, group_name)
+                VALUES ('delete', old.id, old.content, old.tag, old.group_name);
+            END;
+            CREATE TRIGGER IF NOT EXISTS clips_fts_au AFTER UPDATE OF content, tag, group_name ON clips BEGIN
+                INSERT INTO clips_fts(clips_fts, rowid, content, tag, group_name)
+                VALUES ('delete', old.id, old.content, old.tag, old.group_name);
+                INSERT INTO clips_fts(rowid, content, tag, group_name)
+                VALUES (new.id, new.content, new.tag, new.group_name);
+            END;
+        """)
 
         stats_table_exists = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'"

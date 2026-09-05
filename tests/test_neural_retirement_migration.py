@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 REQUIRED_INDEXES = {"idx_pinned", "idx_updated", "idx_group"}
 
 

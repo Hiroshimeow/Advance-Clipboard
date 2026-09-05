@@ -9,8 +9,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 
-CURRENT_SCHEMA_VERSION = 2
-REQUIRED_INDEXES = {"idx_pinned", "idx_updated", "idx_group"}
+CURRENT_SCHEMA_VERSION = 3
+REQUIRED_INDEXES = {"idx_pinned", "idx_updated", "idx_group", "idx_pinned_search"}
 
 
 class DBPlannerMigrationTests(unittest.TestCase):

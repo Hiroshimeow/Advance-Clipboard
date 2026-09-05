@@ -228,6 +228,23 @@ class StorageSearchRankingTests(unittest.TestCase):
 
         self.assertEqual([row["id"] for row in rows], [tagged_id])
 
+    def test_trigram_substring_and_cross_column_terms_preserve_search_semantics(self):
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        substring_id = self._insert_clip("production deploy config", base)
+        cross_column_id = self._insert_clip("deploy body", base + timedelta(minutes=1), group="server ops")
+
+        self.assertIn(substring_id, [row["id"] for row in self.storage.search_history("ploy", limit=10)])
+        self.assertIn(cross_column_id, [row["id"] for row in self.storage.search_history("deploy server", limit=10)])
+
+    def test_short_term_fallback_preserves_recency(self):
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        old_id = self._insert_clip("abc", base)
+        recent_id = self._insert_clip("abd", base + timedelta(minutes=5))
+
+        rows = self.storage.search_history("a", limit=10, ranked=False)
+
+        self.assertEqual([row["id"] for row in rows[:2]], [recent_id, old_id])
+
     def test_literal_like_wildcards_do_not_match_everything(self):
         base = datetime(2026, 1, 1, 12, 0, 0)
         literal_id = self._insert_clip("literal 100% proxy_token", base)
