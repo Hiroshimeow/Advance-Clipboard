@@ -493,16 +493,20 @@ class ClipboardBrowserController:
         )
         worker.start()
 
+    def _is_paginated_filter_search(self, query):
+        checker = getattr(self.storage, "is_filter_query", None)
+        return bool(checker and checker(query))
+
     def _run_search_worker(self, query, generation):
         try:
             history_clips = self.storage.search_history(
                 query,
-                limit=SEARCH_PAGE_SIZE_HISTORY,
+                limit=SEARCH_PAGE_SIZE_HISTORY + 1,
                 ranked=True,
             )
             pinned_clips = self.storage.search_pinned(
                 query,
-                limit=SEARCH_PAGE_SIZE_PINNED,
+                limit=SEARCH_PAGE_SIZE_PINNED + 1,
                 ranked=True,
             )
             self._search_result_queue.put(
@@ -567,14 +571,16 @@ class ClipboardBrowserController:
             self.app.setUpdatesEnabled(False)
             self.app.list_history._clear_hover()
             self.app.list_pinned._clear_hover()
-            self.history_offset = 0
-            self.pinned_offset = 0
-            self.history_has_more = False
-            self.pinned_has_more = False
+            self.history_has_more = len(history_clips) > SEARCH_PAGE_SIZE_HISTORY
+            self.pinned_has_more = len(pinned_clips) > SEARCH_PAGE_SIZE_PINNED
+            history_clips = history_clips[:SEARCH_PAGE_SIZE_HISTORY]
+            pinned_clips = pinned_clips[:SEARCH_PAGE_SIZE_PINNED]
             self._close_expanded_editors(self.app.list_history)
             self._close_expanded_editors(self.app.list_pinned)
             self.app.list_history.set_rows(self.build_history_rows(history_clips))
             self.app.list_pinned.set_rows(self.build_pinned_rows(pinned_clips=pinned_clips))
+            self.history_offset = len(history_clips)
+            self.pinned_offset = len(pinned_clips)
             self._reopen_expanded_editors(self.app.list_history)
             self._reopen_expanded_editors(self.app.list_pinned)
             self._apply_default_selection()
@@ -629,10 +635,11 @@ class ClipboardBrowserController:
             if self.current_search_query:
                 history_clips = self.storage.search_history(
                     self.current_search_query,
-                    limit=SEARCH_PAGE_SIZE_HISTORY,
+                    limit=SEARCH_PAGE_SIZE_HISTORY + 1,
                     ranked=True,
                 )
-                self.history_has_more = False  # Search returns first fast page
+                self.history_has_more = len(history_clips) > SEARCH_PAGE_SIZE_HISTORY
+                history_clips = history_clips[:SEARCH_PAGE_SIZE_HISTORY]
             else:
                 history_clips = self.storage.get_history(
                     limit=PAGE_SIZE_HISTORY, offset=0
@@ -676,12 +683,14 @@ class ClipboardBrowserController:
             # In search mode, flat list of pinned items (no groups)
             pinned_clips = self.storage.search_pinned(
                 self.current_search_query,
-                limit=SEARCH_PAGE_SIZE_PINNED,
+                limit=SEARCH_PAGE_SIZE_PINNED + 1,
                 ranked=True,
             )
-            self.pinned_has_more = False  # Search returns first fast page
+            self.pinned_has_more = len(pinned_clips) > SEARCH_PAGE_SIZE_PINNED
+            pinned_clips = pinned_clips[:SEARCH_PAGE_SIZE_PINNED]
             self._close_expanded_editors(self.app.list_pinned)
             self.app.list_pinned.set_rows(self.build_pinned_rows(pinned_clips=pinned_clips))
+            self.pinned_offset = len(pinned_clips)
             self._reopen_expanded_editors(self.app.list_pinned)
         else:
             groups = []
@@ -840,11 +849,39 @@ class ClipboardBrowserController:
             self._load_more_pinned()
 
     def _load_more_history(self):
-        clips = self.storage.get_history(
-            limit=PAGE_SIZE_HISTORY, offset=self.history_offset
-        )
-        if not clips or len(clips) < PAGE_SIZE_HISTORY:
-            self.history_has_more = False
+        if self.current_search_query:
+            if self._is_paginated_filter_search(self.current_search_query):
+                clips = self.storage.search_history(
+                    self.current_search_query,
+                    limit=SEARCH_PAGE_SIZE_HISTORY + 1,
+                    offset=self.history_offset,
+                    ranked=True,
+                )
+                self.history_has_more = len(clips) > SEARCH_PAGE_SIZE_HISTORY
+                clips = clips[:SEARCH_PAGE_SIZE_HISTORY]
+            else:
+                target = self.history_offset + SEARCH_PAGE_SIZE_HISTORY
+                ranked = self.storage.search_history(
+                    self.current_search_query,
+                    limit=target + 1,
+                    ranked=True,
+                )
+                existing_ids = {
+                    self.app.list_history.item(row).data(Qt.ItemDataRole.UserRole).get("id")
+                    for row in range(self.app.list_history.count())
+                    if isinstance(
+                        self.app.list_history.item(row).data(Qt.ItemDataRole.UserRole), dict
+                    )
+                }
+                unseen = [clip for clip in ranked if clip.get("id") not in existing_ids]
+                self.history_has_more = len(ranked) > target or len(unseen) > SEARCH_PAGE_SIZE_HISTORY
+                clips = unseen[:SEARCH_PAGE_SIZE_HISTORY]
+        else:
+            clips = self.storage.get_history(
+                limit=PAGE_SIZE_HISTORY, offset=self.history_offset
+            )
+            if not clips or len(clips) < PAGE_SIZE_HISTORY:
+                self.history_has_more = False
         if clips:
             self._append_items(self.app.list_history, clips, is_pinned=False)
             self.history_offset += len(clips)
@@ -852,11 +889,32 @@ class ClipboardBrowserController:
     def _load_more_pinned(self):
         if not self.current_search_query:
             return
-        clips = self.storage.get_pinned(
-            limit=PAGE_SIZE_PINNED, offset=self.pinned_offset
-        )
-        if not clips or len(clips) < PAGE_SIZE_PINNED:
-            self.pinned_has_more = False
+        if self._is_paginated_filter_search(self.current_search_query):
+            clips = self.storage.search_pinned(
+                self.current_search_query,
+                limit=SEARCH_PAGE_SIZE_PINNED + 1,
+                offset=self.pinned_offset,
+                ranked=True,
+            )
+            self.pinned_has_more = len(clips) > SEARCH_PAGE_SIZE_PINNED
+            clips = clips[:SEARCH_PAGE_SIZE_PINNED]
+        else:
+            target = self.pinned_offset + SEARCH_PAGE_SIZE_PINNED
+            ranked = self.storage.search_pinned(
+                self.current_search_query,
+                limit=target + 1,
+                ranked=True,
+            )
+            existing_ids = {
+                self.app.list_pinned.item(row).data(Qt.ItemDataRole.UserRole).get("id")
+                for row in range(self.app.list_pinned.count())
+                if isinstance(
+                    self.app.list_pinned.item(row).data(Qt.ItemDataRole.UserRole), dict
+                )
+            }
+            unseen = [clip for clip in ranked if clip.get("id") not in existing_ids]
+            self.pinned_has_more = len(ranked) > target or len(unseen) > SEARCH_PAGE_SIZE_PINNED
+            clips = unseen[:SEARCH_PAGE_SIZE_PINNED]
         if clips:
             self._append_items(self.app.list_pinned, clips, is_pinned=True)
             self.pinned_offset += len(clips)
