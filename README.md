@@ -17,7 +17,9 @@ A lightweight Windows clipboard manager with SQLite storage, pinned clips, group
 - Collapsible groups for pinned clips.
 - Click or press Enter to paste into the active window.
 - SQLite storage with WAL mode.
-- Debounced JSON backups with checksum validation.
+- One primary process owns the global hotkey and clipboard listener; later launches activate the existing window.
+- Text captures above 2 MiB UTF-8 and images above 8K UHD (7680x4320) remain on the system clipboard but are not saved to history.
+- JSON backups debounce for 30 seconds, run no more than once per five minutes, retain ten valid files, and use checksum validation.
 - Recovery from valid backup if the database is missing or corrupt.
 
 ### Search
@@ -27,6 +29,7 @@ A lightweight Windows clipboard manager with SQLite storage, pinned clips, group
 - Tag search via `tag <keyword>` or `tags <keyword>`.
 - Search is asynchronous so typing does not block the UI.
 - Triple-click or clear buttons reset the search box.
+- Performance gate: `uv run python tests/benchmark_search.py` builds a temporary 25,000-row database and requires common one- and two-term searches to remain at or below 25 ms p95. A failure is evidence for a separate FTS5 migration design; it does not trigger an in-place search rewrite.
 
 ### Pinned Clip Editor
 
@@ -89,7 +92,7 @@ Clipboard Monitor -> SQLite Storage -> Search/Ranking -> PyQt6 UI
 ### Data Flow
 
 - Read: UI requests paged history or pinned rows from SQLite.
-- Write: clipboard changes are stored immediately and mark backups dirty.
+- Write: Qt copies clipboard-owned text/image data on the UI thread, then one bounded background ingest worker serializes image encoding, atomic file writes, and SQLite insertion.
 - Search: SQL filtering plus local lightweight ranking, with asynchronous UI updates.
 - Backup: SQLite data is exported to JSON on debounce or app exit.
 - Recovery: valid backup JSON can repopulate SQLite when needed.
