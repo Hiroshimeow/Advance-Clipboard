@@ -33,8 +33,8 @@ class StorageSearchRankingTests(unittest.TestCase):
             db._local.conn = None
         self.tmp.cleanup()
 
-    def _insert_clip(self, content, updated_at, *, pinned=False, tag="", group=""):
-        clip_id, is_new = self.storage.add_clip("text", content, tag)
+    def _insert_clip(self, content, updated_at, *, pinned=False, tag="", group="", clip_type="text"):
+        clip_id, is_new = self.storage.add_clip(clip_type, content, tag)
         if pinned:
             self.storage.pin_clip(clip_id)
         self.storage.update_group(clip_id, group)
@@ -227,6 +227,51 @@ class StorageSearchRankingTests(unittest.TestCase):
         rows = self.storage.search_history("tags work", limit=10, ranked=False)
 
         self.assertEqual([row["id"] for row in rows], [tagged_id])
+
+    def test_tag_colon_search_filters_to_tag_only(self):
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        tagged_id = self._insert_clip("unrelated body", base, tag="work-tools")
+        self._insert_clip("work-tools appears only in body", base + timedelta(minutes=5), tag="")
+
+        rows = self.storage.search_history("tag:work", limit=10, ranked=False)
+
+        self.assertEqual([row["id"] for row in rows], [tagged_id])
+
+    def test_image_filter_variants_return_images_only_for_history_and_pinned(self):
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        history_image = self._insert_clip("history.png", base, clip_type="image")
+        self._insert_clip("image text only", base + timedelta(minutes=1))
+        pinned_image = self._insert_clip("pinned.png", base + timedelta(minutes=2), pinned=True, clip_type="image")
+        self._insert_clip("img text only", base + timedelta(minutes=3), pinned=True)
+
+        variants = ["type: image", "type image", "type: img", "type img", "type:image", "type:img"]
+        for query in variants:
+            with self.subTest(query=query):
+                self.assertEqual([row["id"] for row in self.storage.search_history(query)], [history_image])
+                self.assertEqual([row["id"] for row in self.storage.search_pinned(query)], [pinned_image])
+
+    def test_image_filter_preserves_history_visibility_for_reused_pinned_clip(self):
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        clip_id = self._insert_clip("reused.png", base, pinned=True, clip_type="image")
+        import storage.db as db
+        with db.transaction() as sql:
+            sql.execute(
+                "UPDATE clips SET pinned_at = ?, updated_at = ? WHERE id = ?",
+                (base.isoformat(), (base + timedelta(minutes=1)).isoformat(), clip_id),
+            )
+
+        rows = self.storage.search_history("type:image")
+
+        self.assertEqual([row["id"] for row in rows], [clip_id])
+
+    def test_plain_image_query_keeps_free_text_semantics(self):
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        text_id = self._insert_clip("image deployment notes", base)
+        self._insert_clip("photo.png", base + timedelta(minutes=1), clip_type="image")
+
+        rows = self.storage.search_history("image", limit=10, ranked=False)
+
+        self.assertIn(text_id, [row["id"] for row in rows])
 
     def test_trigram_substring_and_cross_column_terms_preserve_search_semantics(self):
         base = datetime(2026, 1, 1, 12, 0, 0)

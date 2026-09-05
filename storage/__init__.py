@@ -80,13 +80,22 @@ def _rank_lexical_rows(
 
 
 def _parse_tag_search_query(query: str) -> Optional[str]:
-    parts = (query or "").strip().split(maxsplit=1)
+    normalized = (query or "").strip()
+    if normalized.lower().startswith("tag:"):
+        keyword = normalized[4:].strip()
+        return keyword or None
+    parts = normalized.split(maxsplit=1)
     if len(parts) != 2:
         return None
     prefix, keyword = parts[0].lower(), parts[1].strip()
     if prefix not in {"tag", "tags"} or not keyword:
         return None
     return keyword
+
+
+def _is_image_filter_query(query: str) -> bool:
+    normalized = " ".join((query or "").strip().lower().replace(":", ": ").split())
+    return normalized in {"type image", "type img", "type: image", "type: img"}
 
 
 def _fts_match_expression(terms: List[str], *, column: Optional[str] = None) -> Optional[str]:
@@ -258,6 +267,8 @@ class ClipboardStorage:
         tag_query = _parse_tag_search_query(query)
         if tag_query is not None:
             return self._search_pinned_tags_sql(tag_query, limit)
+        if _is_image_filter_query(query):
+            return self._search_pinned_images_sql(limit)
 
         terms = self.search.split_search_terms(query)
         if not terms:
@@ -277,6 +288,13 @@ class ClipboardStorage:
             include_meta=True,
             pinned_tiebreaker=True,
         )
+
+    def _search_pinned_images_sql(self, limit: int) -> List[Dict[str, Any]]:
+        rows = get_connection().execute(
+            "SELECT * FROM clips WHERE is_pinned = 1 AND type = 'image' ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def _search_pinned_sql(self, query: str, limit: int) -> List[Dict[str, Any]]:
         terms = self.search.split_search_terms(query)
@@ -376,6 +394,8 @@ class ClipboardStorage:
         tag_query = _parse_tag_search_query(query)
         if tag_query is not None:
             return self._search_history_tags_sql(tag_query, limit)
+        if _is_image_filter_query(query):
+            return self._search_history_images_sql(limit)
 
         terms = self.search.split_search_terms(query)
         if not terms:
@@ -400,6 +420,16 @@ class ClipboardStorage:
             include_meta=True,
             pinned_tiebreaker=False,
         )
+
+    def _search_history_images_sql(self, limit: int) -> List[Dict[str, Any]]:
+        rows = get_connection().execute(
+            """SELECT * FROM clips INDEXED BY idx_updated
+               WHERE type = 'image'
+                 AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
+               ORDER BY updated_at DESC, id DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def _search_history_sql(self, query: str, limit: int) -> List[Dict[str, Any]]:
         terms = self.search.split_search_terms(query)

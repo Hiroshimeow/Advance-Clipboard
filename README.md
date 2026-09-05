@@ -26,7 +26,9 @@ A lightweight Windows clipboard manager with SQLite storage, pinned clips, group
 
 - Debounced search across history and pinned clips.
 - SQL lexical matching with local dependency-free hybrid ranking.
-- Tag search via `tag <keyword>` or `tags <keyword>`.
+- Tag filters via `tag <keyword>`, `tags <keyword>`, or `tag:<keyword>`.
+- Image filters via `type image`, `type: image`, `type img`, `type: img`, `type:image`, or `type:img`.
+- Tag/type filter syntax is handled as a filter rather than as free-text ranking terms.
 - Search is asynchronous so typing does not block the UI.
 - Triple-click or clear buttons reset the search box.
 - Performance gate: `uv run python tests/benchmark_search.py` builds a temporary 25,000-row database and requires common one- and two-term searches to remain at or below 25 ms p95. A failure is evidence for a separate FTS5 migration design; it does not trigger an in-place search rewrite.
