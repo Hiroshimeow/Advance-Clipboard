@@ -208,9 +208,9 @@ class CopyPastePromotionTests(unittest.TestCase):
                 return _FakeMime()
 
         app.clipboard = _FakeClipboard()
+        self.assertFalse(hasattr(app, "_image_storage_name"))
         with patch("main.os.path.exists", return_value=True), \
-            patch("main.QPixmap") as pixmap_cls, \
-            patch.object(app, "_image_storage_name", side_effect=AssertionError("image hash verification should not run")):
+            patch("main.QPixmap") as pixmap_cls:
             pixmap_cls.return_value.isNull.return_value = False
             self.assertTrue(app._write_clipboard_payload({"id": 10, "type": "image", "content": "fake.png"}))
 
@@ -225,8 +225,8 @@ class CopyPastePromotionTests(unittest.TestCase):
                 return False
 
         app._set_pending_clipboard_guard({"id": 11, "type": "image", "content": "fake.png"})
-        with patch.object(app, "_image_storage_name", side_effect=AssertionError("image guard hash should not run")):
-            self.assertTrue(app._should_ignore_clipboard_update(_FakeMime()))
+        self.assertFalse(hasattr(app, "_image_storage_name"))
+        self.assertTrue(app._should_ignore_clipboard_update(_FakeMime()))
 
     def test_hidden_promotion_marks_ui_dirty_for_next_show(self):
         app = self._make_app()

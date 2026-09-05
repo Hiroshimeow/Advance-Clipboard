@@ -6,7 +6,6 @@
 # ///
 import os
 import sys
-import hashlib
 import ctypes
 import ctypes.wintypes
 import atexit
@@ -33,9 +32,6 @@ from PyQt6.QtCore import (
     QTimer,
 
     QEvent,
-    QByteArray,
-    QBuffer,
-    QIODevice,
 )
 from PyQt6.QtGui import (
     QCursor,
@@ -54,6 +50,7 @@ from core.clipboard_monitor import (
     simulate_paste,
 )
 from core.single_instance import SingleInstanceCoordinator
+from core.clipboard_ingest import CaptureJob, ClipboardIngestBridge, ClipboardIngestProcessor
 
 # Import storage and backup modules
 from storage import get_storage
@@ -141,6 +138,14 @@ class ClientApp(QWidget):
         super().__init__()
         # SQLite storage - single source of truth
         self.storage = get_storage()
+        self.ingest_processor = ClipboardIngestProcessor(self.storage, image_dir=IMAGE_DIR)
+        self.ingest_bridge = ClipboardIngestBridge(self.ingest_processor)
+        self.ingest_bridge.completed.connect(
+            self._on_clipboard_ingest_completed, Qt.ConnectionType.QueuedConnection
+        )
+        self.ingest_bridge.rejected.connect(
+            self._on_clipboard_ingest_rejected, Qt.ConnectionType.QueuedConnection
+        )
 
         # UI state
         self.pending_clipboard_guard = None
@@ -155,6 +160,7 @@ class ClientApp(QWidget):
         self._last_clipboard_capture_at = 0.0
         self._last_ingested_clipboard_key = None
         self._last_ingested_clipboard_at = 0.0
+        self._pending_clipboard_keys = set()
         self._clipboard_capture_timer = QTimer(self)
         self._clipboard_capture_timer.setSingleShot(True)
         self._clipboard_capture_timer.setInterval(35)
@@ -254,6 +260,8 @@ class ClientApp(QWidget):
             monitor = self.win32_monitor
             if monitor is not None:
                 monitor.stop()
+        if getattr(self, "ingest_bridge", None):
+            self.ingest_bridge.stop()
         # Force immediate backup if needed
         if self.storage.need_backup:
             self.backup_scheduler.force_now()
@@ -923,14 +931,6 @@ class ClientApp(QWidget):
         self.search_input.clear()
         self.browser.current_search_query = ""
 
-    def _image_storage_name(self, img):
-        ba = QByteArray()
-        buf = QBuffer(ba)
-        buf.open(QIODevice.OpenModeFlag.WriteOnly)
-        img.save(buf, "PNG")
-        ih = hashlib.md5(ba.data()).hexdigest()
-        return f"{ih}.png"
-
     def _set_pending_clipboard_guard(self, data):
         self.pending_clipboard_guard = {
             "type": data["type"],
@@ -1061,33 +1061,44 @@ class ClientApp(QWidget):
                     "[Win32Monitor] Warning: Received clipboard event but content is empty or unreadable after retries."
                 )
             return
-        clip_type = None
-        content = None
+        job = None
+        pending_key = None
         if mime.hasImage():
-            img = QImage(mime.imageData())
-            if not img.isNull():
-                clip_type = "image"
-                content = self.save_image_if_new(img)
+            image = QImage(mime.imageData()).copy()
+            if not image.isNull():
+                job = CaptureJob.image(image)
         elif mime.hasText():
-            t = mime.text()
-            if t and t.strip():
-                clip_type = "text"
-                content = t
-        if not clip_type or not content:
+            text = mime.text()
+            if text and text.strip():
+                job = CaptureJob.text(text)
+                pending_key = ("text", text)
+        if job is None:
             return
 
         now = time.monotonic()
-        clipboard_key = (clip_type, content)
+        if pending_key in self._pending_clipboard_keys:
+            logger.debug("clipboard_ingest_skipped reason=duplicate_pending")
+            return
         if (
-            clipboard_key == self._last_ingested_clipboard_key
+            pending_key is not None
+            and pending_key == self._last_ingested_clipboard_key
             and now - self._last_ingested_clipboard_at < 1.0
         ):
             logger.debug("clipboard_ingest_skipped reason=duplicate_burst")
             return
+        if pending_key is not None:
+            self._pending_clipboard_keys.add(pending_key)
+        if not self.ingest_bridge.submit(job):
+            if pending_key is not None:
+                self._pending_clipboard_keys.discard(pending_key)
+            logger.warning("clipboard_ingest_rejected reason=queue_full")
 
-        clip_id, is_new = self.storage.add_clip(clip_type, content)
+    def _on_clipboard_ingest_completed(self, result):
+        clipboard_key = (result.clip_type, result.content)
+        self._pending_clipboard_keys.discard(clipboard_key)
         self._last_ingested_clipboard_key = clipboard_key
-        self._last_ingested_clipboard_at = now
+        self._last_ingested_clipboard_at = time.monotonic()
+        clip_id = result.clip_id
         if self.isVisible():
             self.browser.apply_pending_history_updates([clip_id]) or self.refresh_lists()
         else:
@@ -1100,16 +1111,19 @@ class ClientApp(QWidget):
         logger.info(
             "clipboard_ingest_done clip_id=%s is_new=%s elapsed_ms=%.2f",
             clip_id,
-            is_new,
+            result.is_new,
             (time.perf_counter() - self._last_clipboard_capture_at) * 1000,
         )
 
-    def save_image_if_new(self, img):
-        fn = self._image_storage_name(img)
-        fp = os.path.join(IMAGE_DIR, fn)
-        if not os.path.exists(fp):
-            img.save(fp, "PNG")
-        return fn
+    def _on_clipboard_ingest_rejected(self, result):
+        if result.clip_type == "text":
+            self._pending_clipboard_keys.discard(("text", result.content))
+        logger.warning(
+            "clipboard_ingest_rejected reason=%s byte_count=%s pixel_count=%s",
+            result.reason,
+            result.byte_count,
+            result.pixel_count,
+        )
 
     def handle_move(self, clip_id, direction, is_pinned):
         """Move clip up/down."""
