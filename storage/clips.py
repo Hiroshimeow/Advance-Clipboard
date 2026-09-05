@@ -25,36 +25,40 @@ class ClipRepository:
         now = datetime.now().isoformat()
 
         with transaction() as conn:
-            # Check for duplicate
+            # Make dedupe atomic. A separate SELECT followed by INSERT can race
+            # when two clipboard events or two app instances ingest the same
+            # content at the same time.
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO clips
+                   (type, content, hash, tag, is_pinned, pinned_at, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, 0, NULL, ?, ?)""",
+                (clip_type, content, content_hash, tag, now, now),
+            )
+            if cursor.rowcount == 1:
+                new_id = cursor.lastrowid if cursor.lastrowid else 0
+                return new_id, True, False
+
             existing = conn.execute(
                 "SELECT id, is_pinned, updated_at FROM clips WHERE hash = ?",
                 (content_hash,),
             ).fetchone()
+            if not existing:
+                raise RuntimeError("Clip dedupe conflict resolved without an existing row.")
 
-            if existing:
-                # Duplicate found - update timestamp to push to top
-                current_updated_at = existing["updated_at"]
-                if current_updated_at:
-                    try:
-                        current_dt = datetime.fromisoformat(current_updated_at)
-                        if datetime.fromisoformat(now) <= current_dt:
-                            now = (current_dt + timedelta(microseconds=1)).isoformat()
-                    except ValueError:
-                        pass
-                conn.execute(
-                    "UPDATE clips SET updated_at = ? WHERE id = ?",
-                    (now, existing["id"]),
-                )
-                return existing["id"], False, bool(existing["is_pinned"])
-
-            # New clip - insert
-            cursor = conn.execute(
-                """INSERT INTO clips (type, content, hash, tag, is_pinned, pinned_at, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, 0, NULL, ?, ?)""",
-                (clip_type, content, content_hash, tag, now, now),
+            # Duplicate found - update timestamp to push to top.
+            current_updated_at = existing["updated_at"]
+            if current_updated_at:
+                try:
+                    current_dt = datetime.fromisoformat(current_updated_at)
+                    if datetime.fromisoformat(now) <= current_dt:
+                        now = (current_dt + timedelta(microseconds=1)).isoformat()
+                except ValueError:
+                    pass
+            conn.execute(
+                "UPDATE clips SET updated_at = ? WHERE id = ?",
+                (now, existing["id"]),
             )
-            new_id = cursor.lastrowid if cursor.lastrowid else 0
-            return new_id, True, False
+            return existing["id"], False, bool(existing["is_pinned"])
 
     def pin_clip(self, clip_id: int) -> bool:
         """Pin a clip (move to pinned section)."""
@@ -113,11 +117,17 @@ class ClipRepository:
             if not clip:
                 return False
             existing = conn.execute(
-                "SELECT id FROM clips WHERE hash = ? AND id != ?",
+                "SELECT id, is_pinned FROM clips WHERE hash = ? AND id != ?",
                 (content_hash, clip_id),
             ).fetchone()
             if existing:
-                raise ValueError("Clip content already exists.")
+                if clip["is_pinned"] and not existing["is_pinned"]:
+                    # Editing a pinned clip may converge on content that was
+                    # already captured in history. Keep the pinned record and
+                    # remove the redundant history row before updating it.
+                    conn.execute("DELETE FROM clips WHERE id = ?", (existing["id"],))
+                else:
+                    raise ValueError("Another pinned clip already has this content.")
             updated_at = now
             if clip["is_pinned"]:
                 # Keep current history visibility semantics for pinned edits.
@@ -234,7 +244,7 @@ class ClipRepository:
         conn = get_connection()
         rows = conn.execute(
             """SELECT id, type, content, hash, tag, group_name, pinned_at, created_at, updated_at
-               FROM clips
+               FROM clips INDEXED BY idx_updated
                WHERE is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at)
                ORDER BY updated_at DESC
                LIMIT ? OFFSET ?""",

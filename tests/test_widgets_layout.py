@@ -1,19 +1,29 @@
 import os
+import subprocess
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT_DIR)
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import Qt, QSize, QEvent, QPoint
-from PyQt6.QtWidgets import QApplication, QLabel, QListWidgetItem, QPushButton, QWidget
+from PyQt6.QtCore import Qt, QSize, QEvent, QPoint, QPointF, QRect
+from PyQt6.QtGui import QColor, QContextMenuEvent, QImage, QMouseEvent, QPainter
+from PyQt6.QtWidgets import QApplication, QLabel, QListWidgetItem, QMenu, QPushButton, QWidget, QPlainTextEdit, QStyle, QStyleOptionViewItem
 
 from ui.clipboard_browser_controller import ClipboardBrowserController
+from ui.clip_delegate import ClipRowDelegate
+from ui.clip_list_view import ClipListView
+from ui.clip_models import ClipRow, HistoryListModel, ROW_ROLE
+from ui.clip_row import ClipRowMetrics, ClipRowState, ClipRowWidget, ROW_FRAME_INSET_X
 from ui.widgets import (
     COLLAPSED_MAX_LINES,
+    ClipEditPopup,
     ClipItemWidget,
     SmoothListWidget,
     TEXT_FONT,
@@ -38,14 +48,19 @@ def _get_qapp() -> QApplication:
     return _APP
 
 
+def _content_text(widget):
+    if hasattr(widget, "toPlainText"):
+        return widget.toPlainText()
+    return widget.text()
+
+
 class _BrowserHarness(QWidget):
     def __init__(self):
         super().__init__()
         self.storage = SimpleNamespace()
-        self.list_history = SmoothListWidget()
-        self.list_pinned = SmoothListWidget()
+        self.list_history = ClipListView(HistoryListModel(self))
+        self.list_pinned = ClipListView(HistoryListModel(self))
         self.search_input = SimpleNamespace(setFocus=lambda: None, text=lambda: "")
-        self.sidecar = None
         self._updates_enabled = True
         self.browser = ClipboardBrowserController(self)
 
@@ -63,12 +78,12 @@ class _SearchProbeStorage:
     def __init__(self):
         self.calls = []
 
-    def search_history(self, query, limit=None, semantic=True):
-        self.calls.append(("history", query, limit, semantic))
+    def search_history(self, query, limit=None, ranked=True):
+        self.calls.append(("history", query, limit, ranked))
         return []
 
-    def search_pinned(self, query, limit=None, semantic=True):
-        self.calls.append(("pinned", query, limit, semantic))
+    def search_pinned(self, query, limit=None, ranked=True):
+        self.calls.append(("pinned", query, limit, ranked))
         return []
 
 
@@ -97,6 +112,12 @@ class WidgetLayoutTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         _get_qapp()
+
+    def tearDown(self):
+        app = _get_qapp()
+        for widget in app.topLevelWidgets():
+            widget.close()
+        app.processEvents()
 
     def test_single_line_text_gets_full_height(self):
         lines, height = _visible_text_height("single line", TEXT_FONT, 220, 4)
@@ -171,6 +192,43 @@ class WidgetLayoutTests(unittest.TestCase):
         self.assertGreaterEqual(widget.height(), widget.btn_container.minimumHeight() + 10)
         self.assertGreaterEqual(widget.height(), widget.btn_v_widget.minimumHeight() + 10)
         self.assertLessEqual(widget.btn_v_widget.width(), 36)
+
+    def test_expanded_short_text_rows_grow_beyond_collapsed_height(self):
+        cases = [
+            "_parse_legacy_xls",
+            "backend/app/services/document_service.py",
+            "huong develop\nvoi ToC + [BEGIN DIAGRAM CONTEXT] drawing region",
+        ]
+        for content in cases:
+            item = {"type": "text", "content": content, "tag": ""}
+            collapsed = ClipRowMetrics.for_clip(
+                item, ClipRowState(expanded=False), available_width=430
+            )
+            expanded = ClipRowMetrics.for_clip(
+                item, ClipRowState(expanded=True), available_width=430
+            )
+            with self.subTest(content=content):
+                self.assertGreater(expanded.row_height, collapsed.row_height)
+                self.assertGreater(expanded.content_height, collapsed.content_height)
+
+    def test_expanded_short_text_uses_full_content_width(self):
+        item = {
+            "id": 43,
+            "type": "text",
+            "content": "--------------\n2 files changed, 68 insertions(+), 21 deletions(-)",
+            "tag": "",
+            "group_name": "",
+        }
+        widget = ClipItemWidget(
+            item, is_pinned=False, parent_list=None, expanded=True, available_width=560
+        )
+        widget.show()
+        _get_qapp().processEvents()
+
+        self.assertIsInstance(widget.lbl_content, QPlainTextEdit)
+        self.assertEqual(widget.content_container.width(), widget.metrics.content_width)
+        self.assertEqual(widget.lbl_content.width(), widget.metrics.content_width)
+        self.assertEqual(widget.lbl_content.width(), widget.content_container.width())
 
     def test_actions_stay_in_right_side_column(self):
         item = {
@@ -252,7 +310,417 @@ class WidgetLayoutTests(unittest.TestCase):
             widget.lbl_tag.y() + widget.lbl_tag.height(),
         )
 
-    def test_initial_refresh_gives_every_history_row_action_tools(self):
+    def test_expanded_scroll_text_editor_has_opaque_viewport(self):
+        item = {
+            "id": 40,
+            "type": "text",
+            "content": "\n".join(f"line {idx}" for idx in range(30)),
+            "tag": "",
+            "group_name": "",
+        }
+        widget = ClipItemWidget(item, is_pinned=False, parent_list=None, expanded=True, available_width=360)
+        widget.show()
+        _get_qapp().processEvents()
+
+        self.assertIsInstance(widget.lbl_content, QPlainTextEdit)
+        self.assertTrue(widget.lbl_content.testAttribute(Qt.WidgetAttribute.WA_StyledBackground))
+        self.assertTrue(widget.lbl_content.viewport().testAttribute(Qt.WidgetAttribute.WA_StyledBackground))
+        self.assertIn("QPlainTextEdit::viewport { background: #1f1f1f; }", widget.lbl_content.styleSheet())
+        self.assertTrue(widget.lbl_line_count.testAttribute(Qt.WidgetAttribute.WA_StyledBackground))
+        self.assertIn("background: #1f1f1f", widget.lbl_line_count.styleSheet())
+
+    def test_delegate_selected_frame_is_not_clipped_at_left_edge(self):
+        view = ClipListView(HistoryListModel())
+        row = ClipRow(
+            row_kind="clip",
+            clip={"id": 40, "type": "text", "content": "selected frame", "tag": ""},
+        )
+        view.set_rows([row])
+        delegate = view.itemDelegate()
+        height = delegate.measure_row(row, 340).row_height
+        image = QImage(340, height, QImage.Format.Format_RGB32)
+        image.fill(QColor("#000000"))
+        painter = QPainter(image)
+        option = QStyleOptionViewItem()
+        option.rect = QRect(0, 0, 340, height)
+        option.state = QStyle.StateFlag.State_Selected
+        delegate.paint(painter, option, view.model().index(0, 0))
+        painter.end()
+
+        border_y = height // 2
+        self.assertNotEqual(image.pixelColor(0, border_y), QColor("#3daee9"))
+        self.assertEqual(image.pixelColor(ROW_FRAME_INSET_X, border_y), QColor("#3daee9"))
+
+
+    def test_delegate_does_not_paint_expand_button_under_expanded_editor(self):
+        view = ClipListView(HistoryListModel())
+        row = ClipRow(
+            row_kind="clip",
+            clip={"id": 41, "type": "text", "content": "feat/fix-popup-search", "tag": ""},
+            is_expanded=True,
+        )
+        view.set_rows([row])
+        delegate = view.itemDelegate()
+        button_texts = []
+        delegate._paint_button = lambda painter, rect, text, bg, fg: button_texts.append(text)
+
+        height = delegate.measure_row(row, 340).row_height
+        image = QImage(340, height, QImage.Format.Format_RGB32)
+        image.fill(QColor("#000000"))
+        painter = QPainter(image)
+        option = QStyleOptionViewItem()
+        option.rect = QRect(0, 0, 340, height)
+        content_rect = delegate.rects_for(option, row).content
+        delegate.paint(painter, option, view.model().index(0, 0))
+        painter.end()
+
+        bright_text_pixels = 0
+        sample_rect = content_rect.adjusted(0, 0, -1, -1)
+        for x in range(sample_rect.left(), min(sample_rect.right() + 1, sample_rect.left() + 180)):
+            for y in range(sample_rect.top(), min(sample_rect.bottom() + 1, sample_rect.top() + 36)):
+                color = image.pixelColor(x, y)
+                if color.red() > 140 and color.green() > 140 and color.blue() > 140:
+                    bright_text_pixels += 1
+
+        self.assertEqual(button_texts, [])
+        self.assertEqual(bright_text_pixels, 0)
+
+    def test_short_expanded_clip_keeps_editor_geometry_after_toggle(self):
+        harness = _BrowserHarness()
+        clip = {"id": 46, "type": "text", "content": "docker rm -f $(docker ps -aq)\ndocker compose up --build", "tag": ""}
+        harness.list_history.resize(520, 220)
+        harness.list_history.set_rows(harness.browser.build_history_rows([clip]))
+        harness.list_history.show()
+        _get_qapp().processEvents()
+        before_rect = harness.list_history.visualRect(harness.list_history.model().index(0, 0))
+
+        harness.browser.toggle_clip_expanded(46)
+        _get_qapp().processEvents()
+
+        row = harness.list_history.model().row_at(0)
+        editors = [
+            editor for editor in harness.list_history.findChildren(ClipRowWidget)
+            if editor.isVisible()
+        ]
+        visual_rect = harness.list_history.visualRect(harness.list_history.model().index(0, 0))
+
+        self.assertTrue(row.is_expanded)
+        self.assertEqual(len(editors), 1)
+        self.assertGreater(visual_rect.height(), before_rect.height())
+        self.assertEqual(editors[0].geometry(), visual_rect)
+        self.assertIsInstance(editors[0].lbl_content, QPlainTextEdit)
+        self.assertEqual(editors[0].lbl_content.width(), editors[0].metrics.content_width)
+        self.assertIn("docker compose", _content_text(editors[0].lbl_content))
+
+    def test_delete_image_rebinds_remaining_expanded_editor(self):
+        harness = _BrowserHarness()
+        image_clip = {"id": 50, "type": "image", "content": "missing-image.png", "tag": ""}
+        text_clip = {"id": 51, "type": "text", "content": "line one\nline two", "tag": ""}
+        harness.browser.expanded_clip_ids.add(51)
+        harness.list_history.resize(520, 260)
+        harness.list_history.set_rows(harness.browser.build_history_rows([image_clip, text_clip]))
+        harness.browser._reopen_expanded_editors(harness.list_history)
+        harness.list_history.show()
+        _get_qapp().processEvents()
+
+        harness.browser.remove_clip_from_ui(50)
+        _get_qapp().processEvents()
+
+        row = harness.list_history.model().row_at(0)
+        editors = [
+            editor for editor in harness.list_history.findChildren(ClipRowWidget)
+            if editor.isVisible()
+        ]
+        visual_rect = harness.list_history.visualRect(harness.list_history.model().index(0, 0))
+
+        self.assertEqual(harness.list_history.count(), 1)
+        self.assertEqual(row.clip_id, 51)
+        self.assertTrue(row.is_expanded)
+        self.assertEqual(len(editors), 1)
+        self.assertEqual(editors[0].geometry(), visual_rect)
+        self.assertIsInstance(editors[0].lbl_content, QPlainTextEdit)
+        self.assertIn("line two", _content_text(editors[0].lbl_content))
+
+    def test_delegate_still_paints_expand_button_for_collapsed_rows(self):
+        view = ClipListView(HistoryListModel())
+        row = ClipRow(
+            row_kind="clip",
+            clip={"id": 42, "type": "text", "content": "line1\nline2\nline3", "tag": ""},
+            is_expanded=False,
+        )
+        view.set_rows([row])
+        delegate = view.itemDelegate()
+        button_texts = []
+        delegate._paint_button = lambda painter, rect, text, bg, fg: button_texts.append(text)
+
+        height = delegate.measure_row(row, 340).row_height
+        image = QImage(340, height, QImage.Format.Format_RGB32)
+        image.fill(QColor("#000000"))
+        painter = QPainter(image)
+        option = QStyleOptionViewItem()
+        option.rect = QRect(0, 0, 340, height)
+        delegate.paint(painter, option, view.model().index(0, 0))
+        painter.end()
+
+        self.assertIn("▼", button_texts)
+
+    def test_right_click_does_not_trigger_row_click_action(self):
+        view = ClipListView(HistoryListModel())
+        view.resize(360, 240)
+        view.set_rows([
+            ClipRow(
+                row_kind="clip",
+                clip={"id": 41, "type": "text", "content": "right click me", "tag": ""},
+            )
+        ])
+        view.show()
+        _get_qapp().processEvents()
+
+        calls = []
+        view._emit_action = lambda index, action: calls.append(action)
+        index = view.model().index(0, 0)
+        pos = view.visualRect(index).center()
+        if pos.isNull():
+            pos = QPoint(10, 10)
+        global_pos = view.viewport().mapToGlobal(pos)
+
+        press = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            QPointF(pos),
+            QPointF(global_pos),
+            Qt.MouseButton.RightButton,
+            Qt.MouseButton.RightButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        release = QMouseEvent(
+            QEvent.Type.MouseButtonRelease,
+            QPointF(pos),
+            QPointF(global_pos),
+            Qt.MouseButton.RightButton,
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+
+        view.mousePressEvent(press)
+        view.mouseReleaseEvent(release)
+
+        self.assertEqual(calls, [])
+        self.assertFalse(view._pressed_index.isValid())
+        self.assertIsNone(view._pressed_action)
+
+    def test_clip_list_view_imports_without_widgets_import_order_dependency(self):
+        env = os.environ.copy()
+        env.setdefault("QT_QPA_PLATFORM", "offscreen")
+        result = subprocess.run(
+            [sys.executable, "-c", "import ui.clip_list_view; print('ok')"],
+            cwd=ROOT_DIR,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ok", result.stdout)
+
+    def test_delegate_reuses_thumbnail_cache_for_same_image(self):
+        path = os.path.join(tempfile.gettempdir(), "advance_clipboard_thumb_cache_test.png")
+        image = QImage(32, 20, QImage.Format.Format_RGB32)
+        image.fill(QColor("#2b5c75"))
+        self.assertTrue(image.save(path))
+        try:
+            delegate = ClipRowDelegate()
+            first = delegate._thumbnail_for_path(path)
+            second = delegate._thumbnail_for_path(path)
+            self.assertIsNotNone(first)
+            self.assertIs(first, second)
+            self.assertEqual(len(delegate._thumbnail_cache), 1)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def test_fix_popup_uses_native_resize_and_fits_inside_screen(self):
+        popup = ClipEditPopup(
+            {"id": 43, "type": "text", "content": "editable pinned text", "tag": "todo"},
+            parent_list=SimpleNamespace(handle_fix_clip=lambda clip_id, content: None),
+        )
+        self.assertEqual(popup.windowTitle(), "todo")
+        self.assertFalse(bool(popup.windowFlags() & Qt.WindowType.FramelessWindowHint))
+
+        screen = QApplication.primaryScreen().availableGeometry()
+        popup.resize(screen.width() + 500, screen.height() + 500)
+        popup.move(screen.right() + 500, screen.bottom() + 500)
+        popup.show()
+        _get_qapp().processEvents()
+        popup._fit_to_screen()
+
+        geometry = popup.frameGeometry()
+        self.assertLessEqual(geometry.width(), screen.width() - (popup.SCREEN_MARGIN * 2))
+        self.assertLessEqual(geometry.height(), screen.height() - (popup.SCREEN_MARGIN * 2))
+        self.assertGreaterEqual(geometry.left(), screen.left() + popup.SCREEN_MARGIN)
+        self.assertGreaterEqual(geometry.top(), screen.top() + popup.SCREEN_MARGIN)
+        self.assertLessEqual(geometry.right(), screen.right() - popup.SCREEN_MARGIN)
+        self.assertLessEqual(geometry.bottom(), screen.bottom() - popup.SCREEN_MARGIN)
+
+    def test_fix_popup_has_blank_title_without_tag(self):
+        popup = ClipEditPopup(
+            {"id": 44, "type": "text", "content": "editable pinned text", "tag": ""},
+            parent_list=SimpleNamespace(handle_fix_clip=lambda clip_id, content: None),
+        )
+        self.assertEqual(popup.windowTitle(), "")
+
+    def test_fix_popup_search_highlights_and_moves_between_matches(self):
+        popup = ClipEditPopup(
+            {
+                "id": 45,
+                "type": "text",
+                "content": "alpha\n" + "middle\n" * 30 + "target one\nmore\ntarget two",
+                "tag": "todo",
+            },
+            parent_list=SimpleNamespace(handle_fix_clip=lambda clip_id, content: None),
+        )
+        popup.show()
+        _get_qapp().processEvents()
+
+        popup.search_input.setText("target")
+        _get_qapp().processEvents()
+
+        self.assertEqual(len(popup._search_matches), 2)
+        self.assertEqual(popup.editor.textCursor().selectedText(), "target")
+        self.assertEqual(len(popup.editor.extraSelections()), 2)
+        self.assertEqual(popup._current_search_index, 0)
+
+        popup._next_search_match()
+        self.assertEqual(popup.editor.textCursor().selectedText(), "target")
+        self.assertEqual(popup._current_search_index, 1)
+
+        popup.search_input.clear()
+        self.assertEqual(popup._search_matches, [])
+        self.assertEqual(popup.editor.extraSelections(), [])
+
+    def test_context_menu_exposes_tag_and_group_actions(self):
+        class _Storage:
+            def get_groups(self):
+                return ["Work"]
+
+        parent = QWidget()
+        parent.storage = _Storage()
+        parent.handle_add_tag = lambda clip_id, tag: None
+        parent.handle_set_group = lambda clip_id, group: None
+        parent.handle_fix_clip = lambda clip_id, content: None
+        view = ClipListView(HistoryListModel(), parent)
+        view.resize(360, 240)
+        view.set_rows([
+            ClipRow(
+                row_kind="clip",
+                clip={"id": 42, "type": "text", "content": "menu me", "tag": ""},
+            )
+        ])
+        parent.show()
+        view.show()
+        _get_qapp().processEvents()
+
+        seen = []
+        original_exec = QMenu.exec
+
+        def fake_exec(menu, global_pos):
+            for action in menu.actions():
+                seen.append(action.text())
+                submenu = action.menu()
+                if submenu is not None:
+                    seen.extend(sub_action.text() for sub_action in submenu.actions())
+            return None
+
+        index = view.model().index(0, 0)
+        pos = view.visualRect(index).center()
+        if pos.isNull():
+            pos = QPoint(10, 10)
+        event = QContextMenuEvent(
+            QContextMenuEvent.Reason.Mouse,
+            pos,
+            view.viewport().mapToGlobal(pos),
+        )
+
+        QMenu.exec = fake_exec
+        try:
+            view.contextMenuEvent(event)
+        finally:
+            QMenu.exec = original_exec
+
+        self.assertIn("Add to Group", seen)
+        self.assertIn("Work", seen)
+        self.assertIn("Add Tag", seen)
+
+    def test_context_menu_open_image_action_is_image_only(self):
+        from ui.clip_context_menu import show_clip_context_menu
+
+        parent = QWidget()
+        parent.storage = SimpleNamespace(get_groups=lambda: [])
+        seen = []
+        original_exec = QMenu.exec
+
+        def fake_exec(menu, global_pos):
+            seen.append([action.text() for action in menu.actions()])
+            return None
+
+        QMenu.exec = fake_exec
+        try:
+            show_clip_context_menu(
+                parent,
+                {"id": 70, "type": "image", "content": "shot.png"},
+                False,
+                parent,
+                QPoint(0, 0),
+            )
+            show_clip_context_menu(
+                parent,
+                {"id": 71, "type": "text", "content": "plain text"},
+                False,
+                parent,
+                QPoint(0, 0),
+            )
+        finally:
+            QMenu.exec = original_exec
+
+        self.assertIn("Open this image", seen[0])
+        self.assertNotIn("Open this image", seen[1])
+
+    def test_context_menu_open_image_uses_default_browser(self):
+        from ui.clip_context_menu import show_clip_context_menu
+
+        parent = QWidget()
+        parent.storage = SimpleNamespace(get_groups=lambda: [])
+        original_exec = QMenu.exec
+
+        def fake_exec(menu, global_pos):
+            return next(
+                (action for action in menu.actions() if action.text() == "Open this image"),
+                None,
+            )
+
+        with tempfile.TemporaryDirectory() as tmp, patch("ui.widgets.IMAGE_DIR", tmp), patch(
+            "webbrowser.open", return_value=True
+        ) as open_browser:
+            image_path = os.path.join(tmp, "shot.png")
+            with open(image_path, "wb") as handle:
+                handle.write(b"image")
+            QMenu.exec = fake_exec
+            try:
+                show_clip_context_menu(
+                    parent,
+                    {"id": 72, "type": "image", "content": "shot.png"},
+                    False,
+                    parent,
+                    QPoint(0, 0),
+                )
+            finally:
+                QMenu.exec = original_exec
+
+        open_browser.assert_called_once()
+        self.assertEqual(open_browser.call_args.args[0], Path(image_path).resolve().as_uri())
+
+    def test_initial_refresh_gives_every_history_row_action_hitboxes(self):
         harness = _BrowserHarness()
         clips = [
             {"id": idx, "type": "text", "content": f"clip {idx}", "tag": ""}
@@ -268,9 +736,17 @@ class WidgetLayoutTests(unittest.TestCase):
         self.assertEqual(harness.list_history.count(), 3)
         for row in range(harness.list_history.count()):
             item = harness.list_history.item(row)
-            widget = harness.list_history.itemWidget(item)
-            buttons = widget.btn_container.findChildren(QPushButton)
-            self.assertEqual(len(buttons), 3)
+            row_data = item.data(ROW_ROLE)
+            self.assertTrue(row_data.is_clip)
+            index = harness.list_history.model().index(row, 0)
+            option = harness.list_history.viewOptions()
+            option.rect = harness.list_history.visualRect(index)
+            if option.rect.isNull():
+                option.rect = harness.list_history.rect().adjusted(0, row * 80, 0, row * 80 + 80)
+            rects = harness.list_history.itemDelegate().rects_for(option, row_data)
+            self.assertFalse(rects.copy.isNull())
+            self.assertFalse(rects.pin.isNull())
+            self.assertFalse(rects.delete.isNull())
 
     def test_mixed_cjk_text_allocates_full_visible_text_height(self):
         item = {
@@ -395,7 +871,7 @@ class WidgetLayoutTests(unittest.TestCase):
         self.assertTrue(any(btn.toolTip() == "Pin/Unpin" for btn in buttons))
         self.assertTrue(any(btn.toolTip() == "Delete" for btn in buttons))
 
-    def test_resize_reflows_history_row_width(self):
+    def test_resize_reflows_history_delegate_width(self):
         harness = _BrowserHarness()
         harness.list_history.resize(420, 320)
         harness.list_history.show()
@@ -408,31 +884,23 @@ class WidgetLayoutTests(unittest.TestCase):
             "tag": "demo",
             "group_name": "",
         }
-        width = harness.browser._list_content_width(harness.list_history)
-        item = QListWidgetItem(harness.list_history)
-        item.setData(Qt.ItemDataRole.UserRole, clip)
-        ui = ClipItemWidget(clip, False, harness, available_width=width)
-        item.setSizeHint(QSize(width, ui.height()))
-        harness.list_history.addItem(item)
-        harness.list_history.setItemWidget(item, ui)
+        harness.list_history.set_rows(harness.browser.build_history_rows([clip]))
         _get_qapp().processEvents()
 
-        initial_hint_width = item.sizeHint().width()
-        initial_widget_width = ui.width()
+        delegate = harness.list_history.itemDelegate()
+        index = harness.list_history.model().index(0, 0)
+        option = harness.list_history.viewOptions()
+        option.rect = harness.list_history.rect()
+        initial_hint_width = delegate.sizeHint(option, index).width()
 
         harness.list_history.resize(280, 320)
         _get_qapp().processEvents()
         harness.browser._refresh_visible_row_layouts()
         _get_qapp().processEvents()
 
-        resized_item = harness.list_history.item(0)
-        resized_widget = harness.list_history.itemWidget(resized_item)
-        self.assertLess(resized_item.sizeHint().width(), initial_hint_width)
-        self.assertLess(resized_widget.width(), initial_widget_width)
-        self.assertEqual(
-            resized_item.sizeHint().width(),
-            harness.browser._list_content_width(harness.list_history),
-        )
+        option.rect = harness.list_history.rect()
+        resized_hint_width = delegate.sizeHint(option, index).width()
+        self.assertLess(resized_hint_width, initial_hint_width)
 
     def test_action_column_is_flush_to_list_viewport_not_just_row_widget(self):
         harness = _BrowserHarness()
@@ -447,21 +915,15 @@ class WidgetLayoutTests(unittest.TestCase):
             "tag": "demo",
             "group_name": "",
         }
-        width = harness.browser._list_content_width(harness.list_history)
-        item = QListWidgetItem(harness.list_history)
-        item.setData(Qt.ItemDataRole.UserRole, clip)
-        ui = ClipItemWidget(clip, False, harness, available_width=width)
-        item.setSizeHint(QSize(width, ui.height()))
-        harness.list_history.addItem(item)
-        harness.list_history.setItemWidget(item, ui)
+        harness.list_history.set_rows(harness.browser.build_history_rows([clip]))
         _get_qapp().processEvents()
 
-        buttons = ui.btn_container.findChildren(QPushButton)
-        self.assertTrue(buttons)
-        visual_right = max(
-            ui.btn_container.x() + button.x() + button.width()
-            for button in buttons
-        )
+        index = harness.list_history.model().index(0, 0)
+        row_data = index.data(ROW_ROLE)
+        option = harness.list_history.viewOptions()
+        option.rect = harness.list_history.rect()
+        rects = harness.list_history.itemDelegate().rects_for(option, row_data)
+        visual_right = rects.actions.right()
         viewport_right = harness.list_history.viewport().width()
         self.assertLessEqual(viewport_right - visual_right, 12)
 

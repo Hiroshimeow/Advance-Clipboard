@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import threading
 import unittest
 import ctypes
 import types
@@ -16,12 +17,6 @@ from PyQt6.QtGui import QKeyEvent
 # Ensure headless Qt (caller also sets this env var)
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-# Mock heavy Neural modules BEFORE importing main to avoid WebEngine crash in tests
-sys.modules.setdefault("neural.engine", MagicMock())
-sys.modules.setdefault("neural.ui", MagicMock())
-sys.modules.setdefault("neural.bridge", MagicMock())
-sys.modules.setdefault("PyQt6.QtWebEngineWidgets", MagicMock())
-sys.modules.setdefault("PyQt6.QtWebChannel", MagicMock())
 
 if not hasattr(ctypes, "WINFUNCTYPE"):
     ctypes.WINFUNCTYPE = ctypes.CFUNCTYPE
@@ -32,86 +27,6 @@ _clipboard_monitor_mod.VK_CONTROL = 0x11
 _clipboard_monitor_mod.VK_MENU = 0x12
 _clipboard_monitor_mod.simulate_paste = MagicMock()
 sys.modules["core.clipboard_monitor"] = _clipboard_monitor_mod
-
-# Patch NeuralEngine and SidecarWindow with safe stubs
-
-_neural_engine_mod = types.ModuleType("neural.engine")
-
-
-class _StubEngine:
-    name = "NeuralEngine"
-
-    def __init__(self, *a, **kw):
-        pass
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-
-_neural_engine_mod.NeuralEngine = _StubEngine
-sys.modules["neural.engine"] = _neural_engine_mod
-
-_neural_ui_mod = types.ModuleType("neural.ui")
-
-
-class _StubSidecar:
-    def __init__(self, *a, **kw):
-        self.bridge = MagicMock()
-        self.bridge.node_clicked = MagicMock()
-        self.bridge.node_clicked.connect = MagicMock()
-        self.search_bar = MagicMock()
-        self.search_bar.textChanged = MagicMock()
-        self.search_bar.textChanged.connect = MagicMock()
-
-    def show(self):
-        pass
-
-    def hide(self):
-        pass
-
-    def close(self):
-        pass
-
-    def move(self, *a):
-        pass
-
-    def resize(self, *a):
-        pass
-
-    def setGeometry(self, *a):
-        pass
-
-    def setWindowTitle(self, *a):
-        pass
-
-    def update_data(self, *a):
-        pass
-
-    def focus_node(self, *a):
-        pass
-
-    def focus_query(self, *a):
-        pass
-
-    def reload_config(self, *a):
-        pass
-
-    def grab(self):
-        return MagicMock()
-
-    def isVisible(self):
-        return False
-
-    def isActiveWindow(self):
-        return False
-
-
-_neural_ui_mod.SidecarWindow = _StubSidecar
-sys.modules["neural.ui"] = _neural_ui_mod
-
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication, QListWidgetItem
@@ -169,6 +84,12 @@ def _wait_until(predicate, timeout_ms: int = 1200):
     return bool(predicate())
 
 
+def _submit_search(app, query: str):
+    app.browser.current_search_query = query
+    app.browser._last_search_query = f"__force_{query}_{time.perf_counter_ns()}"
+    app.browser._do_search()
+
+
 class _TestClientApp(ClientApp):
     def __init__(self):
         storage_patch = patch("main.get_storage", return_value=_FakeStorage())
@@ -206,18 +127,16 @@ class _FakeStorage:
     def set_backup_callback(self, callback):
         return
 
-    def set_neural_event_callback(self, callback):
-        return
 
     def clear_backup_flag(self):
         self.need_backup = False
 
-    def search_history(self, query: str, limit=None, semantic=True):
+    def search_history(self, query: str, limit=None, ranked=True):
         q = (query or "").lower()
         rows = [c for c in self._history if q in str(c.get("content", "")).lower()]
         return rows if limit is None else rows[:limit]
 
-    def search_pinned(self, query: str, limit=None, semantic=True):
+    def search_pinned(self, query: str, limit=None, ranked=True):
         q = (query or "").lower()
         rows = [c for c in self._pinned if q in str(c.get("content", "")).lower()]
         return rows if limit is None else rows[:limit]
@@ -295,9 +214,6 @@ class _FakeStorage:
                 return True
         return False
 
-    def trigger_daily_rebuild(self):
-        pass
-
 
     def delete_clip(self, clip_id):
         self._history = [c for c in self._history if c.get("id") != clip_id]
@@ -312,25 +228,98 @@ class _SlowFakeStorage(_FakeStorage):
 
 
 class _SlowSearchStorage(_FakeStorage):
-    def search_history(self, query: str, limit=None, semantic=True):
+    def search_history(self, query: str, limit=None, ranked=True):
         time.sleep(0.25)
-        return super().search_history(query, limit, semantic)
+        return super().search_history(query, limit, ranked)
 
-    def search_pinned(self, query: str, limit=None, semantic=True):
+    def search_pinned(self, query: str, limit=None, ranked=True):
         time.sleep(0.25)
-        return super().search_pinned(query, limit, semantic)
+        return super().search_pinned(query, limit, ranked)
 
 
 class _OutOfOrderSearchStorage(_FakeStorage):
-    def search_history(self, query: str, limit=None, semantic=True):
+    def search_history(self, query: str, limit=None, ranked=True):
         if query == "slow":
             time.sleep(0.2)
         rows = [{"id": 1, "type": "text", "content": f"{query} result"}]
         return rows if limit is None else rows[:limit]
 
-    def search_pinned(self, query: str, limit=None, semantic=True):
+    def search_pinned(self, query: str, limit=None, ranked=True):
         if query == "slow":
             time.sleep(0.2)
+        return []
+
+
+class _ControlledSearchStorage(_FakeStorage):
+    def __init__(self, *, block_query=None, error_query=None):
+        super().__init__()
+        self.block_query = block_query
+        self.error_query = error_query
+        self.release = threading.Event()
+        self.history_started = []
+        self.peak_active_history = 0
+        self._active_history = 0
+        self._lock = threading.Lock()
+        self._started_events = {}
+
+    def _started_event(self, query):
+        with self._lock:
+            return self._started_events.setdefault(query, threading.Event())
+
+    def wait_started(self, query, timeout=1.0):
+        return self._started_event(query).wait(timeout)
+
+    def search_history(self, query: str, limit=None, ranked=True):
+        started = self._started_event(query)
+        with self._lock:
+            self.history_started.append(query)
+            self._active_history += 1
+            self.peak_active_history = max(
+                self.peak_active_history, self._active_history
+            )
+        started.set()
+        try:
+            if query == self.block_query:
+                self.release.wait(2.0)
+            if query == self.error_query:
+                raise RuntimeError(f"search failed: {query}")
+            rows = [
+                {
+                    "id": (abs(hash(query)) % 1_000_000) + 1,
+                    "type": "text",
+                    "content": f"{query} result",
+                }
+            ]
+            return rows if limit is None else rows[:limit]
+        finally:
+            with self._lock:
+                self._active_history -= 1
+
+    def search_pinned(self, query: str, limit=None, ranked=True):
+        return []
+
+
+class _RealRefreshOverlapStorage(_FakeStorage):
+    def __init__(self):
+        super().__init__()
+        self.worker_started = threading.Event()
+        self.release_worker = threading.Event()
+        self.history_calls = 0
+        self._lock = threading.Lock()
+
+    def search_history(self, query: str, limit=None, ranked=True):
+        with self._lock:
+            self.history_calls += 1
+            call_number = self.history_calls
+        if call_number == 1:
+            self.worker_started.set()
+            self.release_worker.wait(2.0)
+            rows = [{"id": 1, "type": "text", "content": "worker-old"}]
+        else:
+            rows = [{"id": 2, "type": "text", "content": "refresh-new"}]
+        return rows if limit is None else rows[:limit]
+
+    def search_pinned(self, query: str, limit=None, ranked=True):
         return []
 
 
@@ -659,6 +648,25 @@ class KeyboardNavigationTests(unittest.TestCase):
         app.close()
         QApplication.processEvents()
 
+    def test_repeated_delete_clicks_for_same_clip_are_coalesced(self):
+        _get_qapp()
+        app = _TestClientApp()
+        history = [{"id": 1, "type": "text", "content": "rapid delete"}]
+        app.storage = _SlowDeleteStorage(history=history)
+        app.refresh_lists()
+
+        app.handle_delete(1)
+        app.handle_delete(1)
+        app.handle_delete(1)
+
+        self.assertEqual(app.list_history.count(), 0)
+        self.assertEqual(app.storage.delete_calls, [])
+        self.assertTrue(_wait_until(lambda: app.storage.delete_calls == [1]))
+        self.assertEqual(app.storage.delete_calls, [1])
+        app.backup_scheduler.cancel()
+        app.close()
+        QApplication.processEvents()
+
     def test_ui_show_does_not_select_all_text_and_cursor_at_end(self):
         _get_qapp()
         app = _TestClientApp()
@@ -784,20 +792,20 @@ class KeyboardNavigationTests(unittest.TestCase):
         )
         app.refresh_lists()
         item = app.list_history.item(0)
-        widget = app.list_history.itemWidget(item)
-        self.assertEqual(widget.btn_expand.text(), "▼")
+        row = item.data(Qt.ItemDataRole.UserRole + 100)
+        self.assertFalse(row.is_expanded)
         self.assertNotIn(1, app.browser.expanded_clip_ids)
 
         app.handle_toggle_expand(1)
         item = app.list_history.item(0)
-        widget = app.list_history.itemWidget(item)
-        self.assertEqual(widget.btn_expand.text(), "▲")
+        row = item.data(Qt.ItemDataRole.UserRole + 100)
+        self.assertTrue(row.is_expanded)
         self.assertIn(1, app.browser.expanded_clip_ids)
 
         app.handle_toggle_expand(1)
         item = app.list_history.item(0)
-        widget = app.list_history.itemWidget(item)
-        self.assertEqual(widget.btn_expand.text(), "▼")
+        row = item.data(Qt.ItemDataRole.UserRole + 100)
+        self.assertFalse(row.is_expanded)
         self.assertNotIn(1, app.browser.expanded_clip_ids)
         app.backup_scheduler.cancel()
         app.close()
@@ -865,6 +873,239 @@ class KeyboardNavigationTests(unittest.TestCase):
         app.backup_scheduler.cancel()
         app.close()
         QApplication.processEvents()
+
+    def test_rapid_search_replacement_runs_one_worker_and_only_latest_pending(self):
+        _get_qapp()
+        app = _TestClientApp()
+        storage = _ControlledSearchStorage(block_query="first")
+        app.storage = storage
+        try:
+            _submit_search(app, "first")
+            self.assertTrue(storage.wait_started("first"))
+
+            for query in ("second", "third", "fourth", "final"):
+                _submit_search(app, query)
+
+            QApplication.processEvents()
+            self.assertEqual(storage.history_started, ["first"])
+
+            storage.release.set()
+            self.assertTrue(
+                _wait_until(
+                    lambda: storage.history_started == ["first", "final"]
+                    and app.list_history.count() == 1
+                )
+            )
+            current = app.list_history.item(0).data(Qt.ItemDataRole.UserRole)
+            self.assertEqual(current["content"], "final result")
+            self.assertEqual(storage.peak_active_history, 1)
+        finally:
+            storage.release.set()
+            app.backup_scheduler.cancel()
+            app.close()
+            QApplication.processEvents()
+
+    def test_slow_old_search_never_applies_and_latest_applies_once(self):
+        _get_qapp()
+        app = _TestClientApp()
+        storage = _ControlledSearchStorage(block_query="slow")
+        app.storage = storage
+        try:
+            with patch.object(
+                app.browser,
+                "_apply_search_results",
+                wraps=app.browser._apply_search_results,
+            ) as apply_spy:
+                _submit_search(app, "slow")
+                self.assertTrue(storage.wait_started("slow"))
+                _submit_search(app, "fast")
+                QApplication.processEvents()
+                self.assertFalse(storage.wait_started("fast", timeout=0.03))
+
+                storage.release.set()
+                self.assertTrue(
+                    _wait_until(
+                        lambda: app.list_history.count() == 1
+                        and app.list_history.item(0).data(
+                            Qt.ItemDataRole.UserRole
+                        )["content"]
+                        == "fast result"
+                    )
+                )
+                applied_queries = [call.args[0] for call in apply_spy.call_args_list]
+                self.assertEqual(applied_queries, ["fast"])
+        finally:
+            storage.release.set()
+            app.backup_scheduler.cancel()
+            app.close()
+            QApplication.processEvents()
+
+    def test_search_worker_error_releases_gate_for_latest_pending(self):
+        _get_qapp()
+        app = _TestClientApp()
+        storage = _ControlledSearchStorage(
+            block_query="error", error_query="error"
+        )
+        app.storage = storage
+        try:
+            _submit_search(app, "error")
+            self.assertTrue(storage.wait_started("error"))
+            _submit_search(app, "latest")
+            QApplication.processEvents()
+            self.assertFalse(storage.wait_started("latest", timeout=0.03))
+
+            storage.release.set()
+            self.assertTrue(
+                _wait_until(
+                    lambda: storage.history_started == ["error", "latest"]
+                    and app.list_history.count() == 1
+                )
+            )
+            current = app.list_history.item(0).data(Qt.ItemDataRole.UserRole)
+            self.assertEqual(current["content"], "latest result")
+        finally:
+            storage.release.set()
+            app.backup_scheduler.cancel()
+            app.close()
+            QApplication.processEvents()
+
+    def test_clear_search_while_worker_runs_discards_pending_and_stale_result(self):
+        _get_qapp()
+        app = _TestClientApp()
+        storage = _ControlledSearchStorage(block_query="old")
+        app.storage = storage
+        try:
+            _submit_search(app, "old")
+            self.assertTrue(storage.wait_started("old"))
+            _submit_search(app, "obsolete")
+
+            app.browser.on_search_text_changed("")
+            QApplication.processEvents()
+            self.assertEqual(app.browser.current_search_query, "")
+            self.assertFalse(storage.wait_started("obsolete", timeout=0.03))
+
+            storage.release.set()
+            self.assertTrue(_wait_until(lambda: storage.history_started == ["old"]))
+            QApplication.processEvents()
+            self.assertEqual(app.list_history.count(), 0)
+        finally:
+            storage.release.set()
+            app.backup_scheduler.cancel()
+            app.close()
+            QApplication.processEvents()
+
+    def test_search_shutdown_discards_pending_without_waiting_or_ui_apply(self):
+        _get_qapp()
+        app = _TestClientApp()
+        storage = _ControlledSearchStorage(block_query="old")
+        app.storage = storage
+        try:
+            with patch.object(
+                app.browser,
+                "_apply_search_results",
+                wraps=app.browser._apply_search_results,
+            ) as apply_spy:
+                _submit_search(app, "old")
+                self.assertTrue(storage.wait_started("old"))
+                _submit_search(app, "pending")
+                self.assertTrue(hasattr(app.browser, "shutdown_search"))
+
+                start = time.monotonic()
+                app.browser.shutdown_search()
+                self.assertLess(time.monotonic() - start, 0.05)
+                storage.release.set()
+                time.sleep(0.05)
+                QApplication.processEvents()
+
+                self.assertEqual(storage.history_started, ["old"])
+                self.assertEqual(apply_spy.call_count, 0)
+        finally:
+            storage.release.set()
+            app.backup_scheduler.cancel()
+            app.close()
+            QApplication.processEvents()
+
+    def test_real_refresh_invalidates_older_inflight_search_result(self):
+        _get_qapp()
+        app = _TestClientApp()
+        storage = _RealRefreshOverlapStorage()
+        app.storage = storage
+        try:
+            with patch.object(
+                app.browser,
+                "_apply_search_results",
+                wraps=app.browser._apply_search_results,
+            ) as apply_spy:
+                _submit_search(app, "q")
+                self.assertTrue(storage.worker_started.wait(1.0))
+
+                app.browser.refresh_lists(maintain_selection=False)
+                current = app.list_history.item(0).data(Qt.ItemDataRole.UserRole)
+                self.assertEqual(current["content"], "refresh-new")
+
+                storage.release_worker.set()
+                self.assertTrue(
+                    _wait_until(lambda: not app.browser._search_worker_running)
+                )
+                QApplication.processEvents()
+
+                current = app.list_history.item(0).data(Qt.ItemDataRole.UserRole)
+                self.assertEqual(current["content"], "refresh-new")
+                self.assertEqual(apply_spy.call_count, 0)
+                self.assertEqual(storage.history_calls, 2)
+        finally:
+            storage.release_worker.set()
+            app.backup_scheduler.cancel()
+            app.close()
+            app.deleteLater()
+            QApplication.processEvents()
+
+    def test_refresh_overlap_defers_and_applies_latest_search_once(self):
+        _get_qapp()
+        app = _TestClientApp()
+        storage = _ControlledSearchStorage(block_query="old")
+        app.storage = storage
+        try:
+            with patch.object(
+                app.browser,
+                "_apply_search_results",
+                wraps=app.browser._apply_search_results,
+            ) as apply_spy:
+                _submit_search(app, "old")
+                self.assertTrue(storage.wait_started("old"))
+                _submit_search(app, "latest")
+                app.browser._is_refreshing = True
+                storage.release.set()
+
+                self.assertTrue(
+                    _wait_until(
+                        lambda: storage.wait_started("latest", timeout=0)
+                    )
+                )
+                self.assertTrue(
+                    _wait_until(lambda: app.browser._queued_search_after_refresh)
+                )
+                self.assertEqual(apply_spy.call_count, 0)
+
+                app.browser._is_refreshing = False
+                app.browser._do_search()
+                self.assertTrue(
+                    _wait_until(
+                        lambda: app.list_history.count() == 1
+                        and app.list_history.item(0).data(
+                            Qt.ItemDataRole.UserRole
+                        )["content"]
+                        == "latest result"
+                    )
+                )
+                applied_queries = [call.args[0] for call in apply_spy.call_args_list]
+                self.assertEqual(applied_queries, ["latest"])
+        finally:
+            app.browser._is_refreshing = False
+            storage.release.set()
+            app.backup_scheduler.cancel()
+            app.close()
+            QApplication.processEvents()
 
     def test_search_execution_returns_before_slow_storage_search_finishes(self):
         _get_qapp()

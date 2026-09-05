@@ -71,14 +71,9 @@ class _StubStorage:
     def get_clip_count(self):
         return 0
 
-    def trigger_daily_rebuild(self):
-        pass
 
     def set_backup_callback(self, callback):
         self.backup_callback = callback
-
-    def set_neural_event_callback(self, callback):
-        self.neural_callback = callback
 
     def clear_backup_flag(self):
         self.need_backup = False
@@ -89,13 +84,13 @@ class _StubStorage:
         self._clips.insert(0, {"id": clip_id, "type": clip_type, "content": content, "tag": tag})
         return clip_id, True
 
-    def search_history(self, query, limit=None, semantic=True):
+    def search_history(self, query, limit=None, ranked=True):
         return []
 
     def get_history(self, limit=20, offset=0):
         return self._clips[offset : offset + limit]
 
-    def search_pinned(self, query, limit=None, semantic=True):
+    def search_pinned(self, query, limit=None, ranked=True):
         return []
 
     def get_groups(self):
@@ -125,6 +120,7 @@ class UiPreloadRefreshTests(unittest.TestCase):
         storage_patch.start()
         self.addCleanup(storage_patch.stop)
         app = ClientApp(enable_monitor=False, init_data=False)
+        self.addCleanup(app.ingest_bridge.stop)
         self.addCleanup(app.backup_scheduler.cancel)
         self.addCleanup(app.close)
         return app
@@ -144,7 +140,8 @@ class UiPreloadRefreshTests(unittest.TestCase):
 
         app._process_clipboard_data_retry(0)
 
-        QApplication.processEvents()
+        self.assertTrue(_wait_until(lambda: len(self.storage.added) == 1))
+        self.assertTrue(_wait_until(lambda: app.list_history.count() == 1))
         self.assertEqual([], refresh_calls)
         self.assertFalse(app.is_ui_dirty)
         self.assertFalse(app._requires_full_ui_refresh)
@@ -174,6 +171,56 @@ class UiPreloadRefreshTests(unittest.TestCase):
             if callback_name == "_refresh_after_show"
         ]
         self.assertEqual([50], refresh_delays)
+
+    def test_clipboard_change_events_are_coalesced(self):
+        app = self._make_app()
+        calls = []
+        app._process_clipboard_data_retry = lambda attempt: calls.append(attempt)
+
+        app.on_clipboard_change_delayed()
+        app.on_clipboard_change_delayed()
+        app.on_clipboard_change_delayed()
+
+        self.assertTrue(_wait_until(lambda: len(calls) == 1))
+        self.assertEqual([0], calls)
+
+    def test_duplicate_clipboard_payload_is_ingested_once_per_burst(self):
+        app = self._make_app()
+        mime = QMimeData()
+        mime.setText("same clipboard payload")
+        app.clipboard.mimeData = lambda: mime
+
+        app._process_clipboard_data_retry(0)
+        app._process_clipboard_data_retry(0)
+
+        self.assertTrue(_wait_until(lambda: len(self.storage.added) == 1))
+        self.assertEqual(
+            [("text", "same clipboard payload", "")],
+            self.storage.added,
+        )
+
+    def test_oversized_text_is_rejected_without_storage_write(self):
+        app = self._make_app()
+        mime = QMimeData()
+        mime.setText("x" * (2 * 1024 * 1024 + 1))
+        app.clipboard.mimeData = lambda: mime
+
+        app._process_clipboard_data_retry(0)
+
+        self.assertTrue(_wait_until(lambda: not app._pending_clipboard_keys, timeout_ms=2500))
+        self.assertEqual([], self.storage.added)
+        self.assertEqual(0, app.list_history.count())
+
+    def test_cleanup_stops_ingest_before_forcing_backup(self):
+        app = self._make_app()
+        calls = []
+        app.storage.need_backup = True
+        app.ingest_bridge.stop = lambda timeout=3.0: calls.append("stop")
+        app.backup_scheduler.force_now = lambda: calls.append("backup")
+
+        app._cleanup_on_exit()
+
+        self.assertEqual(["stop", "backup"], calls)
 
 
 if __name__ == "__main__":

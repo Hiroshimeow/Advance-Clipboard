@@ -25,8 +25,22 @@ Why a separate hidden window instead of using ClientApp.winId():
 
 import ctypes
 import ctypes.wintypes
+import logging
 import threading
 from PyQt6.QtCore import QObject, pyqtSignal
+
+logger = logging.getLogger(__name__)
+
+from core.win32_api import (
+    LRESULT,
+    LPARAM,
+    ULONG_PTR,
+    WPARAM,
+    WNDCLASSEX,
+    WNDPROC,
+    kernel32,
+    user32,
+)
 
 # Win32 constants
 WM_CLIPBOARDUPDATE = 0x031D
@@ -62,39 +76,6 @@ CS_VREDRAW = 0x0001
 # HWND_MESSAGE for message-only window
 HWND_MESSAGE = ctypes.wintypes.HWND(-3)
 
-# Win32 API type definitions - 64-bit safe
-import sys
-
-if sys.maxsize > 2**32:
-    LRESULT = ctypes.c_int64
-    LPARAM = ctypes.c_int64
-    WPARAM = ctypes.c_uint64
-    ULONG_PTR = ctypes.c_uint64
-else:
-    LRESULT = ctypes.c_long
-    LPARAM = ctypes.c_long
-    WPARAM = ctypes.c_uint
-    ULONG_PTR = ctypes.c_ulong
-
-WNDPROC = ctypes.WINFUNCTYPE(
-    LRESULT,
-    ctypes.wintypes.HWND,
-    ctypes.wintypes.UINT,
-    WPARAM,
-    LPARAM,
-)
-
-# User32 functions - ensure correct arg types for 64-bit
-user32 = ctypes.windll.user32
-user32.DefWindowProcW.argtypes = [
-    ctypes.wintypes.HWND,
-    ctypes.wintypes.UINT,
-    WPARAM,
-    LPARAM,
-]
-user32.DefWindowProcW.restype = LRESULT
-
-
 def _coerce_lparam(value):
     """Normalize callback values into a signed LPARAM-sized integer."""
     bits = ctypes.sizeof(ctypes.c_void_p) * 8
@@ -103,23 +84,6 @@ def _coerce_lparam(value):
     if value >= (1 << (bits - 1)):
         value -= 1 << bits
     return value
-
-
-class WNDCLASSEX(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", ctypes.wintypes.UINT),
-        ("style", ctypes.wintypes.UINT),
-        ("lpfnWndProc", WNDPROC),
-        ("cbClsExtra", ctypes.c_int),
-        ("cbWndExtra", ctypes.c_int),
-        ("hInstance", ctypes.wintypes.HINSTANCE),
-        ("hIcon", ctypes.wintypes.HANDLE),
-        ("hCursor", ctypes.wintypes.HANDLE),
-        ("hbrBackground", ctypes.wintypes.HANDLE),
-        ("lpszMenuName", ctypes.wintypes.LPCWSTR),
-        ("lpszClassName", ctypes.wintypes.LPCWSTR),
-        ("hIconSm", ctypes.wintypes.HANDLE),
-    ]
 
 
 class Win32ClipboardMonitor(QObject):
@@ -135,148 +99,174 @@ class Win32ClipboardMonitor(QObject):
     clipboard_changed = pyqtSignal()
     hotkey_toggle = pyqtSignal()
 
-    def __init__(self):
+    def __init__(self, *, user32_api=user32, kernel32_api=kernel32):
         super().__init__()
+        self._user32 = user32_api
+        self._kernel32 = kernel32_api
+        self._state_lock = threading.Lock()
+        self._state = "stopped"
+        self._ready = threading.Event()
         self._hwnd = None
         self._thread = None
         self._thread_id = None
-        self._running = False
-        self._wndproc_ref = None  # prevent GC of the callback
+        self._wndproc_ref = None
+
+    @property
+    def state(self):
+        with self._state_lock:
+            return self._state
+
+    def _set_state(self, value):
+        with self._state_lock:
+            self._state = value
 
     def start(self):
-        """Start the monitor thread."""
-        if self._running:
-            return
-        self._running = True
+        """Start the monitor thread and report whether initialization succeeded."""
+        with self._state_lock:
+            if self._state != "stopped":
+                return self._state == "running"
+            self._state = "starting"
+        self._ready.clear()
         self._thread = threading.Thread(
             target=self._run_message_loop,
             daemon=True,
             name="Win32ClipboardMonitor",
         )
         self._thread.start()
+        self._ready.wait(timeout=1.0)
+        return self.state == "running"
 
     def stop(self):
-        """Stop the monitor thread and cleanup."""
-        if not self._running:
-            return
-        self._running = False
-        # Post quit message to the thread's message loop
+        """Stop the monitor thread and cleanup deterministically."""
+        with self._state_lock:
+            if self._state == "stopped":
+                return
+            self._state = "stopping"
         if self._thread_id:
-            ctypes.windll.user32.PostThreadMessageW(self._thread_id, WM_APP_QUIT, 0, 0)
-        if self._thread:
-            self._thread.join(timeout=3)
-            self._thread = None
+            self._user32.PostThreadMessageW(self._thread_id, WM_APP_QUIT, 0, 0)
+        thread = self._thread
+        if thread:
+            thread.join(timeout=3)
+        self._thread = None
+        if self.state != "stopped":
+            self._set_state("stopped")
 
     def _run_message_loop(self):
         """Run Win32 message loop in a dedicated thread."""
-        self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-
-        # Create the window procedure callback
-        # IMPORTANT: Store reference to prevent garbage collection
-        self._wndproc_ref = WNDPROC(self._wndproc)
-
-        # Register window class
         class_name = "AdvClipboardMonitor"
-        hinstance = kernel32.GetModuleHandleW(None)
+        class_registered = False
+        listener_registered = False
+        hotkey_registered = False
+        hinstance = None
+        try:
+            self._thread_id = self._kernel32.GetCurrentThreadId()
+            self._wndproc_ref = WNDPROC(self._wndproc)
+            hinstance = self._kernel32.GetModuleHandleW(None)
 
-        wc = WNDCLASSEX()
-        wc.cbSize = ctypes.sizeof(WNDCLASSEX)
-        wc.style = 0
-        wc.lpfnWndProc = self._wndproc_ref
-        wc.cbClsExtra = 0
-        wc.cbWndExtra = 0
-        wc.hInstance = hinstance
-        wc.hIcon = None
-        wc.hCursor = None
-        wc.hbrBackground = None
-        wc.lpszMenuName = None
-        wc.lpszClassName = class_name
-        wc.hIconSm = None
+            wc = WNDCLASSEX()
+            wc.cbSize = ctypes.sizeof(WNDCLASSEX)
+            wc.style = 0
+            wc.lpfnWndProc = self._wndproc_ref
+            wc.cbClsExtra = 0
+            wc.cbWndExtra = 0
+            wc.hInstance = hinstance
+            wc.hIcon = None
+            wc.hCursor = None
+            wc.hbrBackground = None
+            wc.lpszMenuName = None
+            wc.lpszClassName = class_name
+            wc.hIconSm = None
 
-        atom = user32.RegisterClassExW(ctypes.byref(wc))
-        if not atom:
-            print(f"[Win32Monitor] RegisterClassExW failed: {kernel32.GetLastError()}")
-            return
+            if not self._user32.RegisterClassExW(ctypes.byref(wc)):
+                logger.error(
+                    "win32_register_class_failed error=%s", self._kernel32.GetLastError()
+                )
+                return
+            class_registered = True
 
-        # Create message-only window (parent = HWND_MESSAGE)
-        self._hwnd = user32.CreateWindowExW(
-            0,  # dwExStyle
-            class_name,  # lpClassName
-            "ClipMonitor",  # lpWindowName
-            0,  # dwStyle
-            0,
-            0,
-            0,
-            0,  # x, y, w, h
-            HWND_MESSAGE,  # hWndParent = message-only
-            None,  # hMenu
-            hinstance,  # hInstance
-            None,  # lpParam
-        )
-
-        if not self._hwnd:
-            print(f"[Win32Monitor] CreateWindowExW failed: {kernel32.GetLastError()}")
-            user32.UnregisterClassW(class_name, hinstance)
-            return
-
-        # Register clipboard format listener
-        if not user32.AddClipboardFormatListener(self._hwnd):
-            print(
-                f"[Win32Monitor] AddClipboardFormatListener failed: {kernel32.GetLastError()}"
+            self._hwnd = self._user32.CreateWindowExW(
+                0,
+                class_name,
+                "ClipMonitor",
+                0,
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                None,
+                hinstance,
+                None,
             )
+            if not self._hwnd:
+                logger.error(
+                    "win32_create_window_failed error=%s", self._kernel32.GetLastError()
+                )
+                return
 
-        # Register hotkey: Ctrl+Alt+V (ID=1)
-        if not user32.RegisterHotKey(
-            self._hwnd, HOTKEY_TOGGLE, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_V
-        ):
-            print(
-                f"[Win32Monitor] RegisterHotKey Ctrl+Alt+V failed: {kernel32.GetLastError()}"
+            listener_registered = bool(
+                self._user32.AddClipboardFormatListener(self._hwnd)
             )
+            if not listener_registered:
+                logger.error(
+                    "win32_clipboard_listener_failed error=%s",
+                    self._kernel32.GetLastError(),
+                )
 
-        print("[Win32Monitor] Started — listening for clipboard & hotkeys")
+            hotkey_registered = bool(
+                self._user32.RegisterHotKey(
+                    self._hwnd,
+                    HOTKEY_TOGGLE,
+                    MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
+                    VK_V,
+                )
+            )
+            if not hotkey_registered:
+                logger.error(
+                    "win32_register_hotkey_failed error=%s",
+                    self._kernel32.GetLastError(),
+                )
 
-        # Message loop
-        msg = ctypes.wintypes.MSG()
-        while self._running:
-            ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-            if ret == 0 or ret == -1:
-                break
-            if msg.message == WM_APP_QUIT:
-                break
-            user32.TranslateMessage(ctypes.byref(msg))
-            user32.DispatchMessageW(ctypes.byref(msg))
-
-        # Cleanup
-        if self._hwnd:
-            user32.RemoveClipboardFormatListener(self._hwnd)
-            user32.UnregisterHotKey(self._hwnd, HOTKEY_TOGGLE)
-            user32.DestroyWindow(self._hwnd)
-            self._hwnd = None
-        user32.UnregisterClassW(class_name, hinstance)
-
-        print("[Win32Monitor] Stopped")
+            self._set_state("running")
+            self._ready.set()
+            msg = ctypes.wintypes.MSG()
+            while self.state == "running":
+                ret = self._user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if ret <= 0 or msg.message == WM_APP_QUIT:
+                    break
+                self._user32.TranslateMessage(ctypes.byref(msg))
+                self._user32.DispatchMessageW(ctypes.byref(msg))
+        finally:
+            self._ready.set()
+            if hotkey_registered and self._hwnd:
+                self._user32.UnregisterHotKey(self._hwnd, HOTKEY_TOGGLE)
+            if listener_registered and self._hwnd:
+                self._user32.RemoveClipboardFormatListener(self._hwnd)
+            if self._hwnd:
+                self._user32.DestroyWindow(self._hwnd)
+                self._hwnd = None
+            if class_registered:
+                self._user32.UnregisterClassW(class_name, hinstance)
+            self._thread_id = None
+            self._set_state("stopped")
 
     def _wndproc(self, hwnd, msg, wparam, lparam):
         """Window procedure for the hidden message window."""
-        user32 = ctypes.windll.user32
-
-        if msg == WM_CLIPBOARDUPDATE:
-            # Emit signal — Qt handles thread-safety for queued connections
-            self.clipboard_changed.emit()
-            return 0
-
-        elif msg == WM_HOTKEY:
-            hotkey_id = wparam
-            if hotkey_id == HOTKEY_TOGGLE:
+        try:
+            if msg == WM_CLIPBOARDUPDATE:
+                self._emit_clipboard_changed()
+                return 0
+            if msg == WM_HOTKEY and wparam == HOTKEY_TOGGLE:
                 self.hotkey_toggle.emit()
                 return 0
+            if msg == WM_DESTROY:
+                return 0
+        except BaseException:
+            logger.exception("win32_window_callback_failed message=%s", msg)
+        return self._user32.DefWindowProcW(hwnd, msg, wparam, _coerce_lparam(lparam))
 
-        elif msg == WM_DESTROY:
-            return 0
-
-        return user32.DefWindowProcW(hwnd, msg, wparam, _coerce_lparam(lparam))
+    def _emit_clipboard_changed(self):
+        self.clipboard_changed.emit()
 
 
 class KEYBDINPUT(ctypes.Structure):
@@ -314,8 +304,6 @@ def simulate_paste():
     down before V is pressed.
     """
     import time
-
-    user32 = ctypes.windll.user32
 
     # Clear the opener hotkey state first. Ctrl+Alt+V may still be physically
     # transitioning when the user clicks a clip, so release modifiers explicitly.

@@ -7,9 +7,7 @@ from PyQt6.QtGui import QFontMetrics, QPixmap
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
-    QMenu,
     QPlainTextEdit,
     QPushButton,
     QSizePolicy,
@@ -17,6 +15,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .clip_context_menu import show_clip_context_menu
 from .widgets import (
     CLIP_TEXT_BOTTOM_PADDING,
     COLLAPSED_MAX_LINES,
@@ -35,12 +34,14 @@ ROW_MARGIN_LEFT = 8
 ROW_GROUP_INDENT = 14
 ROW_MARGIN_RIGHT = 2
 ROW_SPACING = 4
+ROW_FRAME_INSET_X = 2
 META_COLUMN_WIDTH = 36
 ACTION_COLUMN_WIDTH = 32
 ACTION_BUTTON_HEIGHT = 22
 ACTION_BUTTON_SPACING = 4
 TEXT_MAX_WIDTH = 520
 TEXT_MIN_WIDTH = 120
+EXPANDED_MIN_VISIBLE_LINES = 6
 TAG_SPACING = 4
 
 
@@ -81,7 +82,9 @@ class ClipRowMetrics:
         tag_text = item_data.get("tag", "")
         group_name = item_data.get("group_name", "")
         badge_text = tag_text or (f"[{group_name}]" if group_name and not state.is_grouped else "")
-        tag_height = measure_tag_height(badge_text, content_width) if badge_text else 0
+        # Tag sits below action buttons (bottom-right), add to actions column
+        if badge_text:
+            actions_height += QFontMetrics(TAG_FONT).height() + 4 + ACTION_BUTTON_SPACING
 
         if item_data.get("type") == "text":
             text = item_data.get("content", "")
@@ -90,11 +93,17 @@ class ClipRowMetrics:
                 display_text = text[:MAX_DISPLAY_CHARS] + "..."
             max_lines = EXPANDED_MAX_LINES if state.expanded else COLLAPSED_MAX_LINES
             rendered_lines, text_height = measure_visible_text(display_text, content_width, max_lines)
-            content_height = text_height + tag_height + (TAG_SPACING if tag_height else 0)
+            if state.expanded:
+                line_spacing = QFontMetrics(TEXT_FONT).lineSpacing()
+                min_text_height = (
+                    EXPANDED_MIN_VISIBLE_LINES * line_spacing
+                ) + CLIP_TEXT_BOTTOM_PADDING + 2
+                text_height = max(text_height, min_text_height)
+            content_height = text_height
         else:
             rendered_lines = 1
             text_height = THUMB_SIZE.height()
-            content_height = THUMB_SIZE.height() + tag_height + (TAG_SPACING if tag_height else 0)
+            content_height = THUMB_SIZE.height()
 
         line_height = QFontMetrics(TAG_FONT).height() + 4
         expand_height = 16 if item_data.get("type") == "text" else 0
@@ -156,14 +165,14 @@ class ClipContentView(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        self.setMinimumWidth(0)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setFixedWidth(metrics.content_width)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
         if item_data.get("type") == "text":
             self.lbl_content = self._build_text_content()
         else:
             self.lbl_content = self._build_image_content()
-        layout.addWidget(self.lbl_content, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self.lbl_content, 0, Qt.AlignmentFlag.AlignTop)
         self.lbl_tag = self._build_tag()
         if self.lbl_tag is not None:
             layout.addSpacing(TAG_SPACING)
@@ -176,26 +185,30 @@ class ClipContentView(QWidget):
         if not self.state.expanded and len(text) > MAX_DISPLAY_CHARS:
             display_text = text[:MAX_DISPLAY_CHARS] + "..."
 
-        if self.state.expanded and self.metrics.rendered_lines > EXPANDED_MAX_LINES:
+        if self.state.expanded:
             label = QPlainTextEdit(self)
             label.setPlainText(display_text)
             label.setReadOnly(True)
             label.setFrameStyle(QFrame.Shape.NoFrame)
+            label.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+            label.document().setDocumentMargin(0)
             label.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
             label.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             label.setStyleSheet(
-                "QPlainTextEdit { color: #e0e0e0; background: transparent; padding: 0px; }"
+                "QPlainTextEdit { color: #e0e0e0; background: #1f1f1f; padding: 0px; }"
+                "QPlainTextEdit::viewport { background: #1f1f1f; }"
             )
+            label.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            label.viewport().setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         else:
             label = QLabel(display_text, self)
             label.setWordWrap(True)
             label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
             label.setStyleSheet("color: #e0e0e0; background: transparent;")
         label.setFont(TEXT_FONT)
-        label.setMinimumWidth(0)
-        label.setMaximumWidth(self.metrics.content_width)
-        label.setMinimumHeight(self.metrics.text_height)
-        label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        label.setFixedWidth(self.metrics.content_width)
+        label.setFixedHeight(self.metrics.text_height)
+        label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         return label
 
     def _build_image_content(self):
@@ -274,8 +287,9 @@ class ClipMetaColumn(QWidget):
         self.lbl_line_count.setToolTip("So dong")
         self.lbl_line_count.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_line_count.setStyleSheet(
-            "QLabel { color: #e6c36a; background: transparent; font-size: 8pt; font-weight: 600; }"
+            "QLabel { color: #e6c36a; background: #1f1f1f; font-size: 8pt; font-weight: 600; }"
         )
+        self.lbl_line_count.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout.addWidget(self.lbl_line_count)
 
         self.btn_expand = None
@@ -453,70 +467,10 @@ class ClipRowWidget(QWidget):
             self.parent_list.handle_delete(self.clip_id)
 
     def contextMenuEvent(self, event):
-        menu = QMenu(self)
-        menu.setStyleSheet(
-            """
-            QMenu { background-color: #2d2d2d; color: #eee; border: 1px solid #444; }
-            QMenu::item:selected { background-color: #d18616; color: white; }
-            """
+        show_clip_context_menu(
+            self,
+            self.item_data,
+            self.is_pinned,
+            self.parent_list,
+            self.mapToGlobal(event.pos()),
         )
-
-        group_menu = menu.addMenu("Add to Group")
-        if self.parent_list:
-            groups = self.parent_list.storage.get_groups()
-            for group in groups:
-                action = group_menu.addAction(group)
-                action.setData(("group", group))
-            if groups:
-                group_menu.addSeparator()
-            new_group_action = group_menu.addAction("New Group...")
-            new_group_action.setData(("new_group", None))
-            current_group = self.item_data.get("group_name", "")
-            if current_group:
-                remove_action = menu.addAction(f"Remove from '{current_group}'")
-                remove_action.setData(("remove_group", None))
-            menu.addSeparator()
-        add_tag_action = menu.addAction("Add Tag")
-        add_tag_action.setData(("tag", None))
-        if self.is_pinned and self.item_data.get("type") == "text":
-            fix_action = menu.addAction("Fix")
-            fix_action.setData(("fix", None))
-
-        action = menu.exec(self.mapToGlobal(event.pos()))
-        if not action or not action.data():
-            return
-        action_type, value = action.data()
-        if action_type == "tag":
-            self.on_add_tag()
-        elif action_type == "group":
-            self.on_set_group(value)
-        elif action_type == "new_group":
-            self.on_new_group()
-        elif action_type == "remove_group":
-            self.on_set_group("")
-        elif action_type == "fix":
-            self.on_fix_clip()
-
-    def on_add_tag(self):
-        current_tag = self.item_data.get("tag", "")
-        tag, ok = QInputDialog.getText(self, "Add Tag", "Enter tag name:", text=current_tag)
-        if ok and self.clip_id and self.parent_list:
-            self.parent_list.handle_add_tag(self.clip_id, tag)
-
-    def on_set_group(self, group_name):
-        if self.clip_id and self.parent_list:
-            self.parent_list.handle_set_group(self.clip_id, group_name)
-
-    def on_new_group(self):
-        group_name, ok = QInputDialog.getText(self, "New Group", "Enter group name:")
-        if ok and group_name.strip() and self.clip_id and self.parent_list:
-            self.parent_list.handle_set_group(self.clip_id, group_name.strip())
-
-    def on_fix_clip(self):
-        if not self.parent_list or not self.clip_id:
-            return
-        from .widgets import ClipEditPopup
-
-        self.edit_popup = ClipEditPopup(self.item_data, self.parent_list, self)
-        self.edit_popup.move(self.mapToGlobal(QPoint(10, 10)))
-        self.edit_popup.show()

@@ -1,6 +1,5 @@
 import os
 import sys
-import types
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -9,89 +8,9 @@ sys.path.insert(0, ROOT_DIR)
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-sys.modules.setdefault("neural.engine", MagicMock())
-sys.modules.setdefault("neural.ui", MagicMock())
-sys.modules.setdefault("neural.bridge", MagicMock())
-sys.modules.setdefault("PyQt6.QtWebEngineWidgets", MagicMock())
-sys.modules.setdefault("PyQt6.QtWebChannel", MagicMock())
 sys.modules.setdefault("core.clipboard_monitor", MagicMock())
 
-_neural_engine_mod = types.ModuleType("neural.engine")
 
-
-class _StubEngine:
-    name = "NeuralEngine"
-
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-
-_neural_engine_mod.NeuralEngine = _StubEngine
-sys.modules["neural.engine"] = _neural_engine_mod
-
-_neural_ui_mod = types.ModuleType("neural.ui")
-
-
-class _StubSidecar:
-    def __init__(self, *args, **kwargs):
-        self.bridge = MagicMock()
-        self.bridge.node_clicked = MagicMock()
-        self.bridge.node_clicked.connect = MagicMock()
-        self.search_bar = MagicMock()
-        self.search_bar.textChanged = MagicMock()
-        self.search_bar.textChanged.connect = MagicMock()
-
-    def show(self):
-        pass
-
-    def hide(self):
-        pass
-
-    def close(self):
-        pass
-
-    def move(self, *args):
-        pass
-
-    def resize(self, *args):
-        pass
-
-    def setGeometry(self, *args):
-        pass
-
-    def setWindowTitle(self, *args):
-        pass
-
-    def update_data(self, *args):
-        pass
-
-    def focus_node(self, *args):
-        pass
-
-    def focus_query(self, *args):
-        pass
-
-    def reload_config(self, *args):
-        pass
-
-    def grab(self):
-        return MagicMock()
-
-    def isVisible(self):
-        return False
-
-    def isActiveWindow(self):
-        return False
-
-
-_neural_ui_mod.SidecarWindow = _StubSidecar
-sys.modules["neural.ui"] = _neural_ui_mod
 
 with patch("ctypes.WINFUNCTYPE", create=True, new=MagicMock()), \
     patch("ctypes.windll", create=True, new=MagicMock()):
@@ -123,6 +42,7 @@ class _StubStorage:
     def __init__(self, clips):
         self.clips = {clip["id"]: dict(clip) for clip in clips}
         self.need_backup = False
+        self.add_clip_calls = []
 
     def is_db_valid(self):
         return True
@@ -130,14 +50,9 @@ class _StubStorage:
     def get_clip_count(self):
         return len(self.clips)
 
-    def trigger_daily_rebuild(self):
-        pass
 
     def set_backup_callback(self, callback):
         self.backup_callback = callback
-
-    def set_neural_event_callback(self, callback):
-        self.neural_callback = callback
 
     def clear_backup_flag(self):
         self.need_backup = False
@@ -149,6 +64,13 @@ class _StubStorage:
     def get_clip_by_id(self, clip_id):
         clip = self.clips.get(clip_id)
         return dict(clip) if clip else None
+
+    def add_clip(self, clip_type, content, tag=""):
+        self.add_clip_calls.append((clip_type, content, tag))
+        for clip in self.clips.values():
+            if clip.get("content") == content:
+                return clip["id"], False
+        raise AssertionError(f"missing stub clip for content: {content}")
 
     def search_history(self, query):
         return []
@@ -204,6 +126,7 @@ class CopyPastePromotionTests(unittest.TestCase):
 
         self.assertEqual([2, 1], self._history_ids(app))
         self.assertEqual(0, app.list_history.currentRow())
+        self.assertEqual([("text", "newer", "")], self.storage.add_clip_calls)
 
     def test_paste_schedules_promotion_after_paste_request(self):
         app = self._make_app()
@@ -211,6 +134,14 @@ class CopyPastePromotionTests(unittest.TestCase):
 
         def fake_prepare(data, attempt_index):
             events.append(("prepare", data["id"], attempt_index))
+
+        original_add_clip = self.storage.add_clip
+
+        def fake_add_clip(clip_type, content, tag=""):
+            events.append(("persist", content))
+            return original_add_clip(clip_type, content, tag)
+
+        self.storage.add_clip = fake_add_clip
 
         def fake_timer(delay, callback):
             events.append(("timer", delay))
@@ -225,9 +156,10 @@ class CopyPastePromotionTests(unittest.TestCase):
             app.handle_paste({"id": 2, "type": "text", "content": "newer"})
 
         self.assertEqual(
-            [("prepare", 2, 0), ("timer", 0), ("promote", 2)],
+            [("prepare", 2, 0), ("persist", "newer"), ("timer", 0), ("promote", 2)],
             events,
         )
+        self.assertEqual([("text", "newer", "")], self.storage.add_clip_calls)
 
     def test_pinned_image_paste_defers_history_promotion_until_after_paste(self):
         app = self._make_app(
@@ -241,6 +173,26 @@ class CopyPastePromotionTests(unittest.TestCase):
             app.handle_paste({"id": 9, "type": "image", "content": "missing-test-image.png", "is_pinned": 1})
 
         self.assertEqual([("prepare", 9, 0), ("dirty", 9)], events)
+        self.assertEqual([("image", "missing-test-image.png", "")], self.storage.add_clip_calls)
+
+    def test_pinned_image_copy_persists_recency_before_hidden_refresh(self):
+        app = self._make_app(
+            clips=[{"id": 9, "type": "image", "content": "missing-test-image.png", "is_pinned": 1}]
+        )
+        events = []
+        original_add_clip = self.storage.add_clip
+
+        def fake_add_clip(clip_type, content, tag=""):
+            events.append(("persist", content))
+            return original_add_clip(clip_type, content, tag)
+
+        self.storage.add_clip = fake_add_clip
+        with patch("main.os.path.exists", return_value=False), \
+            patch.object(app, "_schedule_hidden_ui_refresh", side_effect=lambda clip_id: events.append(("dirty", clip_id))):
+            app.handle_copy_only({"id": 9, "type": "image", "content": "missing-test-image.png", "is_pinned": 1})
+
+        self.assertEqual([("persist", "missing-test-image.png"), ("dirty", 9)], events)
+        self.assertEqual([("image", "missing-test-image.png", "")], self.storage.add_clip_calls)
 
     def test_image_clipboard_write_does_not_hash_roundtrip_image_data(self):
         app = self._make_app()
@@ -256,9 +208,9 @@ class CopyPastePromotionTests(unittest.TestCase):
                 return _FakeMime()
 
         app.clipboard = _FakeClipboard()
+        self.assertFalse(hasattr(app, "_image_storage_name"))
         with patch("main.os.path.exists", return_value=True), \
-            patch("main.QPixmap") as pixmap_cls, \
-            patch.object(app, "_image_storage_name", side_effect=AssertionError("image hash verification should not run")):
+            patch("main.QPixmap") as pixmap_cls:
             pixmap_cls.return_value.isNull.return_value = False
             self.assertTrue(app._write_clipboard_payload({"id": 10, "type": "image", "content": "fake.png"}))
 
@@ -273,8 +225,8 @@ class CopyPastePromotionTests(unittest.TestCase):
                 return False
 
         app._set_pending_clipboard_guard({"id": 11, "type": "image", "content": "fake.png"})
-        with patch.object(app, "_image_storage_name", side_effect=AssertionError("image guard hash should not run")):
-            self.assertTrue(app._should_ignore_clipboard_update(_FakeMime()))
+        self.assertFalse(hasattr(app, "_image_storage_name"))
+        self.assertTrue(app._should_ignore_clipboard_update(_FakeMime()))
 
     def test_hidden_promotion_marks_ui_dirty_for_next_show(self):
         app = self._make_app()

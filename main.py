@@ -1,22 +1,11 @@
-# Disable HF Hub warnings globally before any imports
-import os
-
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-os.environ["HF_HUB_OFFLINE"] = "0"
-os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
-
 # /// script
 # requires-python = ">=3.11,<3.14"
 # dependencies = [
 #     "PyQt6",
-#     "PyQt6-WebEngine",
-#     "sentence-transformers",
-#     "numpy",
 # ]
 # ///
+import os
 import sys
-import hashlib
 import ctypes
 import ctypes.wintypes
 import atexit
@@ -25,7 +14,7 @@ import logging
 import threading
 import time
 import traceback
-import argparse
+
 from PyQt6.QtWidgets import (
     QApplication,
     QWidget,
@@ -41,12 +30,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import (
     Qt,
     QTimer,
-    pyqtSignal,
-    QSize,
+
     QEvent,
-    QByteArray,
-    QBuffer,
-    QIODevice,
 )
 from PyQt6.QtGui import (
     QCursor,
@@ -64,31 +49,28 @@ from core.clipboard_monitor import (
     VK_MENU,
     simulate_paste,
 )
+from core.single_instance import SingleInstanceCoordinator
+from core.clipboard_ingest import CaptureJob, ClipboardIngestBridge, ClipboardIngestProcessor
 
 # Import storage and backup modules
-from storage import get_neural_support_error, get_storage
+from storage import get_storage
 from storage.backup import (
-    create_backup,
+    create_backup_in_subprocess,
+    cleanup_stale_temp_backups,
     find_valid_backup,
     import_legacy_json,
     BackupScheduler,
 )
 from ui.widgets import (
-    SmoothListWidget,
-    LineInfoPopup,
     SearchLineEdit,
-    GroupHeaderWidget,
-    ClipItemWidget,
     PAGE_SIZE_HISTORY,
     PAGE_SIZE_PINNED,
 )
+from ui.clip_list_view import ClipListView
+from ui.clip_models import HistoryListModel, PinnedListModel
 from ui.clipboard_browser_controller import ClipboardBrowserController
 
-# Neural modules are imported only after the user explicitly opens Neural Map.
-HAS_NEURAL_SUPPORT = True
-NEURAL_SUPPORT_ERROR = None
-NeuralEngine = None
-SidecarWindow = None
+
 
 
 # --- Cấu hình ---
@@ -151,20 +133,20 @@ threading.excepthook = _log_thread_exception
 
 
 class ClientApp(QWidget):
-    _neural_graph_loaded = pyqtSignal(int, list, list)
-    _neural_graph_failed = pyqtSignal(int, str)
+
 
     def __init__(self, *, enable_monitor: bool = True, init_data: bool = True):
         super().__init__()
         # SQLite storage - single source of truth
         self.storage = get_storage()
-        storage_neural_error = get_neural_support_error()
-        if storage_neural_error is not None:
-            global HAS_NEURAL_SUPPORT, NEURAL_SUPPORT_ERROR
-            HAS_NEURAL_SUPPORT = False
-            NEURAL_SUPPORT_ERROR = (
-                f"Neural support unavailable: {storage_neural_error}"
-            )
+        self.ingest_processor = ClipboardIngestProcessor(self.storage, image_dir=IMAGE_DIR)
+        self.ingest_bridge = ClipboardIngestBridge(self.ingest_processor)
+        self.ingest_bridge.completed.connect(
+            self._on_clipboard_ingest_completed, Qt.ConnectionType.QueuedConnection
+        )
+        self.ingest_bridge.rejected.connect(
+            self._on_clipboard_ingest_rejected, Qt.ConnectionType.QueuedConnection
+        )
 
         # UI state
         self.pending_clipboard_guard = None
@@ -177,52 +159,39 @@ class ClientApp(QWidget):
         self._ui_opening_until = 0.0
         self._paste_in_progress = False
         self._last_clipboard_capture_at = 0.0
+        self._last_ingested_clipboard_key = None
+        self._last_ingested_clipboard_at = 0.0
+        self._pending_clipboard_keys = set()
+        self._clipboard_capture_timer = QTimer(self)
+        self._clipboard_capture_timer.setSingleShot(True)
+        self._clipboard_capture_timer.setInterval(35)
+        self._clipboard_capture_timer.timeout.connect(
+            lambda: self._process_clipboard_data_retry(0)
+        )
         self._hidden_refresh_timer = QTimer(self)
         self._hidden_refresh_timer.setSingleShot(True)
         self._hidden_refresh_timer.timeout.connect(self._refresh_hidden_ui_cache)
+        self._pending_delete_clip_ids = set()
+        self._delete_flush_timer = QTimer(self)
+        self._delete_flush_timer.setSingleShot(True)
+        self._delete_flush_timer.timeout.connect(self._flush_pending_deletes)
 
         # Browser Controller (Search, Nav, Pagination)
         self.browser = ClipboardBrowserController(self)
 
-        # Neural Memory state
-        self.neural_enabled = False
-        self._neural_engine_started = False
-        self._neural_map_loading = False
-        self._neural_map_state = "not_started"
-        self._neural_load_request_id = 0
-        self._galaxy_loaded = False  # True after first full galaxy load into sidecar
 
-        # Prevent PyTorch from taking over all threads to avoid lagging the host UI and system
-        os.environ["OMP_NUM_THREADS"] = "1"
-        os.environ["MKL_NUM_THREADS"] = "1"
-        os.environ["OPENBLAS_NUM_THREADS"] = "1"
-        os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-        os.environ["NUMEXPR_NUM_THREADS"] = "1"
-
-        self.neural_engine = None
-        self.sidecar = None
-        self._neural_graph_loaded.connect(self._on_neural_graph_loaded)
-        self._neural_graph_failed.connect(self._on_neural_graph_failed)
 
         # Init UI
         self.initUI()
-        if storage_neural_error is not None and NEURAL_SUPPORT_ERROR:
-            self._set_neural_unavailable(NEURAL_SUPPORT_ERROR)
 
-        self.neural_status_timer = QTimer(self)
-        self.neural_status_timer.timeout.connect(self._refresh_neural_status)
-        self.neural_status_timer.start(5000)
 
         # Load data with disaster recovery
         if init_data:
+            cleanup_stale_temp_backups()
             self._init_data()
             self.is_ui_dirty = False
 
-        # Trigger daily RAG index rebuild in background (non-blocking)
-        # If already rebuilt today, skips instantly. Otherwise builds in ~10s background.
-        # Search works immediately with lexical-only fallback while index builds.
-        if os.getenv("ADV_CLIP_DISABLE_RAG_REBUILD") != "1":
-            self.storage.trigger_daily_rebuild()
+
 
         # Qt clipboard object — used to READ clipboard content only
         self.clipboard = QApplication.clipboard()
@@ -245,7 +214,7 @@ class ClientApp(QWidget):
         # Backup scheduling (30s debounce)
         self.backup_scheduler = BackupScheduler(self._perform_backup)
         self.storage.set_backup_callback(self.backup_scheduler.schedule)
-        self.storage.set_neural_event_callback(self._on_neural_storage_event)
+
 
         # Register cleanup on exit
         atexit.register(self._cleanup_on_exit)
@@ -278,27 +247,23 @@ class ClientApp(QWidget):
         self.refresh_lists()
 
     def _perform_backup(self):
-        """Create backup from current SQLite data."""
-        clips = self.storage.get_all_clips()
-        create_backup(clips)
-        self.storage.clear_backup_flag()
+        """Create backup outside the UI process to avoid GIL stalls."""
+        if create_backup_in_subprocess():
+            self.storage.clear_backup_flag()
 
-    def _on_neural_storage_event(self, event_type, clip_id):
-        if not getattr(self, "neural_engine", None):
-            return
-        if event_type == "new_clip":
-            self.neural_engine.enqueue_new_clip(clip_id)
-        elif event_type == "pin_state_changed":
-            self.neural_engine.enqueue_priority_reindex(clip_id)
 
     def _cleanup_on_exit(self):
         """Cleanup when app exits."""
         logger.info("cleanup_on_exit storage_need_backup=%s", self.storage.need_backup)
+        if getattr(self, "browser", None):
+            self.browser.shutdown_search()
         # Stop Win32 monitor thread
         if getattr(self, "win32_monitor", None):
             monitor = self.win32_monitor
             if monitor is not None:
                 monitor.stop()
+        if getattr(self, "ingest_bridge", None):
+            self.ingest_bridge.stop()
         # Force immediate backup if needed
         if self.storage.need_backup:
             self.backup_scheduler.force_now()
@@ -314,9 +279,9 @@ class ClientApp(QWidget):
         self.setStyleSheet("""
             QWidget { background-color: #1e1e1e; color: #f0f0f0; font-family: 'Segoe UI', sans-serif; border-radius: 8px; }
             QLabel { font-weight: bold; color: #888; margin: 5px 0; }
-            QListWidget { background-color: #202020; border: 1px solid #3a3a3a; border-radius: 6px; outline: none; padding: 6px; }
-            QListWidget::item { border-bottom: 1px solid #303030; margin: 3px 0px; }
-            QListWidget::item:selected { background-color: #303840; border: 1px solid #3daee9; border-radius: 4px; }
+            QListView { background-color: #202020; border: 1px solid #3a3a3a; border-radius: 6px; outline: none; padding: 6px; }
+            QListView::item { border-bottom: 1px solid #303030; margin: 3px 0px; }
+            QListView::item:selected { background-color: transparent; }
             QScrollBar:vertical { border: none; background: #1f1f1f; width: 8px; margin: 4px 0px 4px 0px; }
             QScrollBar::handle:vertical { background: #555; min-height: 24px; border-radius: 4px; }
             QScrollBar::handle:vertical:hover { background: #666; }
@@ -361,45 +326,7 @@ class ClientApp(QWidget):
         )
         search_row.addWidget(self.search_input, stretch=1)
 
-        # Neural Toggle
-        self.btn_neural = QPushButton("Neural")
-        self.btn_neural.setCheckable(True)
-        self.btn_neural.setFixedSize(60, 24)
-        self.btn_neural.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_neural.setStyleSheet("""
-            QPushButton { 
-                background: #001100; border: 1px solid #00ff41; 
-                color: #00ff41; font-size: 8pt; font-weight: bold; border-radius: 3px;\
-            }
-            QPushButton:checked { background: #00ff41; color: #000; }
-            QPushButton:hover { background: #003300; }
-            QPushButton:disabled { background: #222; border-color: #555; color: #555; }
-        """)
-        self.btn_neural.setCheckable(False)
-        self.btn_neural.clicked.connect(self._show_neural_floating)
-        if not HAS_NEURAL_SUPPORT:
-            self.btn_neural.setEnabled(False)
-            self.btn_neural.setToolTip(
-                "Neural support requires PyQt6-WebEngine and sentence-transformers"
-            )
-        search_row.addWidget(self.btn_neural)
 
-        self.chk_map = QPushButton("Map OFF")
-        self.chk_map.setCheckable(True)
-        self.chk_map.setFixedSize(70, 24)
-        self.chk_map.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.chk_map.setStyleSheet("""
-            QPushButton {
-                background: #222; border: 1px solid #555;
-                color: #aaa; font-size: 8pt; border-radius: 3px;
-            }
-            QPushButton:checked {
-                background: #00ff41; border: 1px solid #00ff41; color: #000;
-            }
-        """)
-        self.chk_map.toggled.connect(self._toggle_neural)
-        self.chk_map.setEnabled(HAS_NEURAL_SUPPORT)
-        search_row.addWidget(self.chk_map)
 
         btn_clear_p = QPushButton("✕")
         btn_clear_p.setFixedSize(24, 20)
@@ -419,7 +346,7 @@ class ClientApp(QWidget):
 
         # HISTORY column
         col_h = QVBoxLayout()
-        self.list_history = SmoothListWidget()
+        self.list_history = ClipListView(HistoryListModel(self))
         # Keep focus on the search input for keyboard navigation
         self.list_history.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.list_history.setVerticalScrollMode(
@@ -428,13 +355,17 @@ class ClientApp(QWidget):
         self.list_history.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        self.list_history.setResizeMode(SmoothListWidget.ResizeMode.Adjust)
         self.list_history.itemClicked.connect(self.on_item_clicked)
+        self.list_history.rowActivated.connect(self.handle_paste)
+        self.list_history.copyRequested.connect(self.handle_copy_only)
+        self.list_history.pinToggleRequested.connect(self.handle_star)
+        self.list_history.deleteRequested.connect(self.handle_delete)
+        self.list_history.expandToggleRequested.connect(self.handle_toggle_expand)
         col_h.addWidget(self.list_history)
 
         # PINNED column
         col_p = QVBoxLayout()
-        self.list_pinned = SmoothListWidget()
+        self.list_pinned = ClipListView(PinnedListModel(self))
         # Keep focus on the search input for keyboard navigation
         self.list_pinned.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.list_pinned.setVerticalScrollMode(
@@ -443,8 +374,17 @@ class ClientApp(QWidget):
         self.list_pinned.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        self.list_pinned.setResizeMode(SmoothListWidget.ResizeMode.Adjust)
         self.list_pinned.itemClicked.connect(self.on_item_clicked)
+        self.list_pinned.rowActivated.connect(self.handle_paste)
+        self.list_pinned.copyRequested.connect(self.handle_copy_only)
+        self.list_pinned.pinToggleRequested.connect(self.handle_star)
+        self.list_pinned.deleteRequested.connect(self.handle_delete)
+        self.list_pinned.expandToggleRequested.connect(self.handle_toggle_expand)
+        self.list_pinned.groupToggleRequested.connect(
+            lambda group, expanded: self.expand_group(group)
+            if expanded
+            else self.collapse_group(group)
+        )
         col_p.addWidget(self.list_pinned)
 
         # Connect scroll for pagination
@@ -518,21 +458,18 @@ class ClientApp(QWidget):
         self.browser.refresh_pinned_list()
 
     def toggle_visibility(self):
-        print(
-            f"[MainUI] toggle_visibility: visible={self.isVisible()}, map_checked={self.chk_map.isChecked()}"
-        )
+        print(f"[MainUI] toggle_visibility: visible={self.isVisible()}")
         if self.isVisible():
             self.hide()
-            if (
-                hasattr(self, "sidecar")
-                and self.sidecar
-                and getattr(self.sidecar, "_docked_mode", False)
-            ):
-                self.sidecar.hide()
         else:
             self.show_at_cursor()
-            if self.sidecar and self.chk_map.isChecked():
-                self._show_map_docked()
+
+    def activate_from_secondary(self):
+        if not self.isVisible():
+            self.show_at_cursor()
+            return
+        self.raise_()
+        self.activateWindow()
 
     def show_at_cursor(self):
         self.input_locked = True
@@ -614,7 +551,7 @@ class ClientApp(QWidget):
         )
 
     def _schedule_hidden_ui_refresh(self, clip_id=None, *, full_refresh=False):
-        # Hot path: never rebuild QListWidget rows while the popup is hidden.
+        # Hot path: never rebuild rendered rows while the popup is hidden.
         # Clipboard events can arrive in bursts; rendering the hidden UI on each
         # event is the main reason the app feels progressively laggier.
         self.is_ui_dirty = True
@@ -637,350 +574,9 @@ class ClientApp(QWidget):
         self.is_ui_dirty = False
 
     def closeEvent(self, event):
-        """Clean up background threads on close."""
-        if getattr(self, "neural_engine", None):
-            self.neural_engine.stop()
-        if hasattr(self, "sidecar") and self.sidecar is not None:
-            self.sidecar.close()
+        """Clean up on close."""
         super().closeEvent(event)
 
-    def _set_neural_unavailable(self, message):
-        global HAS_NEURAL_SUPPORT, NEURAL_SUPPORT_ERROR
-        HAS_NEURAL_SUPPORT = False
-        NEURAL_SUPPORT_ERROR = message
-        if hasattr(self, "btn_neural"):
-            self.btn_neural.setEnabled(False)
-            self.btn_neural.setToolTip(message)
-        if hasattr(self, "chk_map"):
-            self.chk_map.setChecked(False)
-            self.chk_map.setEnabled(False)
-            self.chk_map.setToolTip(message)
-            self.chk_map.setText("Map OFF")
-
-    def _ensure_neural_components_loaded(self):
-        """Import and create Neural objects only after explicit user action."""
-        global NeuralEngine, SidecarWindow
-        if not HAS_NEURAL_SUPPORT:
-            return False
-
-        if NeuralEngine is None or SidecarWindow is None:
-            try:
-                from PyQt6.QtWebEngineWidgets import QWebEngineView  # noqa: F401
-                from neural.engine import NeuralEngine as LoadedNeuralEngine
-                from neural.ui import SidecarWindow as LoadedSidecarWindow
-
-                NeuralEngine = LoadedNeuralEngine
-                SidecarWindow = LoadedSidecarWindow
-            except Exception as exc:
-                message = f"Neural support unavailable: {exc}"
-                print(f"[Neural] Import failed on demand: {exc}", file=sys.stderr)
-                self._set_neural_unavailable(message)
-                return False
-
-        if self.neural_engine is None:
-            self.neural_engine = NeuralEngine(
-                self.storage,
-                os.path.join(os.path.dirname(__file__), "neural", "config.json"),
-            )
-
-        if self.sidecar is None:
-            self.sidecar = SidecarWindow(self.storage, main_window=self)
-            self.sidecar.bridge.node_clicked.connect(self._on_node_clicked)
-            self.sidecar.search_bar.textChanged.connect(
-                self._on_sidecar_search_changed
-            )
-
-        return True
-
-    def _ensure_neural_engine_started(self):
-        """Start the neural engine on first Neural Map use."""
-        if not HAS_NEURAL_SUPPORT:
-            return False
-        if not self._ensure_neural_components_loaded():
-            return False
-        if self._neural_engine_started:
-            return True
-        self.neural_engine.start()
-        self._neural_engine_started = True
-        return True
-
-    def _focus_sidecar_from_search(self):
-        if self.sidecar and self.browser.current_search_query:
-            self.sidecar.focus_query(self.browser.current_search_query)
-
-    def _ensure_galaxy_loaded(self, force=False):
-        """Load graph data into the persistent sidecar once per app session."""
-        if not self._ensure_neural_components_loaded():
-            return
-        if self._neural_map_loading:
-            return
-        if self._galaxy_loaded and not force:
-            self._focus_sidecar_from_search()
-            return
-
-        self._neural_map_loading = True
-        self._neural_map_state = "loading"
-        self._ensure_neural_engine_started()
-        self._neural_load_request_id += 1
-        request_id = self._neural_load_request_id
-        threading.Thread(
-            target=self._load_neural_graph_in_background,
-            args=(request_id,),
-            daemon=True,
-            name="NeuralGraphLoader",
-        ).start()
-
-    def _load_neural_graph_in_background(self, request_id):
-        try:
-            indexed_ids = self.storage.get_all_clip_ids_with_vectors(limit=500)
-            nodes, links = (
-                self.storage.get_neural_data(indexed_ids) if indexed_ids else ([], [])
-            )
-            formatted_links = [
-                {
-                    "source": l["source_id"],
-                    "target": l["target_id"],
-                    "weight": float(l["weight"]),
-                }
-                for l in links
-            ]
-            self._neural_graph_loaded.emit(request_id, nodes, formatted_links)
-        except Exception as exc:
-            self._neural_graph_failed.emit(request_id, str(exc))
-
-    def _on_neural_graph_loaded(self, request_id, nodes, links):
-        if request_id != self._neural_load_request_id or not self.sidecar:
-            return
-        self.sidecar.update_data(nodes, links)
-        self._galaxy_loaded = True
-        self._neural_map_state = "ready"
-        self._neural_map_loading = False
-        self._focus_sidecar_from_search()
-        self._refresh_neural_status()
-        if hasattr(self, "neural_status_timer"):
-            self.neural_status_timer.stop()
-
-    def _on_neural_graph_failed(self, request_id, message):
-        if request_id != self._neural_load_request_id:
-            return
-        self._neural_map_loading = False
-        self._neural_map_state = "error"
-        print(f"[Neural] Graph load failed: {message}", file=sys.stderr)
-
-    def _show_sidecar_fast(self, docked: bool):
-        if not self.sidecar:
-            return
-        self.sidecar._docked_mode = docked
-        self.sidecar.show()
-        self.sidecar.activateWindow()
-        self.sidecar.raise_()
-        self._focus_sidecar_from_search()
-
-    def _show_map_docked(self):
-        """Show the map docked near the main UI without overlapping it."""
-        print(f"[MainUI] _show_map_docked called, sidecar={self.sidecar is not None}")
-        if not self._ensure_neural_components_loaded():
-            return
-        self.sidecar._docked_mode = True
-        geo = self.geometry()
-        map_w = geo.width()
-        map_h = int(geo.height() * 2 / 3)
-
-        screen = QGuiApplication.screenAt(geo.center())
-        if not screen:
-            screen = QGuiApplication.primaryScreen()
-        screen_geo = screen.availableGeometry() if screen else None
-
-        if screen_geo:
-            # Try ABOVE main UI first
-            target_x = geo.x()
-            target_y = geo.y() - map_h
-
-            if target_y < screen_geo.top():
-                # Not enough space above → try BELOW
-                target_y = geo.y() + geo.height()
-
-            if target_y + map_h > screen_geo.bottom():
-                # Not enough space below either → dock to RIGHT, matching height
-                map_w = int(geo.width() * 2 / 3)
-                map_h = geo.height()
-                target_x = geo.x() + geo.width()
-                target_y = geo.y()
-
-                if target_x + map_w > screen_geo.right():
-                    # Not enough space right → dock to LEFT
-                    target_x = geo.x() - map_w
-                    if target_x < screen_geo.left():
-                        target_x = screen_geo.left()
-
-            # Final horizontal bounds check
-            if target_x < screen_geo.left():
-                target_x = screen_geo.left()
-            if target_x + map_w > screen_geo.right():
-                map_w = screen_geo.right() - target_x
-        else:
-            target_x = geo.x()
-            target_y = geo.y() - map_h
-
-        # Force exact size + position (reset any manual resize the user did)
-        self.sidecar.setGeometry(target_x, target_y, map_w, map_h)
-        self.sidecar.show()
-        # Re-apply after show() — on Windows, setGeometry before show() can be
-        # ignored when the window was previously shown at a different size.
-        self.sidecar.move(target_x, target_y)
-        self.sidecar.resize(map_w, map_h)
-        self._ensure_galaxy_loaded()
-
-    def _show_neural_floating(self):
-        """Open Neural Map as independent floating window at cursor (like test_neural_show.py)."""
-        print(
-            f"[MainUI] _show_neural_floating called, sidecar={self.sidecar is not None}"
-        )
-        if not self._ensure_neural_components_loaded():
-            return
-        self.sidecar._docked_mode = False  # Independent — never auto-hide
-
-        # If already visible, just bring to front
-        if self.sidecar.isVisible():
-            self.sidecar.activateWindow()
-            self.sidecar.raise_()
-            self._ensure_galaxy_loaded()
-            return
-
-        cursor_pos = QCursor.pos()
-        map_w = 700
-        map_h = 500
-
-        target_x = cursor_pos.x() - map_w // 2
-        target_y = cursor_pos.y() - map_h // 2
-
-        # Bound to screen
-        screen = QGuiApplication.screenAt(cursor_pos)
-        if not screen:
-            screen = QGuiApplication.primaryScreen()
-        if screen:
-            sg = screen.availableGeometry()
-            if target_x < sg.left():
-                target_x = sg.left()
-            elif target_x + map_w > sg.right():
-                target_x = sg.right() - map_w
-            if target_y < sg.top():
-                target_y = sg.top()
-            elif target_y + map_h > sg.bottom():
-                target_y = sg.bottom() - map_h
-
-        self.sidecar.setGeometry(target_x, target_y, map_w, map_h)
-        self.sidecar.show()
-        self._ensure_galaxy_loaded()
-
-    def _load_full_galaxy_into_sidecar(self, force=False):
-        """Load the full neural galaxy (all indexed nodes) into sidecar — like test_neural_show.py does.
-        Skips if already loaded unless force=True."""
-        print(
-            f"[MainUI] _load_full_galaxy: force={force}, _galaxy_loaded={self._galaxy_loaded}"
-        )
-        self._ensure_galaxy_loaded(force=force)
-
-    def _toggle_neural(self, checked):
-        self.neural_enabled = checked
-        print(
-            f"[MainUI] _toggle_neural: checked={checked}, sidecar={self.sidecar is not None}"
-        )
-        if checked:
-            self._show_map_docked()
-        elif self.sidecar:
-            self.sidecar.hide()
-        self._refresh_neural_status()
-
-    def _refresh_neural_status(self):
-        if not HAS_NEURAL_SUPPORT:
-            self.chk_map.setText("Map OFF")
-            return
-        if not hasattr(self, "neural_engine") or self.neural_engine is None:
-            self.chk_map.setText("Map OFF")
-            return
-        if self.chk_map.isChecked():
-            self.chk_map.setText("Map ON")
-        else:
-            self.chk_map.setText("Map OFF")
-
-    def _on_sidecar_search_changed(self, text):
-        if self.search_input.text() != text:
-            self.search_input.setText(text)
-        if self.sidecar:
-            self.sidecar.focus_query(text.strip())
-
-    def _on_node_clicked(self, clip_id):
-        """Jump to clip in UI when node is clicked in graph.
-        If clip is not in current list view, load it directly from DB."""
-        # First try to find in current lists
-        for widget in [self.list_history, self.list_pinned]:
-            for r in range(widget.count()):
-                it = widget.item(r)
-                data = it.data(Qt.ItemDataRole.UserRole)
-                if isinstance(data, dict) and data.get("id") == clip_id:
-                    self.browser.active_side = (
-                        "history" if widget == self.list_history else "pinned"
-                    )
-                    widget.setCurrentRow(r)
-                    widget.scrollToItem(it)
-                    self.show()
-                    self.activateWindow()
-                    return
-
-        # Not in current view — load clip directly from DB and put in search
-        clip_data = self.storage.get_clip_by_id(clip_id)
-        if clip_data and clip_data.get("content"):
-            # Use first few words as search to bring the clip into view
-            content = clip_data["content"]
-            search_term = content[:30].strip().split("\n")[0]
-            self.search_input.setText(search_term)
-            self.show()
-            self.activateWindow()
-
-    def _update_sidecar_graph(self):
-        """Fetch all nodes in the neural window and sync sidecar."""
-        if not self.sidecar or not hasattr(self.sidecar, "update_data"):
-            return
-
-        # Get all IDs in the neural window (not just the current UI list)
-        window_ids = []
-        if getattr(self.neural_engine, "index_pinned_always", True):
-            window_ids.extend(self.storage.get_all_pinned_ids())
-        window_ids.extend(
-            self.storage.get_recent_history_ids(
-                getattr(self.neural_engine, "max_recent_index", 200)
-            )
-        )
-
-        # De-duplicate
-        seen = set()
-        deduped_ids = []
-        for cid in window_ids:
-            if cid not in seen:
-                seen.add(cid)
-                deduped_ids.append(cid)
-
-        if deduped_ids:
-            nodes, links = self.storage.get_neural_data(deduped_ids)
-            formatted_links = [
-                {
-                    "source": l["source_id"],
-                    "target": l["target_id"],
-                    "weight": l["weight"],
-                }
-                for l in links
-            ]
-            self.sidecar.update_data(nodes, formatted_links)
-
-            if self.browser.current_search_query:
-                self.sidecar.focus_query(self.browser.current_search_query)
-            else:
-                active_widget = self.browser._active_list()
-                if active_widget.currentItem():
-                    d = active_widget.currentItem().data(Qt.ItemDataRole.UserRole)
-                    if isinstance(d, dict) and d.get("id"):
-                        self.sidecar.focus_node(d["id"])
 
     def on_item_clicked(self, item):
         if self.input_locked:
@@ -1022,6 +618,11 @@ class ClientApp(QWidget):
         clip_id = data.get("id") if data else None
         if clip_id is None:
             return
+        clip_id, _ = self.storage.add_clip(
+            data["type"],
+            data["content"],
+            data.get("tag", ""),
+        )
         if data.get("type") == "image" and data.get("is_pinned"):
             self._schedule_hidden_ui_refresh(clip_id)
             return
@@ -1332,14 +933,6 @@ class ClientApp(QWidget):
         self.search_input.clear()
         self.browser.current_search_query = ""
 
-    def _image_storage_name(self, img):
-        ba = QByteArray()
-        buf = QBuffer(ba)
-        buf.open(QIODevice.OpenModeFlag.WriteOnly)
-        img.save(buf, "PNG")
-        ih = hashlib.md5(ba.data()).hexdigest()
-        return f"{ih}.png"
-
     def _set_pending_clipboard_guard(self, data):
         self.pending_clipboard_guard = {
             "type": data["type"],
@@ -1414,14 +1007,24 @@ class ClientApp(QWidget):
         self.refresh_lists()
 
     def handle_delete(self, clip_id):
-        """Delete a clip."""
+        """Delete a clip, coalescing rapid delete clicks into one backend flush."""
+        if not clip_id or clip_id in self._pending_delete_clip_ids:
+            return
+        self._pending_delete_clip_ids.add(clip_id)
         self.browser.remove_clip_from_ui(clip_id)
-        QTimer.singleShot(25, lambda: self._delete_clip_backend(clip_id))
+        if not self._delete_flush_timer.isActive():
+            self._delete_flush_timer.start(25)
 
-    def _delete_clip_backend(self, clip_id):
-        self.storage.delete_clip(clip_id)
+    def _flush_pending_deletes(self):
+        clip_ids = list(self._pending_delete_clip_ids)
+        if not clip_ids:
+            return
+        self._pending_delete_clip_ids.clear()
+        for clip_id in clip_ids:
+            self.storage.delete_clip(clip_id)
         self.refresh_lists()
         self.browser.reset_after_delete_refresh()
+
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key.Key_Escape:
@@ -1429,9 +1032,10 @@ class ClientApp(QWidget):
         super().keyPressEvent(e)
 
     def on_clipboard_change_delayed(self):
-        """Delay reading clipboard slightly so source apps can finish publishing data."""
-        self._last_clipboard_capture_at = time.perf_counter()
-        QTimer.singleShot(5, lambda: self._process_clipboard_data_retry(0))
+        """Coalesce clipboard format bursts before reading the final payload."""
+        if not self._clipboard_capture_timer.isActive():
+            self._last_clipboard_capture_at = time.perf_counter()
+        self._clipboard_capture_timer.start()
 
     def _process_clipboard_data(self):
         self._process_clipboard_data_retry(0)
@@ -1459,21 +1063,44 @@ class ClientApp(QWidget):
                     "[Win32Monitor] Warning: Received clipboard event but content is empty or unreadable after retries."
                 )
             return
-        clip_type = None
-        content = None
+        job = None
+        pending_key = None
         if mime.hasImage():
-            img = QImage(mime.imageData())
-            if not img.isNull():
-                clip_type = "image"
-                content = self.save_image_if_new(img)
+            image = QImage(mime.imageData()).copy()
+            if not image.isNull():
+                job = CaptureJob.image(image)
         elif mime.hasText():
-            t = mime.text()
-            if t and t.strip():
-                clip_type = "text"
-                content = t
-        if not clip_type or not content:
+            text = mime.text()
+            if text and text.strip():
+                job = CaptureJob.text(text)
+                pending_key = ("text", text)
+        if job is None:
             return
-        clip_id, is_new = self.storage.add_clip(clip_type, content)
+
+        now = time.monotonic()
+        if pending_key in self._pending_clipboard_keys:
+            logger.debug("clipboard_ingest_skipped reason=duplicate_pending")
+            return
+        if (
+            pending_key is not None
+            and pending_key == self._last_ingested_clipboard_key
+            and now - self._last_ingested_clipboard_at < 1.0
+        ):
+            logger.debug("clipboard_ingest_skipped reason=duplicate_burst")
+            return
+        if pending_key is not None:
+            self._pending_clipboard_keys.add(pending_key)
+        if not self.ingest_bridge.submit(job):
+            if pending_key is not None:
+                self._pending_clipboard_keys.discard(pending_key)
+            logger.warning("clipboard_ingest_rejected reason=queue_full")
+
+    def _on_clipboard_ingest_completed(self, result):
+        clipboard_key = (result.clip_type, result.content)
+        self._pending_clipboard_keys.discard(clipboard_key)
+        self._last_ingested_clipboard_key = clipboard_key
+        self._last_ingested_clipboard_at = time.monotonic()
+        clip_id = result.clip_id
         if self.isVisible():
             self.browser.apply_pending_history_updates([clip_id]) or self.refresh_lists()
         else:
@@ -1486,16 +1113,19 @@ class ClientApp(QWidget):
         logger.info(
             "clipboard_ingest_done clip_id=%s is_new=%s elapsed_ms=%.2f",
             clip_id,
-            is_new,
+            result.is_new,
             (time.perf_counter() - self._last_clipboard_capture_at) * 1000,
         )
 
-    def save_image_if_new(self, img):
-        fn = self._image_storage_name(img)
-        fp = os.path.join(IMAGE_DIR, fn)
-        if not os.path.exists(fp):
-            img.save(fp, "PNG")
-        return fn
+    def _on_clipboard_ingest_rejected(self, result):
+        if result.clip_type == "text":
+            self._pending_clipboard_keys.discard(("text", result.content))
+        logger.warning(
+            "clipboard_ingest_rejected reason=%s byte_count=%s pixel_count=%s",
+            result.reason,
+            result.byte_count,
+            result.pixel_count,
+        )
 
     def handle_move(self, clip_id, direction, is_pinned):
         """Move clip up/down."""
@@ -1503,93 +1133,15 @@ class ClientApp(QWidget):
         self.refresh_lists()
 
     def hideEvent(self, event):
-        """When Main UI hides, hide the Map too (only if docked)."""
-        if (
-            hasattr(self, "sidecar")
-            and self.sidecar
-            and getattr(self.sidecar, "_docked_mode", False)
-        ):
-            self.sidecar.hide()
         super().hideEvent(event)
 
     def changeEvent(self, e):
         if e.type() == QEvent.Type.ActivationChange and not self.isActiveWindow():
-            # Only skip hide if user genuinely clicked INTO the sidecar
-            sidecar_has_focus = (
-                hasattr(self, "sidecar")
-                and self.sidecar is not None
-                and hasattr(self.sidecar, "isActiveWindow")
-                and self.sidecar.isActiveWindow()
-            )
-            if not sidecar_has_focus:
-                self.hide()
+            self.hide()
         super().changeEvent(e)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Advance Clipboard Manager")
-    parser.add_argument(
-        "--index-all",
-        type=int,
-        metavar="COUNT",
-        help="Force index N clips using Neural Engine and exit",
-    )
-    args = parser.parse_args()
-
-    # If --index-all is passed, run indexing and exit
-    if args.index_all:
-        print(f"--- Force Indexing {args.index_all} Clips ---")
-        from neural.engine import NeuralEngine
-        from storage import get_storage
-
-        store = get_storage()
-        config_path = os.path.join(os.path.dirname(__file__), "neural", "config.json")
-        engine = NeuralEngine(store, config_path)
-
-        try:
-            from sentence_transformers import SentenceTransformer
-            import warnings
-
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                engine.model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
-        except ImportError:
-            print("ERROR: sentence-transformers not installed.")
-            sys.exit(1)
-
-        unindexed = store.get_unindexed_ids_within_window(
-            recent_limit=engine.max_recent_index,
-            include_pinned=engine.index_pinned_always,
-            limit=args.index_all,
-        )
-        indexed_in_window, total_in_window = store.get_neural_window_totals(
-            recent_limit=engine.max_recent_index,
-            include_pinned=engine.index_pinned_always,
-        )
-        total = len(unindexed)
-        if total == 0:
-            print(
-                f"No unindexed clips found inside neural window ({indexed_in_window}/{total_in_window})."
-            )
-            sys.exit(0)
-
-        print(
-            f"Found {total} unindexed clips inside neural window. Current progress: {indexed_in_window}/{total_in_window}. Starting..."
-        )
-
-        # Process in batches of 10 for better progress reporting
-        batch_size = 10
-        for i in range(0, total, batch_size):
-            batch = unindexed[i : i + batch_size]
-            t0 = time.time()
-            engine._index_clips(batch)
-            dt = time.time() - t0
-            print(
-                f"Indexed {min(i + batch_size, total)}/{total} clips... (batch time: {dt:.2f}s)"
-            )
-
-        print("Indexing complete.")
-        sys.exit(0)
 
     logger.info("main_start pid=%s", os.getpid())
     app = QApplication(sys.argv)
@@ -1600,17 +1152,17 @@ def main():
     palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
     app.setPalette(palette)
 
-    # Allow Ctrl+C in terminal to kill the app
-    import signal
-
-    signal.signal(signal.SIGINT, lambda *args: app.quit())
-    # Timer to let Python process signals (Qt blocks the Python signal handler otherwise)
-    _signal_timer = QTimer()
-    _signal_timer.start(200)
-    _signal_timer.timeout.connect(lambda: None)
+    coordinator = SingleInstanceCoordinator()
+    if not coordinator.acquire_or_notify():
+        coordinator.close()
+        logger.info("secondary_instance_notified_primary")
+        _fault_log_handle.flush()
+        return 0
 
     window = ClientApp()
+    coordinator.activate_requested.connect(window.activate_from_secondary)
     exit_code = app.exec()
+    coordinator.close()
     logger.info("main_exit exit_code=%s", exit_code)
     _fault_log_handle.flush()
     sys.exit(exit_code)
