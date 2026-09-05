@@ -3,7 +3,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT_DIR)
@@ -649,6 +651,74 @@ class WidgetLayoutTests(unittest.TestCase):
         self.assertIn("Add to Group", seen)
         self.assertIn("Work", seen)
         self.assertIn("Add Tag", seen)
+
+    def test_context_menu_open_image_action_is_image_only(self):
+        from ui.clip_context_menu import show_clip_context_menu
+
+        parent = QWidget()
+        parent.storage = SimpleNamespace(get_groups=lambda: [])
+        seen = []
+        original_exec = QMenu.exec
+
+        def fake_exec(menu, global_pos):
+            seen.append([action.text() for action in menu.actions()])
+            return None
+
+        QMenu.exec = fake_exec
+        try:
+            show_clip_context_menu(
+                parent,
+                {"id": 70, "type": "image", "content": "shot.png"},
+                False,
+                parent,
+                QPoint(0, 0),
+            )
+            show_clip_context_menu(
+                parent,
+                {"id": 71, "type": "text", "content": "plain text"},
+                False,
+                parent,
+                QPoint(0, 0),
+            )
+        finally:
+            QMenu.exec = original_exec
+
+        self.assertIn("Open this image", seen[0])
+        self.assertNotIn("Open this image", seen[1])
+
+    def test_context_menu_open_image_uses_default_browser(self):
+        from ui.clip_context_menu import show_clip_context_menu
+
+        parent = QWidget()
+        parent.storage = SimpleNamespace(get_groups=lambda: [])
+        original_exec = QMenu.exec
+
+        def fake_exec(menu, global_pos):
+            return next(
+                (action for action in menu.actions() if action.text() == "Open this image"),
+                None,
+            )
+
+        with tempfile.TemporaryDirectory() as tmp, patch("ui.widgets.IMAGE_DIR", tmp), patch(
+            "webbrowser.open", return_value=True
+        ) as open_browser:
+            image_path = os.path.join(tmp, "shot.png")
+            with open(image_path, "wb") as handle:
+                handle.write(b"image")
+            QMenu.exec = fake_exec
+            try:
+                show_clip_context_menu(
+                    parent,
+                    {"id": 72, "type": "image", "content": "shot.png"},
+                    False,
+                    parent,
+                    QPoint(0, 0),
+                )
+            finally:
+                QMenu.exec = original_exec
+
+        open_browser.assert_called_once()
+        self.assertEqual(open_browser.call_args.args[0], Path(image_path).resolve().as_uri())
 
     def test_initial_refresh_gives_every_history_row_action_hitboxes(self):
         harness = _BrowserHarness()

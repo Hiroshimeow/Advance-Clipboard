@@ -1,4 +1,27 @@
+import webbrowser
+from pathlib import Path
+
 from PyQt6.QtWidgets import QInputDialog, QMenu
+
+
+def _open_image(clip_data):
+    from .widgets import IMAGE_DIR
+
+    content = str(clip_data.get("content") or "")
+    if not content:
+        return
+    image_path = Path(IMAGE_DIR, content).resolve()
+    if image_path.is_file():
+        webbrowser.open(image_path.as_uri())
+
+
+def _is_image(clip_data):
+    return clip_data.get("type") == "image"
+
+
+CONTEXT_ACTIONS = [
+    ("Open this image", _is_image, _open_image),
+]
 
 
 def show_clip_context_menu(owner, clip_data, is_pinned, parent_handler, global_pos):
@@ -15,6 +38,15 @@ def show_clip_context_menu(owner, clip_data, is_pinned, parent_handler, global_p
         QMenu::item:selected { background-color: #d18616; color: white; }
         """
     )
+
+    extra_action_count = 0
+    for index, (label, applies_to, _handler) in enumerate(CONTEXT_ACTIONS):
+        if applies_to(clip_data):
+            action = menu.addAction(label)
+            action.setData(("context_action", index))
+            extra_action_count += 1
+    if extra_action_count:
+        menu.addSeparator()
 
     group_menu = menu.addMenu("Add to Group")
     storage = getattr(parent_handler, "storage", None)
@@ -44,7 +76,9 @@ def show_clip_context_menu(owner, clip_data, is_pinned, parent_handler, global_p
         return
 
     action_type, value = action.data()
-    if action_type == "tag" and hasattr(parent_handler, "handle_add_tag"):
+    if action_type == "context_action":
+        CONTEXT_ACTIONS[value][2](clip_data)
+    elif action_type == "tag" and hasattr(parent_handler, "handle_add_tag"):
         tag, ok = QInputDialog.getText(
             owner, "Add Tag", "Enter tag name:", text=clip_data.get("tag", "")
         )
