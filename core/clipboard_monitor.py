@@ -28,6 +28,17 @@ import ctypes.wintypes
 import threading
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from core.win32_api import (
+    LRESULT,
+    LPARAM,
+    ULONG_PTR,
+    WPARAM,
+    WNDCLASSEX,
+    WNDPROC,
+    kernel32,
+    user32,
+)
+
 # Win32 constants
 WM_CLIPBOARDUPDATE = 0x031D
 WM_HOTKEY = 0x0312
@@ -62,39 +73,6 @@ CS_VREDRAW = 0x0001
 # HWND_MESSAGE for message-only window
 HWND_MESSAGE = ctypes.wintypes.HWND(-3)
 
-# Win32 API type definitions - 64-bit safe
-import sys
-
-if sys.maxsize > 2**32:
-    LRESULT = ctypes.c_int64
-    LPARAM = ctypes.c_int64
-    WPARAM = ctypes.c_uint64
-    ULONG_PTR = ctypes.c_uint64
-else:
-    LRESULT = ctypes.c_long
-    LPARAM = ctypes.c_long
-    WPARAM = ctypes.c_uint
-    ULONG_PTR = ctypes.c_ulong
-
-WNDPROC = ctypes.WINFUNCTYPE(
-    LRESULT,
-    ctypes.wintypes.HWND,
-    ctypes.wintypes.UINT,
-    WPARAM,
-    LPARAM,
-)
-
-# User32 functions - ensure correct arg types for 64-bit
-user32 = ctypes.windll.user32
-user32.DefWindowProcW.argtypes = [
-    ctypes.wintypes.HWND,
-    ctypes.wintypes.UINT,
-    WPARAM,
-    LPARAM,
-]
-user32.DefWindowProcW.restype = LRESULT
-
-
 def _coerce_lparam(value):
     """Normalize callback values into a signed LPARAM-sized integer."""
     bits = ctypes.sizeof(ctypes.c_void_p) * 8
@@ -103,23 +81,6 @@ def _coerce_lparam(value):
     if value >= (1 << (bits - 1)):
         value -= 1 << bits
     return value
-
-
-class WNDCLASSEX(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", ctypes.wintypes.UINT),
-        ("style", ctypes.wintypes.UINT),
-        ("lpfnWndProc", WNDPROC),
-        ("cbClsExtra", ctypes.c_int),
-        ("cbWndExtra", ctypes.c_int),
-        ("hInstance", ctypes.wintypes.HINSTANCE),
-        ("hIcon", ctypes.wintypes.HANDLE),
-        ("hCursor", ctypes.wintypes.HANDLE),
-        ("hbrBackground", ctypes.wintypes.HANDLE),
-        ("lpszMenuName", ctypes.wintypes.LPCWSTR),
-        ("lpszClassName", ctypes.wintypes.LPCWSTR),
-        ("hIconSm", ctypes.wintypes.HANDLE),
-    ]
 
 
 class Win32ClipboardMonitor(QObject):
@@ -162,16 +123,14 @@ class Win32ClipboardMonitor(QObject):
         self._running = False
         # Post quit message to the thread's message loop
         if self._thread_id:
-            ctypes.windll.user32.PostThreadMessageW(self._thread_id, WM_APP_QUIT, 0, 0)
+            user32.PostThreadMessageW(self._thread_id, WM_APP_QUIT, 0, 0)
         if self._thread:
             self._thread.join(timeout=3)
             self._thread = None
 
     def _run_message_loop(self):
         """Run Win32 message loop in a dedicated thread."""
-        self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
+        self._thread_id = kernel32.GetCurrentThreadId()
 
         # Create the window procedure callback
         # IMPORTANT: Store reference to prevent garbage collection
@@ -260,8 +219,6 @@ class Win32ClipboardMonitor(QObject):
 
     def _wndproc(self, hwnd, msg, wparam, lparam):
         """Window procedure for the hidden message window."""
-        user32 = ctypes.windll.user32
-
         if msg == WM_CLIPBOARDUPDATE:
             # Emit signal — Qt handles thread-safety for queued connections
             self.clipboard_changed.emit()
@@ -314,8 +271,6 @@ def simulate_paste():
     down before V is pressed.
     """
     import time
-
-    user32 = ctypes.windll.user32
 
     # Clear the opener hotkey state first. Ctrl+Alt+V may still be physically
     # transitioning when the user clicks a clip, so release modifiers explicitly.
