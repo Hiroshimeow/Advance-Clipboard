@@ -945,6 +945,54 @@ class KeyboardNavigationTests(unittest.TestCase):
                     app.close()
                     QApplication.processEvents()
 
+    def test_free_text_search_scroll_loads_past_first_twelve(self):
+        _get_qapp()
+        history = [
+            {"id": idx + 1, "type": "text", "content": f"proxy history {idx}"}
+            for idx in range(27)
+        ]
+        pinned = [
+            {"id": 100 + idx, "type": "text", "content": f"proxy pinned {idx}", "group_name": ""}
+            for idx in range(27)
+        ]
+        app = _TestClientApp()
+        app.storage = _FakeStorage(history=history, pinned=pinned)
+        try:
+            _submit_search(app, "proxy")
+            self.assertTrue(
+                _wait_until(
+                    lambda: app.list_history.count() == 12
+                    and app.list_pinned.count() == 12
+                )
+            )
+            self.assertTrue(app.browser.history_has_more)
+            self.assertTrue(app.browser.pinned_has_more)
+
+            for expected in (24, 27):
+                app.browser.on_history_scroll(
+                    app.list_history.verticalScrollBar().maximum()
+                )
+                app.browser.on_pinned_scroll(
+                    app.list_pinned.verticalScrollBar().maximum()
+                )
+                self.assertEqual(app.list_history.count(), expected)
+                self.assertEqual(app.list_pinned.count(), expected)
+
+            self.assertFalse(app.browser.history_has_more)
+            self.assertFalse(app.browser.pinned_has_more)
+            self.assertEqual(
+                len({app.list_history.item(i).data(Qt.ItemDataRole.UserRole)["id"] for i in range(27)}),
+                27,
+            )
+            self.assertEqual(
+                len({app.list_pinned.item(i).data(Qt.ItemDataRole.UserRole)["id"] for i in range(27)}),
+                27,
+            )
+        finally:
+            app.backup_scheduler.cancel()
+            app.close()
+            QApplication.processEvents()
+
     def test_rapid_search_replacement_runs_one_worker_and_only_latest_pending(self):
         _get_qapp()
         app = _TestClientApp()

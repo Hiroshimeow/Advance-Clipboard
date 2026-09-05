@@ -979,7 +979,7 @@ class WidgetLayoutTests(unittest.TestCase):
 
         self.assertEqual(
             storage.calls,
-            [("history", "linux proxy", 12, True), ("pinned", "linux proxy", 12, True)],
+            [("history", "linux proxy", 13, True), ("pinned", "linux proxy", 13, True)],
         )
 
 
