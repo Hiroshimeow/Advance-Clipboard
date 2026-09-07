@@ -1,18 +1,41 @@
+import subprocess
 import webbrowser
 from pathlib import Path
 
 from PyQt6.QtWidgets import QInputDialog, QMenu
 
 
-def _open_image(clip_data):
+def resolve_image_path(clip_data):
     from .widgets import IMAGE_DIR
 
     content = str(clip_data.get("content") or "")
-    if not content:
-        return
-    image_path = Path(IMAGE_DIR, content).resolve()
-    if image_path.is_file():
+    return Path(IMAGE_DIR, content).resolve() if content else None
+
+
+def _open_image(clip_data, parent_handler=None):
+    image_path = resolve_image_path(clip_data)
+    if image_path and image_path.is_file():
         webbrowser.open(image_path.as_uri())
+
+
+def _show_preview(clip_data, parent_handler=None):
+    if parent_handler and hasattr(parent_handler, "handle_show_preview"):
+        parent_handler.handle_show_preview(clip_data)
+
+
+def _copy_image_path(clip_data, parent_handler=None):
+    image_path = resolve_image_path(clip_data)
+    if image_path and parent_handler and hasattr(parent_handler, "handle_copy_image_path"):
+        parent_handler.handle_copy_image_path(str(image_path))
+
+
+def _open_with_paint(clip_data, parent_handler=None):
+    image_path = resolve_image_path(clip_data)
+    if image_path and image_path.is_file():
+        try:
+            subprocess.Popen(["mspaint.exe", str(image_path)], shell=False)
+        except OSError:
+            pass
 
 
 def _is_image(clip_data):
@@ -20,7 +43,10 @@ def _is_image(clip_data):
 
 
 CONTEXT_ACTIONS = [
+    ("Show preview", lambda clip: True, _show_preview),
     ("Open this image", _is_image, _open_image),
+    ("Copy image path", _is_image, _copy_image_path),
+    ("Open with Paint", _is_image, _open_with_paint),
 ]
 
 
@@ -77,7 +103,7 @@ def show_clip_context_menu(owner, clip_data, is_pinned, parent_handler, global_p
 
     action_type, value = action.data()
     if action_type == "context_action":
-        CONTEXT_ACTIONS[value][2](clip_data)
+        CONTEXT_ACTIONS[value][2](clip_data, parent_handler)
     elif action_type == "tag" and hasattr(parent_handler, "handle_add_tag"):
         tag, ok = QInputDialog.getText(
             owner, "Add Tag", "Enter tag name:", text=clip_data.get("tag", "")

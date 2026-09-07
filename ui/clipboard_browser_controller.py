@@ -437,6 +437,9 @@ class ClipboardBrowserController:
         """Debounced search optimized for interactive typing."""
         if self._search_shutdown:
             return
+        preview = getattr(self.app, "preview", None)
+        if preview:
+            preview.begin_search_defer()
         previous_query = self.current_search_query
         self.current_search_query = text.strip()
         if previous_query and not self.current_search_query:

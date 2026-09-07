@@ -69,6 +69,7 @@ from ui.widgets import (
 from ui.clip_list_view import ClipListView
 from ui.clip_models import HistoryListModel, PinnedListModel
 from ui.clipboard_browser_controller import ClipboardBrowserController
+from ui.preview import PreviewController
 
 
 
@@ -183,6 +184,9 @@ class ClientApp(QWidget):
 
         # Init UI
         self.initUI()
+        self.preview = PreviewController(self, image_dir=IMAGE_DIR)
+        self.list_history.previewCandidate.connect(self.preview.request_preview)
+        self.list_pinned.previewCandidate.connect(self.preview.request_preview)
 
 
         # Load data with disaster recovery
@@ -575,6 +579,8 @@ class ClientApp(QWidget):
 
     def closeEvent(self, event):
         """Clean up on close."""
+        if getattr(self, "preview", None):
+            self.preview.reset()
         super().closeEvent(event)
 
 
@@ -962,6 +968,15 @@ class ClientApp(QWidget):
         self.pending_clipboard_guard = None
         return False
 
+    def handle_show_preview(self, data):
+        self.preview.activate(data)
+        self.search_input.setFocus()
+
+    def handle_copy_image_path(self, absolute_path):
+        data = {"type": "text", "content": str(absolute_path)}
+        self._set_pending_clipboard_guard(data)
+        self.clipboard.setText(str(absolute_path))
+
     def handle_copy_only(self, data):
         self._set_pending_clipboard_guard(data)
         if data["type"] == "text":
@@ -1133,6 +1148,8 @@ class ClientApp(QWidget):
         self.refresh_lists()
 
     def hideEvent(self, event):
+        if getattr(self, "preview", None):
+            self.preview.reset()
         super().hideEvent(event)
 
     def changeEvent(self, e):

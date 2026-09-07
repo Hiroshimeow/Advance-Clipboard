@@ -1275,6 +1275,41 @@ class KeyboardNavigationTests(unittest.TestCase):
         app.close()
         QApplication.processEvents()
 
+    def test_copy_image_path_reuses_text_clipboard_guard(self):
+        _get_qapp()
+        app = _TestClientApp()
+        try:
+            path = r"E:\\tmp\\missing-shot.png"
+            app.handle_copy_image_path(path)
+            self.assertEqual(app.pending_clipboard_guard["type"], "text")
+            self.assertEqual(app.pending_clipboard_guard["content"], path)
+            self.assertEqual(app.clipboard.text(), path)
+            self.assertTrue(app._should_ignore_clipboard_update(app.clipboard.mimeData()))
+            self.assertIsNone(app.pending_clipboard_guard)
+        finally:
+            app.backup_scheduler.cancel()
+            app.close()
+            QApplication.processEvents()
+
+    def test_preview_mode_resets_when_main_window_hides(self):
+        _get_qapp()
+        app = _TestClientApp()
+        try:
+            app.show()
+            QApplication.processEvents()
+            app.handle_show_preview({"id": 91, "type": "text", "content": "preview me"})
+            self.assertTrue(app.preview.enabled)
+            app.hide()
+            QApplication.processEvents()
+            self.assertFalse(app.preview.enabled)
+            app.show()
+            QApplication.processEvents()
+            self.assertFalse(app.preview.enabled)
+        finally:
+            app.backup_scheduler.cancel()
+            app.close()
+            QApplication.processEvents()
+
     def test_ready_to_paste_restores_last_active_window_before_ctrl_v(self):
         _get_qapp()
         with patch("main.get_storage", return_value=_FakeStorage()):

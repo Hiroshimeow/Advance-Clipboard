@@ -23,6 +23,7 @@ class ClipListView(QListView):
     groupToggleRequested = pyqtSignal(str, bool)
     rowActivated = pyqtSignal(object)
     itemClicked = pyqtSignal(object)
+    previewCandidate = pyqtSignal(dict)
 
     def __init__(self, model: ClipListModel | None = None, parent=None):
         super().__init__(parent)
@@ -38,7 +39,15 @@ class ClipListView(QListView):
         self._pressed_index = QModelIndex()
         self._pressed_action = None
         self._wheel_angle_pixel_remainder = 0.0
+        self._last_preview_hover_key = None
         self.setProperty("activeSide", False)
+
+    def currentChanged(self, current, previous):
+        super().currentChanged(current, previous)
+        self._last_preview_hover_key = None
+        row = current.data(ROW_ROLE) if current.isValid() else None
+        if isinstance(row, ClipRow) and row.is_clip:
+            self.previewCandidate.emit(row.clip)
 
     def set_active_visual(self, active: bool):
         self.setProperty("activeSide", bool(active))
@@ -173,6 +182,17 @@ class ClipListView(QListView):
         except Exception:
             text = ""
         return ClipRow(row_kind="group_header", group_name=text, group_count=0)
+
+    def mouseMoveEvent(self, event):
+        index = self.indexAt(event.position().toPoint())
+        row = index.data(ROW_ROLE) if index.isValid() else None
+        if isinstance(row, ClipRow) and row.is_clip:
+            clip = row.clip
+            key = (clip.get("id"), clip.get("type"))
+            if key != self._last_preview_hover_key:
+                self._last_preview_hover_key = key
+                self.previewCandidate.emit(clip)
+        super().mouseMoveEvent(event)
 
     def mousePressEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
