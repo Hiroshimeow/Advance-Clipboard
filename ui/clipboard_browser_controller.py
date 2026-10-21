@@ -97,7 +97,10 @@ class ClipboardBrowserController:
     def refresh_shortcuts_and_actions(self):
         try:
             self._shortcuts_cache = self.storage.get_all_shortcuts()
-            self._actions_cache = {cid: True for cid in self.storage.get_all_clip_actions()}
+            if hasattr(self.storage, "get_action_clip_ids"):
+                self._actions_cache = {cid: True for cid in self.storage.get_action_clip_ids()}
+            else:
+                self._actions_cache = {cid: True for cid in self.storage.get_all_clip_actions()}
         except Exception:
             self._shortcuts_cache = {}
             self._actions_cache = {}
@@ -457,6 +460,9 @@ class ClipboardBrowserController:
 
     def activate_current(self):
         """Paste the currently active item."""
+        if getattr(self.app, "is_ui_dirty", False) and getattr(self.app, "pending_ui_clip_ids", None):
+            if hasattr(self.app, "_refresh_after_show"):
+                self.app._refresh_after_show()
         w = self._active_list()
         if not w:
             return
@@ -496,6 +502,9 @@ class ClipboardBrowserController:
         Alt+1..3 -> History clip 1, 2, 3
         Alt+4..6 -> Pinned clip 1, 2, 3
         """
+        if getattr(self.app, "is_ui_dirty", False) and getattr(self.app, "pending_ui_clip_ids", None):
+            if hasattr(self.app, "_refresh_after_show"):
+                self.app._refresh_after_show()
         if self.search_debounce_timer.isActive():
             self.search_debounce_timer.stop()
             self.app._do_search()
@@ -909,6 +918,25 @@ class ClipboardBrowserController:
                 changed = True
 
             if changed:
+                model = self.app.list_history.model()
+                for idx in range(min(4, model.rowCount())):
+                    r_data = model.row_at(idx)
+                    if r_data and r_data.is_clip:
+                        expected_alt = f"Alt+{idx+1}" if idx < 3 else ""
+                        if r_data.alt_shortcut != expected_alt:
+                            model.replace_row(
+                                idx,
+                                ClipRow(
+                                    row_kind="clip",
+                                    clip=r_data.clip,
+                                    group_name=r_data.group_name,
+                                    is_pinned=r_data.is_pinned,
+                                    is_grouped_child=r_data.is_grouped_child,
+                                    is_expanded=r_data.is_expanded,
+                                    search_query=r_data.search_query,
+                                    alt_shortcut=expected_alt,
+                                ),
+                            )
                 self.history_offset = max(self.history_offset, self.app.list_history.count())
                 self.app.list_history.scrollToTop()
                 self.app.list_history.setCurrentRow(0)

@@ -34,12 +34,9 @@ def open_url(url: str) -> Tuple[bool, str]:
     if not is_valid_url(clean_url):
         return False, "Đường dẫn không hợp lệ (phải bắt đầu bằng http:// hoặc https://)"
     try:
-        if sys.platform == "win32":
-            import ctypes
-            # ShellExecuteW(HWND hwnd, LPCWSTR lpOperation, LPCWSTR lpFile, LPCWSTR lpParameters, LPCWSTR lpDirectory, INT nShowCmd)
-            ret = ctypes.windll.shell32.ShellExecuteW(0, "open", clean_url, None, None, 1)
-            if ret > 32:
-                return True, "Đã mở URL trong trình duyệt."
+        if sys.platform == "win32" and hasattr(os, "startfile"):
+            os.startfile(clean_url)
+            return True, "Đã mở URL trong trình duyệt."
         # Fallback to webbrowser
         opened = webbrowser.open(clean_url)
         return (True, "Đã mở URL.") if opened else (False, "Không thể mở trình duyệt.")

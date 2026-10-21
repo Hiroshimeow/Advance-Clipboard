@@ -141,7 +141,7 @@ class ClipboardStorage:
     def clear_backup_flag(self):
         ClipboardStorage._need_backup = False
 
-    def _fts_probe_rowids(self, conn, fts_query: str, cap: int = 400) -> Optional[List[int]]:
+    def _fts_probe_rowids(self, conn, fts_query: str, cap: int = 250) -> Optional[List[int]]:
         """Probe FTS5 rowids to optimize selective and non-matching queries."""
         rows = conn.execute(
             "SELECT rowid FROM clips_fts WHERE clips_fts MATCH ? LIMIT ?",
@@ -314,6 +314,9 @@ class ClipboardStorage:
     def get_all_clip_actions(self) -> Dict[int, Dict[str, Any]]:
         return self.clips.get_all_clip_actions()
 
+    def get_action_clip_ids(self) -> set:
+        return self.clips.get_action_clip_ids()
+
     # ==================== SEARCH OPERATIONS (delegated) ====================
 
     def is_filter_query(self, query: str) -> bool:
@@ -373,14 +376,6 @@ class ClipboardStorage:
                     selective_ids + [limit],
                 ).fetchall()
                 return [dict(r) for r in rows]
-            rows = conn.execute(
-                """SELECT * FROM clips INDEXED BY idx_pinned_search
-                   WHERE is_pinned = 1
-                     AND id IN (SELECT rowid FROM clips_fts WHERE clips_fts MATCH ?)
-                   ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ?""",
-                (fts_query, limit),
-            ).fetchall()
-            return [dict(r) for r in rows]
         where_clauses = []
         params = []
         for term in terms:
@@ -388,7 +383,7 @@ class ClipboardStorage:
             where_clauses.append("(content LIKE ? ESCAPE '\\' OR tag LIKE ? ESCAPE '\\' OR group_name LIKE ? ESCAPE '\\')")
             params.extend([pattern, pattern, pattern])
         rows = conn.execute(
-            f"SELECT * FROM clips WHERE is_pinned = 1 AND ({' AND '.join(where_clauses)}) ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ?",
+            f"SELECT * FROM clips INDEXED BY idx_pinned_search WHERE is_pinned = 1 AND ({' AND '.join(where_clauses)}) ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ?",
             params + [limit],
         ).fetchall()
         return [dict(r) for r in rows]
@@ -544,14 +539,6 @@ class ClipboardStorage:
                     selective_ids + [limit],
                 ).fetchall()
                 return [dict(r) for r in rows]
-            rows = conn.execute(
-                """SELECT * FROM clips INDEXED BY idx_updated
-                   WHERE id IN (SELECT rowid FROM clips_fts WHERE clips_fts MATCH ?)
-                     AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
-                   ORDER BY updated_at DESC LIMIT ?""",
-                (fts_query, limit),
-            ).fetchall()
-            return [dict(r) for r in rows]
         where_clauses = []
         params = []
         for term in terms:

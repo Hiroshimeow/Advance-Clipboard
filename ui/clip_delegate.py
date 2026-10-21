@@ -42,10 +42,12 @@ class RowRects:
 
 class ClipRowDelegate(QStyledItemDelegate):
     MAX_THUMBNAIL_CACHE_ENTRIES = 128
+    MAX_METRICS_CACHE_ENTRIES = 512
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._thumbnail_cache = OrderedDict()
+        self._metrics_cache = OrderedDict()
 
     def sizeHint(self, option, index):
         row = index.data(ROW_ROLE)
@@ -58,15 +60,41 @@ class ClipRowDelegate(QStyledItemDelegate):
         return QSize(width, metrics.row_height)
 
     def measure_row(self, row: ClipRow, available_width: int) -> ClipRowMetrics:
-        return ClipRowMetrics.for_clip(
-            row.clip or {},
+        clip = row.clip or {}
+        avail_w = max(240, int(available_width))
+        content = str(clip.get("content", ""))
+        cache_key = (
+            row.clip_id,
+            clip.get("type"),
+            len(content),
+            content[:64],
+            clip.get("tag", ""),
+            clip.get("group_name", ""),
+            clip.get("shortcut_key"),
+            bool(clip.get("has_action")),
+            row.is_pinned,
+            row.is_grouped_child,
+            row.is_expanded,
+            avail_w,
+        )
+        cached = self._metrics_cache.get(cache_key)
+        if cached is not None:
+            self._metrics_cache.move_to_end(cache_key)
+            return cached
+
+        metrics = ClipRowMetrics.for_clip(
+            clip,
             ClipRowState(
                 is_pinned=row.is_pinned,
                 is_grouped=row.is_grouped_child,
                 expanded=row.is_expanded,
             ),
-            available_width,
+            avail_w,
         )
+        self._metrics_cache[cache_key] = metrics
+        while len(self._metrics_cache) > self.MAX_METRICS_CACHE_ENTRIES:
+            self._metrics_cache.popitem(last=False)
+        return metrics
 
     def rects_for(self, option, row: ClipRow) -> RowRects:
         outer = QRect(option.rect)
@@ -170,8 +198,6 @@ class ClipRowDelegate(QStyledItemDelegate):
         rects = self.rects_for(option, row)
 
         if not row.is_expanded:
-            # Expanded rows use a persistent editor; keep the delegate underlay to
-            # frame-only so short clips do not double-paint text or controls.
             painter.setFont(TEXT_FONT)
             painter.setPen(QColor("#e0e0e0"))
             if clip.get("type") == "image":
@@ -189,6 +215,14 @@ class ClipRowDelegate(QStyledItemDelegate):
             painter.drawText(QRect(rects.meta.left(), rects.meta.top(), rects.meta.width(), 18), Qt.AlignmentFlag.AlignCenter, str(line_count))
             if clip.get("type") == "text":
                 self._paint_button(painter, rects.expand, "▼", "#333333", "#888888")
+
+            # Subtle Alt+1..6 quick-paste indicator in meta column
+            alt_sc = getattr(row, "alt_shortcut", "")
+            if alt_sc:
+                alt_rect = QRect(rects.meta.left() - 2, rects.expand.bottom() + 4, rects.meta.width() + 4, 14)
+                painter.setFont(TAG_FONT)
+                painter.setPen(QColor("#78909c"))
+                painter.drawText(alt_rect, Qt.AlignmentFlag.AlignCenter, alt_sc)
 
             self._paint_button(painter, rects.copy, "❐", "#2b5c75", "#dddddd")
             self._paint_button(painter, rects.pin, "★" if row.is_pinned else "☆", "#7a5c20" if row.is_pinned else "#3a3a3a", "#ffd700" if row.is_pinned else "#dddddd")
@@ -279,13 +313,11 @@ class ClipRowDelegate(QStyledItemDelegate):
     def _badge_text(self, row: ClipRow) -> str:
         clip = row.clip or {}
         badges = []
-        if getattr(row, "alt_shortcut", ""):
-            badges.append(f"[{row.alt_shortcut}]")
         sc = clip.get("shortcut_key")
         if sc:
             badges.append(f"[Ctrl+{sc}]")
         if clip.get("has_action"):
-            badges.append("[⚡ Action]")
+            badges.append("[⚡]")
         tag = str(clip.get("tag", "") or "")
         group_name = str(clip.get("group_name", "") or "")
         if tag:

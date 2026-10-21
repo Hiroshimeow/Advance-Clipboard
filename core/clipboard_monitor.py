@@ -278,16 +278,21 @@ def get_window_class_name(hwnd) -> str:
         return ""
 
 
+VK_LCONTROL = 0xA2
+VK_RCONTROL = 0xA3
+VK_LMENU = 0xA4
+VK_RMENU = 0xA5
+
+
 def simulate_paste(target_hwnd=None, focus_hwnd=None):
     """
-    Simulate paste into target application.
+    Simulate paste into target application with minimal latency.
     
-    Fix for Explorer F2 rename and address bar:
-    1. If target focus control is an 'Edit' class (such as Explorer rename box or address bar),
-       send direct WM_PASTE message. This pastes instantly and natively without triggering
-       focus loss or menu-bar activation.
-    2. Otherwise, use paced keybd_event with neutral dummy key to prevent Alt keyup from
-       triggering Windows menu-bar activation (SC_KEYMENU).
+    1. If target focus control is a Win32 'Edit' / 'RichEdit' class (such as Explorer F2 rename
+       or address bar), send direct WM_PASTE (0x0302) message.
+    2. Otherwise, release any held Alt/Ctrl modifiers (including left/right specific VKs so
+       Alt+1..6 never re-triggers the Ctrl+Alt+V global hotkey) with a neutral dummy key (0x07)
+       to prevent SC_KEYMENU, then inject Ctrl+V.
     """
     if sys.platform != "win32":
         return
@@ -296,20 +301,32 @@ def simulate_paste(target_hwnd=None, focus_hwnd=None):
     if focus_hwnd and user32.IsWindow(focus_hwnd):
         cls_name = get_window_class_name(focus_hwnd).lower()
         if cls_name in ("edit", "richedit20w", "richedit50w"):
-            logger.info("simulate_paste_direct_wm_paste hwnd=%s class=%s", focus_hwnd, cls_name)
+            logger.debug("simulate_paste_direct_wm_paste hwnd=%s class=%s", focus_hwnd, cls_name)
             user32.SendMessageW(focus_hwnd, WM_PASTE, 0, 0)
             return
 
     # 2. Paced keybd_event sequence
-    alt_down = bool(user32.GetAsyncKeyState(VK_MENU) & 0x8000)
-    ctrl_down = bool(user32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
+    alt_down = bool(
+        (user32.GetAsyncKeyState(VK_MENU) & 0x8000)
+        or (user32.GetAsyncKeyState(VK_LMENU) & 0x8000)
+        or (user32.GetAsyncKeyState(VK_RMENU) & 0x8000)
+    )
+    ctrl_down = bool(
+        (user32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
+        or (user32.GetAsyncKeyState(VK_LCONTROL) & 0x8000)
+        or (user32.GetAsyncKeyState(VK_RCONTROL) & 0x8000)
+    )
 
     if alt_down:
         user32.keybd_event(0x07, 0, 0, 0)
         user32.keybd_event(0x07, 0, KEYEVENTF_KEYUP, 0)
+        user32.keybd_event(VK_LMENU, 0, KEYEVENTF_KEYUP, 0)
+        user32.keybd_event(VK_RMENU, 0, KEYEVENTF_KEYUP, 0)
         user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
 
     if ctrl_down:
+        user32.keybd_event(VK_LCONTROL, 0, KEYEVENTF_KEYUP, 0)
+        user32.keybd_event(VK_RCONTROL, 0, KEYEVENTF_KEYUP, 0)
         user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
 
     user32.keybd_event(VK_CONTROL, 0, 0, 0)

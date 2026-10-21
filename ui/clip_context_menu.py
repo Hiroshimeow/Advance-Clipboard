@@ -52,6 +52,8 @@ def _is_url(clip_data):
 
 def _open_url_action(clip_data, parent_handler=None):
     url = str(clip_data.get("content") or "").strip()
+    if parent_handler and hasattr(parent_handler, "hide"):
+        parent_handler.hide()
     open_url(url)
 
 
@@ -148,7 +150,11 @@ def show_clip_context_menu(owner, clip_data, is_pinned, parent_handler, global_p
         fix_action = menu.addAction("Fix")
         fix_action.setData(("fix", None))
 
-    selected_action = menu.exec(global_pos)
+    setattr(parent_handler, "_child_dialog_open", True)
+    try:
+        selected_action = menu.exec(global_pos)
+    finally:
+        setattr(parent_handler, "_child_dialog_open", False)
     if not selected_action or not selected_action.data():
         return
 
@@ -166,15 +172,23 @@ def show_clip_context_menu(owner, clip_data, is_pinned, parent_handler, global_p
     elif action_type == "remove_action" and hasattr(parent_handler, "handle_remove_action"):
         parent_handler.handle_remove_action(clip_id)
     elif action_type == "tag" and hasattr(parent_handler, "handle_add_tag"):
-        tag, ok = QInputDialog.getText(
-            owner, "Add Tag", "Enter tag name:", text=clip_data.get("tag", "")
-        )
+        setattr(parent_handler, "_child_dialog_open", True)
+        try:
+            tag, ok = QInputDialog.getText(
+                owner, "Add Tag", "Enter tag name:", text=clip_data.get("tag", "")
+            )
+        finally:
+            setattr(parent_handler, "_child_dialog_open", False)
         if ok:
             parent_handler.handle_add_tag(clip_id, tag)
     elif action_type == "group" and hasattr(parent_handler, "handle_set_group"):
         parent_handler.handle_set_group(clip_id, value)
     elif action_type == "new_group" and hasattr(parent_handler, "handle_set_group"):
-        group_name, ok = QInputDialog.getText(owner, "New Group", "Enter group name:")
+        setattr(parent_handler, "_child_dialog_open", True)
+        try:
+            group_name, ok = QInputDialog.getText(owner, "New Group", "Enter group name:")
+        finally:
+            setattr(parent_handler, "_child_dialog_open", False)
         if ok and group_name.strip():
             parent_handler.handle_set_group(clip_id, group_name.strip())
     elif action_type == "remove_group" and hasattr(parent_handler, "handle_set_group"):

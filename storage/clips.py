@@ -293,13 +293,16 @@ class ClipRepository:
         rows = conn.execute(
             "SELECT * FROM clips ORDER BY is_pinned DESC, updated_at DESC"
         ).fetchall()
+        shortcuts = self.get_all_shortcuts()
+        actions = self.get_all_clip_actions()
         out = []
         for r in rows:
             d = dict(r)
-            sc = self.get_shortcut_for_clip(d["id"])
+            cid = d["id"]
+            sc = shortcuts.get(cid)
             if sc:
                 d["shortcut_key"] = sc
-            act = self.get_clip_action(d["id"])
+            act = actions.get(cid)
             if act:
                 d["action"] = act
             out.append(d)
@@ -509,7 +512,7 @@ class ClipRepository:
         Configure an executable action on a clip.
         action_type: 'python_inline', 'script_file', 'command'
         """
-        if action_type not in ("python_inline", "script_file", "command"):
+        if action_type not in ("python_inline", "script_file", "command", "url"):
             raise ValueError(f"Loại action không hợp lệ: {action_type}")
         now = datetime.now().isoformat()
         args_json = json.dumps(args or [], ensure_ascii=False)
@@ -568,3 +571,9 @@ class ClipRepository:
             d["is_background"] = bool(d.get("is_background"))
             out[cid] = d
         return out
+
+    def get_action_clip_ids(self) -> set[int]:
+        """Fast lookup of clip IDs that have an action configured."""
+        conn = get_connection()
+        rows = conn.execute("SELECT clip_id FROM clip_actions").fetchall()
+        return {int(r[0]) for r in rows}

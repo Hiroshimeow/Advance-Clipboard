@@ -174,5 +174,23 @@ with open('{out_file}', 'w') as f:
         self.assertIsNone(self.storage.get_clip_action(self.clip_id))
 
 
+
+    def test_save_and_get_url_action_in_storage_and_dialog(self):
+        # Regression test for ValueError: Loại action không hợp lệ: url
+        ok = self.storage.set_clip_action(
+            self.clip_id,
+            "url",
+            "https://example.com/docs",
+            args=[],
+            is_background=False,
+        )
+        self.assertTrue(ok)
+        act = self.storage.get_clip_action(self.clip_id)
+        self.assertIsNotNone(act)
+        self.assertEqual(act["action_type"], "url")
+        self.assertEqual(act["target"], "https://example.com/docs")
+        self.assertIn(self.clip_id, self.storage.get_action_clip_ids())
+
+
 if __name__ == "__main__":
     unittest.main()

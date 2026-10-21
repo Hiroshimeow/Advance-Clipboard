@@ -647,15 +647,18 @@ class ActionConfigDialog(QDialog):
     def _load_existing(self):
         action = self.storage.get_clip_action(self.clip_id)
         if not action:
-            # Check if clip text is URL by default
             content = str(self.clip_data.get("content", "")).strip()
             if is_valid_url(content):
                 idx = self.cb_type.findData("url")
                 if idx >= 0:
                     self.cb_type.setCurrentIndex(idx)
                 self.edit_target.setText(content)
-            else:
-                self._on_type_changed()
+            elif os.path.isabs(content) and os.path.splitext(content)[1].lower() in (".py", ".ps1", ".bat", ".cmd", ".sh"):
+                idx = self.cb_type.findData("script_file")
+                if idx >= 0:
+                    self.cb_type.setCurrentIndex(idx)
+                self.edit_target.setText(content)
+            self._on_type_changed()
             return
 
         self.btn_remove.show()

@@ -81,7 +81,12 @@ class ClipRowMetrics:
 
         tag_text = item_data.get("tag", "")
         group_name = item_data.get("group_name", "")
-        badge_text = tag_text or (f"[{group_name}]" if group_name and not state.is_grouped else "")
+        badge_text = (
+            tag_text
+            or (f"[{group_name}]" if group_name and not state.is_grouped else "")
+            or item_data.get("shortcut_key")
+            or item_data.get("has_action")
+        )
         # Tag sits below action buttons (bottom-right), add to actions column
         if badge_text:
             actions_height += QFontMetrics(TAG_FONT).height() + 4 + ACTION_BUTTON_SPACING

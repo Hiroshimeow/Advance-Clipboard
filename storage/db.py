@@ -13,22 +13,32 @@ CURRENT_SCHEMA_VERSION = 3
 
 
 def get_connection() -> sqlite3.Connection:
-    """Get thread-local database connection configured for WAL concurrency."""
+    """Get thread-local database connection configured for WAL concurrency and fast in-memory cache."""
     conn = getattr(_local, "conn", None)
-    if conn is not None:
+    conn_path = getattr(_local, "db_file", None)
+    if conn is not None and conn_path == DB_FILE:
         try:
-            conn.execute("SELECT 1")
+            conn.in_transaction
             return conn
         except sqlite3.ProgrammingError:
             _local.conn = None
+
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA cache_size=-16000")
     conn.execute("PRAGMA foreign_keys=ON")
     _local.conn = conn
+    _local.db_file = DB_FILE
     return conn
 
 

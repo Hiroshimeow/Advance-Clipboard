@@ -64,5 +64,40 @@ class FocusF2SafetyTests(unittest.TestCase):
             self.assertTrue(alt_up)
 
 
+
+    def test_ready_to_paste_does_not_block_when_alt_or_ctrl_held(self):
+        from PyQt6.QtWidgets import QApplication
+        app_inst = QApplication.instance() or QApplication([])
+        client = ClientApp(enable_monitor=False, init_data=False)
+        try:
+            client.last_active_window_handle = 5555
+            user32_mock = Mock()
+            user32_mock.IsWindow.return_value = 1
+            user32_mock.IsIconic.return_value = 0
+            user32_mock.GetForegroundWindow.return_value = 5555
+            # Even with VK_MENU and VK_CONTROL held down (e.g. during Alt+1 or Ctrl+Q),
+            # _ready_to_paste must return True immediately without 180ms polling delay
+            user32_mock.GetAsyncKeyState.return_value = 0x8000
+            windll_mock = Mock()
+            windll_mock.user32 = user32_mock
+            with patch("sys.platform", "win32"), patch("main.ctypes.windll", windll_mock, create=True):
+                self.assertTrue(client._ready_to_paste())
+        finally:
+            client.backup_scheduler.cancel()
+            client.close()
+
+    def test_self_clipboard_write_suppresses_monitor_re_read_contention(self):
+        from PyQt6.QtWidgets import QApplication
+        app_inst = QApplication.instance() or QApplication([])
+        client = ClientApp(enable_monitor=False, init_data=False)
+        try:
+            client._set_pending_clipboard_guard({"type": "text", "content": "fast paste"})
+            client.on_clipboard_change_delayed()
+            self.assertFalse(client._clipboard_capture_timer.isActive())
+        finally:
+            client.backup_scheduler.cancel()
+            client.close()
+
+
 if __name__ == "__main__":
     unittest.main()
