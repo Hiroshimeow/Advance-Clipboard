@@ -1,0 +1,9 @@
+{
+  "original_path": "E:\\python_project\\multi-run-apps\\tools\\advance-clipboard",
+  "original_head": "bbd721bbd223d221e17adedeb5bd48b7859c3189",
+  "reference_parent": "bbd721bbd223d221e17adedeb5bd48b7859c3189",
+  "sanitized": false,
+  "notes": [
+    "Included previously ignored uv.lock for reproducible dependencies. Did not copy .plan files or actual local clipboard data."
+  ]
+}
