@@ -4,6 +4,8 @@ from pathlib import Path
 
 from PyQt6.QtWidgets import QInputDialog, QMenu
 
+from core.action_runner import is_valid_url, open_url
+
 
 def resolve_image_path(clip_data):
     from .widgets import IMAGE_DIR
@@ -42,11 +44,23 @@ def _is_image(clip_data):
     return clip_data.get("type") == "image"
 
 
+def _is_url(clip_data):
+    if clip_data.get("type") != "text":
+        return False
+    return is_valid_url(str(clip_data.get("content") or ""))
+
+
+def _open_url_action(clip_data, parent_handler=None):
+    url = str(clip_data.get("content") or "").strip()
+    open_url(url)
+
+
 CONTEXT_ACTIONS = [
     ("Show preview", lambda clip: True, _show_preview),
     ("Open this image", _is_image, _open_image),
     ("Copy image path", _is_image, _copy_image_path),
     ("Open with Paint", _is_image, _open_with_paint),
+    ("Mở URL này", _is_url, _open_url_action),
 ]
 
 
@@ -65,6 +79,19 @@ def show_clip_context_menu(owner, clip_data, is_pinned, parent_handler, global_p
         """
     )
 
+    storage = getattr(parent_handler, "storage", None)
+
+    # 1. RUN action if action exists
+    existing_action = storage.get_clip_action(clip_id) if (storage and hasattr(storage, "get_clip_action")) else None
+    if existing_action:
+        run_act = menu.addAction("⚡ RUN Action")
+        font = run_act.font()
+        font.setBold(True)
+        run_act.setFont(font)
+        run_act.setData(("run_action", None))
+        menu.addSeparator()
+
+    # 2. Preview, Image, URL actions
     extra_action_count = 0
     for index, (label, applies_to, _handler) in enumerate(CONTEXT_ACTIONS):
         if applies_to(clip_data):
@@ -74,8 +101,31 @@ def show_clip_context_menu(owner, clip_data, is_pinned, parent_handler, global_p
     if extra_action_count:
         menu.addSeparator()
 
+    # 3. Shortcut binding
+    existing_shortcut = storage.get_shortcut_for_clip(clip_id) if (storage and hasattr(storage, "get_shortcut_for_clip")) else None
+    if existing_shortcut:
+        sc_edit_act = menu.addAction(f"Đổi phím tắt (Ctrl+{existing_shortcut})...")
+        sc_edit_act.setData(("assign_shortcut", None))
+        sc_remove_act = menu.addAction(f"Gỡ phím tắt (Ctrl+{existing_shortcut})")
+        sc_remove_act.setData(("remove_shortcut", None))
+    else:
+        sc_act = menu.addAction("Gán phím tắt (Ctrl+key)...")
+        sc_act.setData(("assign_shortcut", None))
+    menu.addSeparator()
+
+    # 4. Action configuration
+    if existing_action:
+        act_edit_act = menu.addAction("Sửa Action...")
+        act_edit_act.setData(("configure_action", None))
+        act_remove_act = menu.addAction("Gỡ Action")
+        act_remove_act.setData(("remove_action", None))
+    else:
+        act_add_act = menu.addAction("Gán Action...")
+        act_add_act.setData(("configure_action", None))
+    menu.addSeparator()
+
+    # 5. Group management
     group_menu = menu.addMenu("Add to Group")
-    storage = getattr(parent_handler, "storage", None)
     if storage is not None:
         for group in storage.get_groups():
             action = group_menu.addAction(group)
@@ -91,19 +141,30 @@ def show_clip_context_menu(owner, clip_data, is_pinned, parent_handler, global_p
         remove_action.setData(("remove_group", None))
     menu.addSeparator()
 
+    # 6. Tag & Fix
     add_tag_action = menu.addAction("Add Tag")
     add_tag_action.setData(("tag", None))
     if is_pinned and clip_data.get("type") == "text":
         fix_action = menu.addAction("Fix")
         fix_action.setData(("fix", None))
 
-    action = menu.exec(global_pos)
-    if not action or not action.data():
+    selected_action = menu.exec(global_pos)
+    if not selected_action or not selected_action.data():
         return
 
-    action_type, value = action.data()
+    action_type, value = selected_action.data()
     if action_type == "context_action":
         CONTEXT_ACTIONS[value][2](clip_data, parent_handler)
+    elif action_type == "run_action" and hasattr(parent_handler, "handle_run_action"):
+        parent_handler.handle_run_action(clip_data)
+    elif action_type == "assign_shortcut" and hasattr(parent_handler, "handle_assign_shortcut"):
+        parent_handler.handle_assign_shortcut(clip_data)
+    elif action_type == "remove_shortcut" and hasattr(parent_handler, "handle_remove_shortcut"):
+        parent_handler.handle_remove_shortcut(clip_id)
+    elif action_type == "configure_action" and hasattr(parent_handler, "handle_configure_action"):
+        parent_handler.handle_configure_action(clip_data)
+    elif action_type == "remove_action" and hasattr(parent_handler, "handle_remove_action"):
+        parent_handler.handle_remove_action(clip_id)
     elif action_type == "tag" and hasattr(parent_handler, "handle_add_tag"):
         tag, ok = QInputDialog.getText(
             owner, "Add Tag", "Enter tag name:", text=clip_data.get("tag", "")

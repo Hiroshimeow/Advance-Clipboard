@@ -278,6 +278,18 @@ class ClipRowDelegate(QStyledItemDelegate):
 
     def _badge_text(self, row: ClipRow) -> str:
         clip = row.clip or {}
+        badges = []
+        if getattr(row, "alt_shortcut", ""):
+            badges.append(f"[{row.alt_shortcut}]")
+        sc = clip.get("shortcut_key")
+        if sc:
+            badges.append(f"[Ctrl+{sc}]")
+        if clip.get("has_action"):
+            badges.append("[⚡ Action]")
         tag = str(clip.get("tag", "") or "")
         group_name = str(clip.get("group_name", "") or "")
-        return tag or (f"[{group_name}]" if group_name and not row.is_grouped_child else "")
+        if tag:
+            badges.append(tag)
+        elif group_name and not row.is_grouped_child:
+            badges.append(f"[{group_name}]")
+        return " ".join(badges)

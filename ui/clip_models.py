@@ -21,6 +21,7 @@ class ClipRow:
     is_group_expanded: bool = False
     is_expanded: bool = False
     search_query: str = ""
+    alt_shortcut: str = ""
 
     @property
     def clip_id(self) -> int | None:
@@ -60,9 +61,11 @@ class ClipListItem:
             current = self._model.row_at(self._row)
             group_name = ""
             is_grouped_child = False
+            alt_shortcut = ""
             if current is not None:
                 group_name = current.group_name
                 is_grouped_child = current.is_grouped_child
+                alt_shortcut = current.alt_shortcut
             self._model.replace_row(
                 self._row,
                 ClipRow(
@@ -71,6 +74,7 @@ class ClipListItem:
                     group_name=group_name,
                     is_grouped_child=is_grouped_child,
                     is_pinned=bool(value.get("is_pinned")),
+                    alt_shortcut=alt_shortcut,
                 ),
             )
             return
@@ -87,6 +91,7 @@ class ClipListItem:
                         is_pinned=current.is_pinned,
                         is_expanded=current.is_expanded,
                         search_query=current.search_query,
+                        alt_shortcut=current.alt_shortcut,
                     ),
                 )
                 return

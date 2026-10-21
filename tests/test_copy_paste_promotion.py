@@ -8,6 +8,7 @@ sys.path.insert(0, ROOT_DIR)
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+_orig_cm = sys.modules.get("core.clipboard_monitor")
 sys.modules.setdefault("core.clipboard_monitor", MagicMock())
 
 
@@ -241,3 +242,10 @@ class CopyPastePromotionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def tearDownModule():
+    if _orig_cm is not None:
+        sys.modules["core.clipboard_monitor"] = _orig_cm
+    else:
+        sys.modules.pop("core.clipboard_monitor", None)

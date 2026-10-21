@@ -1,17 +1,18 @@
 """
-SQLite Storage Layer for Clipboard Manager (Facade)
-- Single source of truth
-- MD5 hash dedup
-- Pagination support
-- Thread-safe operations
+SQLite Storage Layer for Advance Clipboard Workspace (Facade)
+- Single source of truth with WAL mode
+- MD5 hash deduplication
+- Selective FTS5 trigram + covering-index hybrid retrieval
+- Persistent clip shortcuts (Ctrl+key) and clip actions (RUN / Ctrl+Enter)
+- JSON backup & recovery
 """
 
 from typing import Optional, List, Dict, Any, Tuple
 from .db import (
     get_connection,
+    close_connection,
     transaction,
     init_db,
-
     DB_FILE,
 )
 
@@ -21,7 +22,6 @@ _transaction = transaction
 
 from .clips import ClipRepository, compute_hash
 from .search import SearchService
-
 
 
 def _lexical_tier(row: Dict[str, Any], query: str, *, include_meta: bool = False) -> int:
@@ -81,21 +81,27 @@ def _rank_lexical_rows(
 
 def _parse_tag_search_query(query: str) -> Optional[str]:
     normalized = (query or "").strip()
-    if normalized.lower().startswith("tag:"):
-        keyword = normalized[4:].strip()
-        return keyword or None
+    lower = normalized.lower()
+    for prefix in ("tags:", "tag:"):
+        if lower.startswith(prefix):
+            kw = normalized[len(prefix):].strip()
+            return kw if kw else ""
     parts = normalized.split(maxsplit=1)
-    if len(parts) != 2:
-        return None
-    prefix, keyword = parts[0].lower(), parts[1].strip()
-    if prefix not in {"tag", "tags"} or not keyword:
-        return None
-    return keyword
+    if len(parts) == 1 and parts[0].lower() in {"tag", "tags"}:
+        return ""
+    if len(parts) == 2 and parts[0].lower() in {"tag", "tags"}:
+        return parts[1].strip()
+    return None
 
 
 def _is_image_filter_query(query: str) -> bool:
-    normalized = " ".join((query or "").strip().lower().replace(":", ": ").split())
-    return normalized in {"type image", "type img", "type: image", "type: img"}
+    s = (query or "").strip().lower()
+    norm = " ".join(s.replace(":", ": ").split())
+    if norm in {"type image", "type img", "type: image", "type: img"}:
+        return True
+    if s in {"image:", "img:", "images:", "type:image", "type:img", "type:images"}:
+        return True
+    return False
 
 
 def _fts_match_expression(terms: List[str], *, column: Optional[str] = None) -> Optional[str]:
@@ -115,19 +121,11 @@ class ClipboardStorage:
     def __init__(self):
         self.clips = ClipRepository()
         self.search = SearchService()
-
-
-
-
-        # Initialize tables
         init_db()
-
 
     def set_backup_callback(self, callback):
         """Set callback to trigger backup when data changes."""
         self._backup_callback = callback
-
-
 
     def _mark_dirty(self):
         """Mark that backup is needed."""
@@ -136,14 +134,22 @@ class ClipboardStorage:
         if self._backup_callback:
             self._backup_callback()
 
-
-
     @property
     def need_backup(self) -> bool:
         return ClipboardStorage._need_backup
 
     def clear_backup_flag(self):
         ClipboardStorage._need_backup = False
+
+    def _fts_probe_rowids(self, conn, fts_query: str, cap: int = 400) -> Optional[List[int]]:
+        """Probe FTS5 rowids to optimize selective and non-matching queries."""
+        rows = conn.execute(
+            "SELECT rowid FROM clips_fts WHERE clips_fts MATCH ? LIMIT ?",
+            (fts_query, cap + 1),
+        ).fetchall()
+        if len(rows) <= cap:
+            return [int(r[0]) for r in rows]
+        return None
 
     # ==================== PUBLIC API (delegated) ====================
 
@@ -153,24 +159,19 @@ class ClipboardStorage:
 
     def add_clip(self, clip_type: str, content: str, tag: str = "") -> Tuple[int, bool]:
         clip_id, is_new, was_pinned = self.clips.add_clip(clip_type, content, tag)
-        if is_new or True:  # always mark dirty for updated_at changes
-            self._mark_dirty()
-
-
+        self._mark_dirty()
         return clip_id, is_new
 
     def pin_clip(self, clip_id: int) -> bool:
         ok = self.clips.pin_clip(clip_id)
         if ok:
             self._mark_dirty()
-
         return ok
 
     def unpin_clip(self, clip_id: int) -> bool:
         ok = self.clips.unpin_clip(clip_id)
         if ok:
             self._mark_dirty()
-
         return ok
 
     def delete_clip(self, clip_id: int) -> bool:
@@ -251,13 +252,67 @@ class ClipboardStorage:
         return self.clips.is_duplicate(content)
 
     def import_clips(self, clips: List[Dict[str, Any]]) -> int:
-        return self.clips.import_clips(clips)
+        count = self.clips.import_clips(clips)
+        if count > 0:
+            self._mark_dirty()
+        return count
 
     def is_db_valid(self) -> bool:
         return self.clips.is_db_valid()
 
     def get_clip_count(self) -> int:
         return self.clips.get_clip_count()
+
+    # ==================== SHORTCUT & ACTION DELEGATES ====================
+
+    def assign_shortcut(self, clip_id: int, key: str, *, force: bool = False) -> Tuple[bool, Optional[int]]:
+        ok, conflict_id = self.clips.assign_shortcut(clip_id, key, force=force)
+        if ok:
+            self._mark_dirty()
+        return ok, conflict_id
+
+    def remove_shortcut(self, clip_id: int) -> bool:
+        ok = self.clips.remove_shortcut(clip_id)
+        if ok:
+            self._mark_dirty()
+        return ok
+
+    def get_shortcut_for_clip(self, clip_id: int) -> Optional[str]:
+        return self.clips.get_shortcut_for_clip(clip_id)
+
+    def get_clip_by_shortcut(self, key: str) -> Optional[Dict[str, Any]]:
+        return self.clips.get_clip_by_shortcut(key)
+
+    def get_all_shortcuts(self) -> Dict[int, str]:
+        return self.clips.get_all_shortcuts()
+
+    def set_clip_action(
+        self,
+        clip_id: int,
+        action_type: str,
+        target: str,
+        *,
+        args: Optional[List[str]] = None,
+        is_background: bool = False,
+    ) -> bool:
+        ok = self.clips.set_clip_action(
+            clip_id, action_type, target, args=args, is_background=is_background
+        )
+        if ok:
+            self._mark_dirty()
+        return ok
+
+    def get_clip_action(self, clip_id: int) -> Optional[Dict[str, Any]]:
+        return self.clips.get_clip_action(clip_id)
+
+    def remove_clip_action(self, clip_id: int) -> bool:
+        ok = self.clips.remove_clip_action(clip_id)
+        if ok:
+            self._mark_dirty()
+        return ok
+
+    def get_all_clip_actions(self) -> Dict[int, Dict[str, Any]]:
+        return self.clips.get_all_clip_actions()
 
     # ==================== SEARCH OPERATIONS (delegated) ====================
 
@@ -306,6 +361,18 @@ class ClipboardStorage:
         conn = get_connection()
         fts_query = _fts_match_expression(terms)
         if fts_query is not None:
+            selective_ids = self._fts_probe_rowids(conn, fts_query)
+            if selective_ids is not None:
+                if not selective_ids:
+                    return []
+                placeholders = ",".join("?" for _ in selective_ids)
+                rows = conn.execute(
+                    f"""SELECT * FROM clips
+                        WHERE is_pinned = 1 AND id IN ({placeholders})
+                        ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ?""",
+                    selective_ids + [limit],
+                ).fetchall()
+                return [dict(r) for r in rows]
             rows = conn.execute(
                 """SELECT * FROM clips INDEXED BY idx_pinned_search
                    WHERE is_pinned = 1
@@ -335,6 +402,22 @@ class ClipboardStorage:
         conn = get_connection()
         fts_query = _fts_match_expression(terms, column="tag")
         if fts_query is not None:
+            selective_ids = self._fts_probe_rowids(conn, fts_query)
+            if selective_ids is not None:
+                if not selective_ids:
+                    return []
+                placeholders = ",".join("?" for _ in selective_ids)
+                rows = conn.execute(
+                    f"""SELECT * FROM clips
+                        WHERE is_pinned = 1 AND tag <> '' AND id IN ({placeholders})
+                        ORDER BY CASE
+                            WHEN LOWER(TRIM(tag)) = ? THEN 0
+                            WHEN LOWER(TRIM(tag)) LIKE ? ESCAPE '\\' THEN 1
+                            ELSE 2
+                        END, updated_at DESC, pin_order DESC, id DESC LIMIT ?""",
+                    selective_ids + [tag_query_cmp, prefix_pattern, limit],
+                ).fetchall()
+                return [dict(r) for r in rows]
             rows = conn.execute(
                 """SELECT * FROM clips INDEXED BY idx_pinned
                    WHERE is_pinned = 1 AND tag <> ''
@@ -366,13 +449,20 @@ class ClipboardStorage:
 
     def _search_pinned_tags_sql(self, query: str, limit: int, offset: int = 0) -> List[Dict[str, Any]]:
         terms = self.search.split_search_terms(query)
-        if not terms:
-            return []
         conn = get_connection()
+        if not terms:
+            rows = conn.execute(
+                """SELECT * FROM clips INDEXED BY idx_pinned_search
+                   WHERE is_pinned = 1 AND tag <> ''
+                   ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ? OFFSET ?""",
+                (limit, offset),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
         fts_query = _fts_match_expression(terms, column="tag")
         if fts_query is not None:
             rows = conn.execute(
-                """SELECT * FROM clips
+                """SELECT * FROM clips INDEXED BY idx_pinned_search
                    WHERE is_pinned = 1 AND tag <> ''
                      AND id IN (SELECT rowid FROM clips_fts WHERE clips_fts MATCH ?)
                    ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ? OFFSET ?""",
@@ -441,6 +531,19 @@ class ClipboardStorage:
         conn = get_connection()
         fts_query = _fts_match_expression(terms)
         if fts_query is not None:
+            selective_ids = self._fts_probe_rowids(conn, fts_query)
+            if selective_ids is not None:
+                if not selective_ids:
+                    return []
+                placeholders = ",".join("?" for _ in selective_ids)
+                rows = conn.execute(
+                    f"""SELECT * FROM clips
+                        WHERE id IN ({placeholders})
+                          AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
+                        ORDER BY updated_at DESC LIMIT ?""",
+                    selective_ids + [limit],
+                ).fetchall()
+                return [dict(r) for r in rows]
             rows = conn.execute(
                 """SELECT * FROM clips INDEXED BY idx_updated
                    WHERE id IN (SELECT rowid FROM clips_fts WHERE clips_fts MATCH ?)
@@ -473,6 +576,23 @@ class ClipboardStorage:
         conn = get_connection()
         fts_query = _fts_match_expression(terms, column="tag")
         if fts_query is not None:
+            selective_ids = self._fts_probe_rowids(conn, fts_query)
+            if selective_ids is not None:
+                if not selective_ids:
+                    return []
+                placeholders = ",".join("?" for _ in selective_ids)
+                rows = conn.execute(
+                    f"""SELECT * FROM clips
+                        WHERE tag <> '' AND id IN ({placeholders})
+                          AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
+                        ORDER BY CASE
+                            WHEN LOWER(TRIM(tag)) = ? THEN 0
+                            WHEN LOWER(TRIM(tag)) LIKE ? ESCAPE '\\' THEN 1
+                            ELSE 2
+                        END, updated_at DESC, id DESC LIMIT ?""",
+                    selective_ids + [tag_query_cmp, prefix_pattern, limit],
+                ).fetchall()
+                return [dict(r) for r in rows]
             rows = conn.execute(
                 """SELECT * FROM clips
                    WHERE tag <> ''
@@ -506,9 +626,17 @@ class ClipboardStorage:
 
     def _search_history_tags_sql(self, query: str, limit: int, offset: int = 0) -> List[Dict[str, Any]]:
         terms = self.search.split_search_terms(query)
-        if not terms:
-            return []
         conn = get_connection()
+        if not terms:
+            rows = conn.execute(
+                """SELECT * FROM clips INDEXED BY idx_updated
+                   WHERE tag <> ''
+                     AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
+                   ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?""",
+                (limit, offset),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
         fts_query = _fts_match_expression(terms, column="tag")
         if fts_query is not None:
             rows = conn.execute(
@@ -537,12 +665,8 @@ class ClipboardStorage:
         return [dict(r) for r in rows]
 
 
-
 # Global instance
 _storage: Optional[ClipboardStorage] = None
-
-
-
 
 
 def get_storage() -> ClipboardStorage:

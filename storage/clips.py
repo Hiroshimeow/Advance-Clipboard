@@ -1,4 +1,5 @@
 import hashlib
+import json
 import sqlite3
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
@@ -25,9 +26,6 @@ class ClipRepository:
         now = datetime.now().isoformat()
 
         with transaction() as conn:
-            # Make dedupe atomic. A separate SELECT followed by INSERT can race
-            # when two clipboard events or two app instances ingest the same
-            # content at the same time.
             cursor = conn.execute(
                 """INSERT OR IGNORE INTO clips
                    (type, content, hash, tag, is_pinned, pinned_at, created_at, updated_at)
@@ -45,7 +43,6 @@ class ClipRepository:
             if not existing:
                 raise RuntimeError("Clip dedupe conflict resolved without an existing row.")
 
-            # Duplicate found - update timestamp to push to top.
             current_updated_at = existing["updated_at"]
             if current_updated_at:
                 try:
@@ -64,7 +61,6 @@ class ClipRepository:
         """Pin a clip (move to pinned section)."""
         now = datetime.now().isoformat()
         with transaction() as conn:
-            # Get max pin_order
             max_order = conn.execute(
                 "SELECT COALESCE(MAX(pin_order), 0) FROM clips WHERE is_pinned = 1"
             ).fetchone()[0]
@@ -86,8 +82,10 @@ class ClipRepository:
             return True
 
     def delete_clip(self, clip_id: int) -> bool:
-        """Delete a clip by ID."""
+        """Delete a clip by ID, cleaning up shortcuts and actions in the same transaction."""
         with transaction() as conn:
+            conn.execute("DELETE FROM clip_shortcuts WHERE clip_id = ?", (clip_id,))
+            conn.execute("DELETE FROM clip_actions WHERE clip_id = ?", (clip_id,))
             conn.execute("DELETE FROM clips WHERE id = ?", (clip_id,))
             return True
 
@@ -122,15 +120,11 @@ class ClipRepository:
             ).fetchone()
             if existing:
                 if clip["is_pinned"] and not existing["is_pinned"]:
-                    # Editing a pinned clip may converge on content that was
-                    # already captured in history. Keep the pinned record and
-                    # remove the redundant history row before updating it.
                     conn.execute("DELETE FROM clips WHERE id = ?", (existing["id"],))
                 else:
                     raise ValueError("Another pinned clip already has this content.")
             updated_at = now
             if clip["is_pinned"]:
-                # Keep current history visibility semantics for pinned edits.
                 updated_at = clip["updated_at"] or now
             conn.execute(
                 "UPDATE clips SET content = ?, hash = ?, updated_at = ? WHERE id = ?",
@@ -175,7 +169,6 @@ class ClipRepository:
         """Move clip up/down in its list."""
         with transaction() as conn:
             if is_pinned:
-                # Get current order
                 current = conn.execute(
                     "SELECT pin_order FROM clips WHERE id = ?", (clip_id,)
                 ).fetchone()
@@ -185,14 +178,12 @@ class ClipRepository:
                 current_order = current["pin_order"]
                 new_order = current_order + direction
 
-                # Find clip at target position
                 target = conn.execute(
                     "SELECT id FROM clips WHERE is_pinned = 1 AND pin_order = ?",
                     (new_order,),
                 ).fetchone()
 
                 if target:
-                    # Swap positions
                     conn.execute(
                         "UPDATE clips SET pin_order = ? WHERE id = ?",
                         (new_order, clip_id),
@@ -203,7 +194,6 @@ class ClipRepository:
                         (current_order, target_id),
                     )
             else:
-                # For history, reorder by updated_at
                 rows = conn.execute(
                     "SELECT id FROM clips WHERE is_pinned = 0 ORDER BY updated_at DESC"
                 ).fetchall()
@@ -217,7 +207,6 @@ class ClipRepository:
                 new_idx = idx + direction
                 if 0 <= new_idx < len(clip_ids):
                     clip_ids[idx], clip_ids[new_idx] = clip_ids[new_idx], clip_ids[idx]
-                    # Update timestamps to reflect new order
                     base_time = datetime.now()
                     for i, cid in enumerate(clip_ids):
                         new_time = base_time.timestamp() - i * 0.001
@@ -230,12 +219,32 @@ class ClipRepository:
     def clear_history(self) -> int:
         """Clear all non-pinned clips. Returns count deleted."""
         with transaction() as conn:
+            conn.execute(
+                """DELETE FROM clip_shortcuts WHERE clip_id IN (
+                       SELECT id FROM clips WHERE is_pinned = 0
+                   )"""
+            )
+            conn.execute(
+                """DELETE FROM clip_actions WHERE clip_id IN (
+                       SELECT id FROM clips WHERE is_pinned = 0
+                   )"""
+            )
             cursor = conn.execute("DELETE FROM clips WHERE is_pinned = 0")
             return cursor.rowcount
 
     def clear_pinned(self) -> int:
         """Clear all pinned clips. Returns count deleted."""
         with transaction() as conn:
+            conn.execute(
+                """DELETE FROM clip_shortcuts WHERE clip_id IN (
+                       SELECT id FROM clips WHERE is_pinned = 1
+                   )"""
+            )
+            conn.execute(
+                """DELETE FROM clip_actions WHERE clip_id IN (
+                       SELECT id FROM clips WHERE is_pinned = 1
+                   )"""
+            )
             cursor = conn.execute("DELETE FROM clips WHERE is_pinned = 1")
             return cursor.rowcount
 
@@ -279,12 +288,22 @@ class ClipRepository:
         return dict(row) if row else None
 
     def get_all_clips(self) -> List[Dict[str, Any]]:
-        """Get all clips (for backup)."""
+        """Get all clips with attached shortcuts and actions for backup."""
         conn = get_connection()
         rows = conn.execute(
             "SELECT * FROM clips ORDER BY is_pinned DESC, updated_at DESC"
         ).fetchall()
-        return [dict(r) for r in rows]
+        out = []
+        for r in rows:
+            d = dict(r)
+            sc = self.get_shortcut_for_clip(d["id"])
+            if sc:
+                d["shortcut_key"] = sc
+            act = self.get_clip_action(d["id"])
+            if act:
+                d["action"] = act
+            out.append(d)
+        return out
 
     def get_history_count(self) -> int:
         """Get total count of history clips."""
@@ -311,7 +330,7 @@ class ClipRepository:
         return row is not None
 
     def import_clips(self, clips: List[Dict[str, Any]]) -> int:
-        """Import clips from backup."""
+        """Import clips from backup with shortcut and action restoration."""
         count = 0
         with transaction() as conn:
             for clip in clips:
@@ -324,12 +343,15 @@ class ClipRepository:
                 content_hash = clip.get("hash") or compute_hash(content)
                 created_at = clip.get("created_at", datetime.now().isoformat())
                 updated_at = clip.get("updated_at", created_at)
+                pinned_at = clip.get("pinned_at")
+                if is_pinned and not pinned_at:
+                    pinned_at = updated_at
 
                 try:
                     cursor = conn.execute(
                         """INSERT OR IGNORE INTO clips 
-                           (type, content, hash, tag, group_name, is_pinned, pin_order, created_at, updated_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           (type, content, hash, tag, group_name, is_pinned, pin_order, pinned_at, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             clip_type,
                             content,
@@ -338,11 +360,43 @@ class ClipRepository:
                             group_name,
                             is_pinned,
                             pin_order,
+                            pinned_at,
                             created_at,
                             updated_at,
                         ),
                     )
                     count += cursor.rowcount
+                    imported_id = cursor.lastrowid
+                    if not imported_id:
+                        row = conn.execute("SELECT id FROM clips WHERE hash = ?", (content_hash,)).fetchone()
+                        imported_id = row[0] if row else None
+
+                    # Restore shortcut if provided
+                    if imported_id and clip.get("shortcut_key"):
+                        skey = str(clip["shortcut_key"]).strip().upper()
+                        if len(skey) == 1 and skey.isalnum():
+                            conn.execute(
+                                """INSERT OR REPLACE INTO clip_shortcuts (clip_id, shortcut_key)
+                                   VALUES (?, ?)""",
+                                (imported_id, skey),
+                            )
+
+                    # Restore action if provided
+                    if imported_id and clip.get("action"):
+                        act = clip["action"]
+                        conn.execute(
+                            """INSERT OR REPLACE INTO clip_actions
+                               (clip_id, action_type, target, args_json, is_background, updated_at)
+                               VALUES (?, ?, ?, ?, ?, ?)""",
+                            (
+                                imported_id,
+                                act.get("action_type", "command"),
+                                act.get("target", ""),
+                                json.dumps(act.get("args", [])),
+                                1 if act.get("is_background") else 0,
+                                act.get("updated_at", datetime.now().isoformat()),
+                            ),
+                        )
                 except sqlite3.IntegrityError:
                     pass
         return count
@@ -363,3 +417,154 @@ class ClipRepository:
             return conn.execute("SELECT COUNT(*) FROM clips").fetchone()[0]
         except Exception:
             return 0
+
+    # ==================== SHORTCUT OPERATIONS ====================
+
+    def assign_shortcut(
+        self, clip_id: int, key: str, *, force: bool = False
+    ) -> Tuple[bool, Optional[int]]:
+        """
+        Assign a single shortcut key (0-9, A-Z) to a clip.
+        Returns (success, existing_clip_id_if_conflict).
+        """
+        norm_key = (key or "").strip().upper()
+        if len(norm_key) != 1 or not norm_key.isalnum():
+            raise ValueError("Phím tắt chỉ chấp nhận đúng một ký tự (0-9 hoặc A-Z).")
+
+        with transaction() as conn:
+            clip = conn.execute("SELECT id FROM clips WHERE id = ?", (clip_id,)).fetchone()
+            if not clip:
+                return False, None
+
+            existing = conn.execute(
+                "SELECT clip_id FROM clip_shortcuts WHERE shortcut_key = ? COLLATE NOCASE",
+                (norm_key,),
+            ).fetchone()
+
+            if existing:
+                existing_id = int(existing["clip_id"])
+                if existing_id == clip_id:
+                    return True, None
+                if not force:
+                    return False, existing_id
+                conn.execute(
+                    "DELETE FROM clip_shortcuts WHERE shortcut_key = ? COLLATE NOCASE",
+                    (norm_key,),
+                )
+
+            conn.execute(
+                """INSERT INTO clip_shortcuts (clip_id, shortcut_key)
+                   VALUES (?, ?)
+                   ON CONFLICT(clip_id) DO UPDATE SET shortcut_key = excluded.shortcut_key""",
+                (clip_id, norm_key),
+            )
+            return True, None
+
+    def remove_shortcut(self, clip_id: int) -> bool:
+        """Remove shortcut assigned to clip."""
+        with transaction() as conn:
+            cursor = conn.execute("DELETE FROM clip_shortcuts WHERE clip_id = ?", (clip_id,))
+            return cursor.rowcount > 0
+
+    def get_shortcut_for_clip(self, clip_id: int) -> Optional[str]:
+        """Get shortcut key for a clip if assigned."""
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT shortcut_key FROM clip_shortcuts WHERE clip_id = ?", (clip_id,)
+        ).fetchone()
+        return str(row["shortcut_key"]) if row else None
+
+    def get_clip_by_shortcut(self, key: str) -> Optional[Dict[str, Any]]:
+        """Find the clip mapped to a shortcut key."""
+        norm_key = (key or "").strip().upper()
+        if not norm_key:
+            return None
+        conn = get_connection()
+        row = conn.execute(
+            """SELECT c.* FROM clips c
+               JOIN clip_shortcuts s ON s.clip_id = c.id
+               WHERE s.shortcut_key = ? COLLATE NOCASE""",
+            (norm_key,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_all_shortcuts(self) -> Dict[int, str]:
+        """Get map of {clip_id: shortcut_key}."""
+        conn = get_connection()
+        rows = conn.execute("SELECT clip_id, shortcut_key FROM clip_shortcuts").fetchall()
+        return {int(r["clip_id"]): str(r["shortcut_key"]) for r in rows}
+
+    # ==================== ACTION OPERATIONS ====================
+
+    def set_clip_action(
+        self,
+        clip_id: int,
+        action_type: str,
+        target: str,
+        *,
+        args: Optional[List[str]] = None,
+        is_background: bool = False,
+    ) -> bool:
+        """
+        Configure an executable action on a clip.
+        action_type: 'python_inline', 'script_file', 'command'
+        """
+        if action_type not in ("python_inline", "script_file", "command"):
+            raise ValueError(f"Loại action không hợp lệ: {action_type}")
+        now = datetime.now().isoformat()
+        args_json = json.dumps(args or [], ensure_ascii=False)
+        with transaction() as conn:
+            clip = conn.execute("SELECT id FROM clips WHERE id = ?", (clip_id,)).fetchone()
+            if not clip:
+                return False
+            conn.execute(
+                """INSERT INTO clip_actions (clip_id, action_type, target, args_json, is_background, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(clip_id) DO UPDATE SET
+                       action_type = excluded.action_type,
+                       target = excluded.target,
+                       args_json = excluded.args_json,
+                       is_background = excluded.is_background,
+                       updated_at = excluded.updated_at""",
+                (clip_id, action_type, target.strip(), args_json, 1 if is_background else 0, now),
+            )
+            return True
+
+    def get_clip_action(self, clip_id: int) -> Optional[Dict[str, Any]]:
+        """Get action configuration for a clip if configured."""
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT action_type, target, args_json, is_background, updated_at FROM clip_actions WHERE clip_id = ?",
+            (clip_id,),
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            d["args"] = json.loads(d.get("args_json") or "[]")
+        except Exception:
+            d["args"] = []
+        d["is_background"] = bool(d.get("is_background"))
+        return d
+
+    def remove_clip_action(self, clip_id: int) -> bool:
+        """Remove action assigned to clip."""
+        with transaction() as conn:
+            cursor = conn.execute("DELETE FROM clip_actions WHERE clip_id = ?", (clip_id,))
+            return cursor.rowcount > 0
+
+    def get_all_clip_actions(self) -> Dict[int, Dict[str, Any]]:
+        """Get all configured actions."""
+        conn = get_connection()
+        rows = conn.execute("SELECT * FROM clip_actions").fetchall()
+        out = {}
+        for r in rows:
+            cid = int(r["clip_id"])
+            d = dict(r)
+            try:
+                d["args"] = json.loads(d.get("args_json") or "[]")
+            except Exception:
+                d["args"] = []
+            d["is_background"] = bool(d.get("is_background"))
+            out[cid] = d
+        return out

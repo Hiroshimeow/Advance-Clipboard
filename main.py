@@ -327,6 +327,9 @@ class ClientApp(QWidget):
             on_up=self.browser.nav_up,
             on_down=self.browser.nav_down,
             on_enter=self.browser.activate_current,
+            on_ctrl_enter=self.browser.activate_current_action,
+            on_alt_digit=self.browser.handle_alt_digit,
+            on_ctrl_key=self.browser.handle_ctrl_shortcut,
         )
         search_row.addWidget(self.search_input, stretch=1)
 
@@ -502,17 +505,8 @@ class ClientApp(QWidget):
             try:
                 our_hwnd = int(self.winId())
                 user32 = ctypes.windll.user32
-                f_hwnd = user32.GetForegroundWindow()
-                if f_hwnd != our_hwnd:
-                    ft, at = (
-                        user32.GetWindowThreadProcessId(f_hwnd, None),
-                        user32.GetWindowThreadProcessId(our_hwnd, None),
-                    )
-                    user32.AttachThreadInput(ft, at, True)
-                    user32.SetForegroundWindow(our_hwnd)
-                    user32.SetFocus(our_hwnd)
-                    user32.AttachThreadInput(ft, at, False)
-            except:
+                user32.SetForegroundWindow(our_hwnd)
+            except Exception:
                 pass
         self.raise_()
         self.activateWindow()
@@ -576,6 +570,92 @@ class ClientApp(QWidget):
         self.browser.active_side = "history"
         self.refresh_lists()
         self.is_ui_dirty = False
+
+    def keyPressEvent(self, event):
+        k = event.key()
+        modifiers = event.modifiers()
+        is_repeat = bool(getattr(event, "isAutoRepeat", lambda: False)())
+
+        if (modifiers & Qt.KeyboardModifier.ControlModifier) and k in (
+            Qt.Key.Key_Return,
+            Qt.Key.Key_Enter,
+        ):
+            if not is_repeat:
+                self.browser.activate_current_action()
+                event.accept()
+                return
+
+        if (modifiers & Qt.KeyboardModifier.AltModifier) and not (
+            modifiers & Qt.KeyboardModifier.ControlModifier
+        ):
+            if Qt.Key.Key_1 <= k <= Qt.Key.Key_6:
+                digit = k - Qt.Key.Key_0
+                if not is_repeat and self.browser.handle_alt_digit(digit):
+                    event.accept()
+                    return
+
+        if (modifiers & Qt.KeyboardModifier.ControlModifier) and not (
+            modifiers & Qt.KeyboardModifier.AltModifier
+        ):
+            char = event.text()
+            if not char:
+                if Qt.Key.Key_0 <= k <= Qt.Key.Key_9 or Qt.Key.Key_A <= k <= Qt.Key.Key_Z:
+                    char = chr(k)
+            if char and len(char) == 1 and char.isalnum() and not is_repeat:
+                if self.browser.handle_ctrl_shortcut(char.upper()):
+                    event.accept()
+                    return
+
+        super().keyPressEvent(event)
+
+    def handle_assign_shortcut(self, clip_data):
+        from ui.widgets import ShortcutAssignDialog
+        dlg = ShortcutAssignDialog(clip_data, self.storage, parent=self)
+        if dlg.exec():
+            self.browser.refresh_shortcuts_and_actions()
+            self.refresh_lists()
+
+    def handle_remove_shortcut(self, clip_id):
+        self.storage.remove_shortcut(clip_id)
+        self.browser.refresh_shortcuts_and_actions()
+        self.refresh_lists()
+
+    def handle_configure_action(self, clip_data):
+        from ui.widgets import ActionConfigDialog
+        dlg = ActionConfigDialog(clip_data, self.storage, parent=self)
+        if dlg.exec():
+            self.browser.refresh_shortcuts_and_actions()
+            self.refresh_lists()
+
+    def handle_remove_action(self, clip_id):
+        self.storage.remove_clip_action(clip_id)
+        self.browser.refresh_shortcuts_and_actions()
+        self.refresh_lists()
+
+    def handle_open_url(self, url):
+        from core.action_runner import open_url
+        open_url(url)
+
+    def handle_run_action(self, clip_data):
+        self.handle_run_clip_action_or_url(clip_data)
+
+    def handle_run_clip_action_or_url(self, clip_data):
+        clip_id = clip_data.get("id")
+        if not clip_id:
+            return
+
+        action = self.storage.get_clip_action(clip_id)
+        if action:
+            from core.action_runner import ActionRunner
+            def on_done(res):
+                logger.info("action_done clip_id=%s success=%s code=%s msg=%s", clip_id, res.success, res.exit_code, res.message)
+            ActionRunner.execute_action(clip_id, action, on_complete=on_done)
+            return
+
+        content = str(clip_data.get("content", "")).strip()
+        from core.action_runner import is_valid_url, open_url
+        if is_valid_url(content):
+            open_url(content)
 
     def closeEvent(self, event):
         """Clean up on close."""
@@ -922,8 +1002,9 @@ class ClientApp(QWidget):
                     )
                     self._finish_paste_attempt(clear_guard=False)
                     return
-            simulate_paste()
-            logger.info("simulate_paste_done target_hwnd=%s", target_hwnd)
+            focus_hwnd = getattr(self, "last_focus_window_handle", None)
+            simulate_paste(target_hwnd=target_hwnd, focus_hwnd=focus_hwnd)
+            logger.info("simulate_paste_done target_hwnd=%s focus_hwnd=%s", target_hwnd, focus_hwnd)
         except Exception as exc:
             logger.error("perform_keyboard_paste_failed: %s", exc)
         self._finish_paste_attempt()

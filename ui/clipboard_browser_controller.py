@@ -57,6 +57,10 @@ class ClipboardBrowserController:
         self._layout_refresh_timer.setSingleShot(True)
         self._layout_refresh_timer.timeout.connect(self._refresh_visible_row_layouts)
 
+        self._shortcuts_cache = {}
+        self._actions_cache = {}
+        self.refresh_shortcuts_and_actions()
+
 
 
     def bind_viewports(self):
@@ -90,32 +94,58 @@ class ClipboardBrowserController:
         self.app.list_history.doItemsLayout()
         self.app.list_pinned.doItemsLayout()
 
-    def build_clip_row(self, clip, is_pinned, *, is_grouped=False, group_name="", search_query=""):
+    def refresh_shortcuts_and_actions(self):
+        try:
+            self._shortcuts_cache = self.storage.get_all_shortcuts()
+            self._actions_cache = {cid: True for cid in self.storage.get_all_clip_actions()}
+        except Exception:
+            self._shortcuts_cache = {}
+            self._actions_cache = {}
+
+    def build_clip_row(self, clip, is_pinned, *, is_grouped=False, group_name="", search_query="", alt_shortcut=""):
+        clip_dict = dict(clip)
+        cid = clip_dict.get("id")
+        if cid:
+            if "shortcut_key" not in clip_dict:
+                clip_dict["shortcut_key"] = self._shortcuts_cache.get(cid)
+            if "has_action" not in clip_dict:
+                clip_dict["has_action"] = bool(self._actions_cache.get(cid))
+
         return ClipRow(
             row_kind="clip",
-            clip=dict(clip),
+            clip=clip_dict,
             group_name=group_name or str(clip.get("group_name", "") or ""),
             is_pinned=bool(is_pinned),
             is_grouped_child=bool(is_grouped),
-            is_expanded=clip.get("id") in self.expanded_clip_ids,
+            is_expanded=clip_dict.get("id") in self.expanded_clip_ids,
             search_query=search_query,
+            alt_shortcut=alt_shortcut,
         )
 
     def build_history_rows(self, clips):
-        return [
-            self.build_clip_row(clip, False, search_query=self.current_search_query)
-            for clip in clips
-        ]
+        rows = []
+        for i, clip in enumerate(clips):
+            alt_sc = f"Alt+{i+1}" if i < 3 else ""
+            rows.append(
+                self.build_clip_row(
+                    clip, False, search_query=self.current_search_query, alt_shortcut=alt_sc
+                )
+            )
+        return rows
 
     def build_pinned_rows(self, groups=None, ungrouped=None, pinned_clips=None):
         query = self.current_search_query
         if pinned_clips is not None:
-            return [
-                self.build_clip_row(clip, True, search_query=query)
-                for clip in pinned_clips
-            ]
+            rows = []
+            for i, clip in enumerate(pinned_clips):
+                alt_sc = f"Alt+{i+4}" if i < 3 else ""
+                rows.append(
+                    self.build_clip_row(clip, True, search_query=query, alt_shortcut=alt_sc)
+                )
+            return rows
 
         rows = []
+        pasteable_count = 0
         for group_name, clips in groups or []:
             expanded = group_name in self.expanded_groups
             rows.append(
@@ -129,20 +159,25 @@ class ClipboardBrowserController:
                 )
             )
             if expanded:
-                rows.extend(
-                    self.build_clip_row(
-                        clip,
-                        True,
-                        is_grouped=True,
-                        group_name=group_name,
-                        search_query=query,
+                for clip in clips:
+                    alt_sc = f"Alt+{pasteable_count+4}" if pasteable_count < 3 else ""
+                    pasteable_count += 1
+                    rows.append(
+                        self.build_clip_row(
+                            clip,
+                            True,
+                            is_grouped=True,
+                            group_name=group_name,
+                            search_query=query,
+                            alt_shortcut=alt_sc,
+                        )
                     )
-                    for clip in clips
-                )
-        rows.extend(
-            self.build_clip_row(clip, True, search_query=query)
-            for clip in (ungrouped or [])
-        )
+        for clip in (ungrouped or []):
+            alt_sc = f"Alt+{pasteable_count+4}" if pasteable_count < 3 else ""
+            pasteable_count += 1
+            rows.append(
+                self.build_clip_row(clip, True, search_query=query, alt_shortcut=alt_sc)
+            )
         return rows
 
     def start_background_refresh(self):
@@ -433,6 +468,66 @@ class ClipboardBrowserController:
         self.app.handle_paste(data)
         self.app.search_input.setFocus()
 
+    def activate_current_action(self):
+        """Run action or open URL for currently selected clip."""
+        w = self._active_list()
+        if not w:
+            return
+        self._ensure_current_item()
+        ci = w.currentItem()
+        if not self._is_pasteable_item(ci):
+            return
+        data = ci.data(Qt.ItemDataRole.UserRole)
+        if not data or not data.get("id"):
+            return
+        self.app.handle_run_clip_action_or_url(data)
+
+    def get_column_clips(self, side: str) -> list:
+        """Get visible, pasteable clips in currently displayed model order."""
+        view = self.app.list_history if side == "history" else self.app.list_pinned
+        clips = []
+        for row in view.rows():
+            if row.is_clip and row.clip:
+                clips.append(row.clip)
+        return clips
+
+    def handle_alt_digit(self, digit: int) -> bool:
+        """
+        Alt+1..3 -> History clip 1, 2, 3
+        Alt+4..6 -> Pinned clip 1, 2, 3
+        """
+        if self.search_debounce_timer.isActive():
+            self.search_debounce_timer.stop()
+            self.app._do_search()
+
+        if 1 <= digit <= 3:
+            clips = self.get_column_clips("history")
+            idx = digit - 1
+            if idx < len(clips):
+                target_clip = clips[idx]
+                self.app.handle_paste(target_clip)
+                return True
+        elif 4 <= digit <= 6:
+            clips = self.get_column_clips("pinned")
+            idx = digit - 4
+            if idx < len(clips):
+                target_clip = clips[idx]
+                self.app.handle_paste(target_clip)
+                return True
+        return False
+
+    def handle_ctrl_shortcut(self, char: str) -> bool:
+        """Handle Ctrl+<0-9, a-z> shortcut to paste mapped clip."""
+        norm_key = (char or "").strip().upper()
+        if not norm_key or len(norm_key) != 1 or not norm_key.isalnum():
+            return False
+
+        clip = self.storage.get_clip_by_shortcut(norm_key)
+        if clip:
+            self.app.handle_paste(clip)
+            return True
+        return False
+
     def on_search_text_changed(self, text):
         """Debounced search optimized for interactive typing."""
         if self._search_shutdown:
@@ -632,6 +727,7 @@ class ClipboardBrowserController:
             history_blocker = QSignalBlocker(history_bar)
             pinned_blocker = QSignalBlocker(pinned_bar)
 
+            self.refresh_shortcuts_and_actions()
             # 1. Refresh History
             self.history_offset = 0
 

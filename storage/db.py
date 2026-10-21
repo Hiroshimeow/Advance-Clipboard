@@ -3,7 +3,7 @@ import os
 import threading
 from contextlib import contextmanager
 
-# DB_FILE is now located inside the storage/ directory
+# DB_FILE is located inside the storage/ directory
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clipboard.db")
 
 # Thread-local storage for connections
@@ -13,16 +13,34 @@ CURRENT_SCHEMA_VERSION = 3
 
 
 def get_connection() -> sqlite3.Connection:
-    """Get thread-local database connection."""
-    if not hasattr(_local, "conn") or _local.conn is None:
-        _local.conn = sqlite3.connect(
-            DB_FILE, check_same_thread=False, timeout=5.0
-        )
-        _local.conn.row_factory = sqlite3.Row
-        _local.conn.execute("PRAGMA journal_mode=WAL")
-        _local.conn.execute("PRAGMA synchronous=NORMAL")
-        _local.conn.execute("PRAGMA busy_timeout=5000")
-    return _local.conn
+    """Get thread-local database connection configured for WAL concurrency."""
+    conn = getattr(_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.execute("SELECT 1")
+            return conn
+        except sqlite3.ProgrammingError:
+            _local.conn = None
+
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    _local.conn = conn
+    return conn
+
+
+def close_connection() -> None:
+    """Close thread-local database connection if open."""
+    conn = getattr(_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _local.conn = None
 
 
 @contextmanager
@@ -42,9 +60,13 @@ def init_db():
     with transaction() as conn:
         user_version = conn.execute("PRAGMA user_version").fetchone()[0]
 
-        table_exists = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'clips'"
-        ).fetchone() is not None
+        existing_tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'virtual table')"
+            ).fetchall()
+        }
+        table_exists = "clips" in existing_tables
         schema_changed = not table_exists
 
         conn.execute("""
@@ -92,13 +114,9 @@ def init_db():
                 schema_changed = True
 
         if user_version < 2:
-            legacy_neural_tables = {
-                row[0]
-                for row in conn.execute(
-                    "SELECT name FROM sqlite_master "
-                    "WHERE type = 'table' AND name IN ('neural_links', 'neural_vectors')"
-                )
-            }
+            legacy_neural_tables = existing_tables.intersection(
+                {"neural_links", "neural_vectors"}
+            )
             if "neural_links" in legacy_neural_tables:
                 conn.execute("DROP TABLE IF EXISTS neural_links")
             if "neural_vectors" in legacy_neural_tables:
@@ -106,9 +124,7 @@ def init_db():
             if legacy_neural_tables:
                 schema_changed = True
 
-        fts_exists = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'clips_fts'"
-        ).fetchone() is not None
+        fts_exists = "clips_fts" in existing_tables
         if not fts_exists:
             conn.execute("""
                 CREATE VIRTUAL TABLE clips_fts USING fts5(
@@ -140,9 +156,31 @@ def init_db():
             END;
         """)
 
-        stats_table_exists = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'"
-        ).fetchone() is not None
+        # Focused workspace extensions: clip_shortcuts and clip_actions
+        if "clip_shortcuts" not in existing_tables:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS clip_shortcuts (
+                    clip_id INTEGER PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
+                    shortcut_key TEXT NOT NULL UNIQUE COLLATE NOCASE
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_clip_shortcuts_key ON clip_shortcuts(shortcut_key)")
+            schema_changed = True
+
+        if "clip_actions" not in existing_tables:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS clip_actions (
+                    clip_id INTEGER PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
+                    action_type TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    args_json TEXT DEFAULT '[]',
+                    is_background INTEGER DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            schema_changed = True
+
+        stats_table_exists = "sqlite_stat1" in existing_tables
         has_clips = conn.execute("SELECT 1 FROM clips LIMIT 1").fetchone() is not None
         stats_present = stats_table_exists and (
             not has_clips
