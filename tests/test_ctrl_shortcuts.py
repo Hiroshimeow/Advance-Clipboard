@@ -37,6 +37,7 @@ class CtrlShortcutTests(unittest.TestCase):
         self.client.handle_paste = Mock()
 
     def tearDown(self):
+        self.client._cleanup_on_exit()
         self.client.close()
 
     def test_assign_valid_single_key(self):

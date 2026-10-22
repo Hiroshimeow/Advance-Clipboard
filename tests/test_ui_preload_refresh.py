@@ -216,7 +216,11 @@ class UiPreloadRefreshTests(unittest.TestCase):
         app = self._make_app()
         calls = []
         app.storage.need_backup = True
-        app.ingest_bridge.stop = lambda timeout=3.0: calls.append("stop")
+        stop = app.ingest_bridge.stop
+        def stop_and_record():
+            stop()
+            calls.append("stop")
+        app.ingest_bridge.stop = stop_and_record
         app.backup_scheduler.force_now = lambda: calls.append("backup")
 
         app._cleanup_on_exit()

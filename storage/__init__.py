@@ -7,6 +7,7 @@ SQLite Storage Layer for Advance Clipboard Workspace (Facade)
 - JSON backup & recovery
 """
 
+import threading
 from typing import Optional, List, Dict, Any, Tuple
 from .db import (
     get_connection,
@@ -116,6 +117,8 @@ class ClipboardStorage:
     """Facade for clipboard storage subsystem."""
 
     _need_backup = False
+    _backup_revision = 0
+    _backup_lock = threading.Lock()
     _backup_callback = None
 
     def __init__(self):
@@ -129,17 +132,30 @@ class ClipboardStorage:
 
     def _mark_dirty(self):
         """Mark that backup is needed."""
-        ClipboardStorage._need_backup = True
+        with ClipboardStorage._backup_lock:
+            ClipboardStorage._backup_revision += 1
+            ClipboardStorage._need_backup = True
         self.search.increment_revision()
         if self._backup_callback:
             self._backup_callback()
 
     @property
     def need_backup(self) -> bool:
-        return ClipboardStorage._need_backup
+        with ClipboardStorage._backup_lock:
+            return ClipboardStorage._need_backup
 
-    def clear_backup_flag(self):
-        ClipboardStorage._need_backup = False
+    @property
+    def backup_revision(self) -> int:
+        with ClipboardStorage._backup_lock:
+            return ClipboardStorage._backup_revision
+
+    def clear_backup_flag(self, expected_revision: Optional[int] = None):
+        """Acknowledge a backup only if no newer mutation was recorded."""
+        with ClipboardStorage._backup_lock:
+            if expected_revision is not None and expected_revision != ClipboardStorage._backup_revision:
+                return False
+            ClipboardStorage._need_backup = False
+            return True
 
     def _fts_probe_rowids(self, conn, fts_query: str, cap: int = 250) -> Optional[List[int]]:
         """Probe FTS5 rowids to optimize selective and non-matching queries."""
@@ -252,8 +268,13 @@ class ClipboardStorage:
         return self.clips.is_duplicate(content)
 
     def import_clips(self, clips: List[Dict[str, Any]]) -> int:
+        # Insert count excludes metadata restored onto existing clips. SQLite's
+        # connection-local change counter includes those writes (and triggers),
+        # without being affected by concurrent writers on other connections.
+        conn = get_connection()
+        before = conn.total_changes
         count = self.clips.import_clips(clips)
-        if count > 0:
+        if conn.total_changes != before:
             self._mark_dirty()
         return count
 

@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 from .backup import create_backup
+from .clips import export_clips
 
 
 def create_backup_from_database(db_file: str) -> bool:
@@ -13,10 +14,7 @@ def create_backup_from_database(db_file: str) -> bool:
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     try:
-        rows = conn.execute(
-            "SELECT * FROM clips ORDER BY is_pinned DESC, updated_at DESC"
-        ).fetchall()
-        clips = [dict(row) for row in rows]
+        clips = export_clips(conn)
     finally:
         conn.close()
 

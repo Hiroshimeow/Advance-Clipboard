@@ -52,7 +52,7 @@ def resolve_python_runner(script_path: Optional[str] = None) -> List[str]:
     """
     uv_bin = shutil.which("uv")
     if uv_bin:
-        return [uv_bin, "run"]
+        return [uv_bin, "run"] + (["python"] if script_path is None else [])
 
     if script_path:
         script_dir = os.path.dirname(os.path.abspath(script_path))

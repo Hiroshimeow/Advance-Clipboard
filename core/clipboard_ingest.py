@@ -157,6 +157,7 @@ class ClipboardIngestBridge(QObject):
         self._processor = processor
         self._queue = queue.Queue(maxsize=queue_capacity)
         self._stopping = threading.Event()
+        self._submission_lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._run,
             daemon=True,
@@ -169,23 +170,25 @@ class ClipboardIngestBridge(QObject):
         return self._thread.is_alive()
 
     def submit(self, job: CaptureJob) -> bool:
-        if self._stopping.is_set():
-            self.rejected.emit(
-                IngestResult(False, "worker_stopped", clip_type=job.clip_type)
-            )
-            return False
-        try:
-            self._queue.put_nowait(job)
-            return True
-        except queue.Full:
-            self.rejected.emit(
-                IngestResult(False, "queue_full", clip_type=job.clip_type)
-            )
-            return False
+        with self._submission_lock:
+            if self._stopping.is_set():
+                reason = "worker_stopped"
+            else:
+                try:
+                    self._queue.put_nowait(job)
+                    return True
+                except queue.Full:
+                    reason = "queue_full"
+        self.rejected.emit(IngestResult(False, reason, clip_type=job.clip_type))
+        return False
 
-    def stop(self, timeout: float = 3.0) -> None:
-        self._stopping.set()
+    def stop(self, timeout: float | None = None) -> None:
+        """Drain all accepted work; an explicit timeout must report failure."""
+        with self._submission_lock:
+            self._stopping.set()
         self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            raise TimeoutError("Clipboard ingest worker has not drained")
 
     def _run(self) -> None:
         while not self._stopping.is_set() or not self._queue.empty():

@@ -11,6 +11,57 @@ def compute_hash(content: str) -> str:
     return hashlib.md5(content.encode("utf-8", errors="replace")).hexdigest()
 
 
+def export_clips(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """Export clips and optional metadata from one connection/read snapshot.
+
+    Legacy databases may not have either metadata table. An existing caller
+    transaction remains owned by the caller; otherwise release our read
+    transaction before returning (including on errors).
+    """
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN")
+    try:
+        rows = conn.execute(
+            "SELECT * FROM clips ORDER BY is_pinned DESC, updated_at DESC"
+        ).fetchall()
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        shortcuts = {}
+        if "clip_shortcuts" in tables:
+            shortcuts = {
+                int(row["clip_id"]): str(row["shortcut_key"])
+                for row in conn.execute("SELECT clip_id, shortcut_key FROM clip_shortcuts")
+            }
+        actions = {}
+        if "clip_actions" in tables:
+            for row in conn.execute("SELECT * FROM clip_actions"):
+                action = dict(row)
+                try:
+                    action["args"] = json.loads(action.get("args_json") or "[]")
+                except (TypeError, ValueError):
+                    action["args"] = []
+                action["is_background"] = bool(action.get("is_background"))
+                actions[int(row["clip_id"])] = action
+        out = []
+        for row in rows:
+            clip = dict(row)
+            cid = clip["id"]
+            if shortcuts.get(cid):
+                clip["shortcut_key"] = shortcuts[cid]
+            if cid in actions:
+                clip["action"] = actions[cid]
+            out.append(clip)
+        return out
+    finally:
+        if owns_transaction:
+            conn.rollback()
+
+
 class ClipRepository:
     def __init__(self):
         pass
@@ -289,24 +340,7 @@ class ClipRepository:
 
     def get_all_clips(self) -> List[Dict[str, Any]]:
         """Get all clips with attached shortcuts and actions for backup."""
-        conn = get_connection()
-        rows = conn.execute(
-            "SELECT * FROM clips ORDER BY is_pinned DESC, updated_at DESC"
-        ).fetchall()
-        shortcuts = self.get_all_shortcuts()
-        actions = self.get_all_clip_actions()
-        out = []
-        for r in rows:
-            d = dict(r)
-            cid = d["id"]
-            sc = shortcuts.get(cid)
-            if sc:
-                d["shortcut_key"] = sc
-            act = actions.get(cid)
-            if act:
-                d["action"] = act
-            out.append(d)
-        return out
+        return export_clips(get_connection())
 
     def get_history_count(self) -> int:
         """Get total count of history clips."""
@@ -369,8 +403,10 @@ class ClipRepository:
                         ),
                     )
                     count += cursor.rowcount
-                    imported_id = cursor.lastrowid
-                    if not imported_id:
+                    # SQLite retains the previous successful INSERT's lastrowid
+                    # when INSERT OR IGNORE skips a duplicate.
+                    imported_id = cursor.lastrowid if cursor.rowcount == 1 else None
+                    if imported_id is None:
                         row = conn.execute("SELECT id FROM clips WHERE hash = ?", (content_hash,)).fetchone()
                         imported_id = row[0] if row else None
 

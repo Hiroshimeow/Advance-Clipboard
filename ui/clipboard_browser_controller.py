@@ -666,8 +666,20 @@ class ClipboardBrowserController:
         self._search_generation += 1
         self._pending_search = None
         self._queued_search_after_refresh = False
-        self.search_debounce_timer.stop()
-        self._search_result_timer.stop()
+        self._refresh_worker_generation += 1
+        self._pending_refresh_generations.clear()
+        for timer in (
+            self.search_debounce_timer,
+            self._search_result_timer,
+            self._refresh_result_timer,
+            self._layout_refresh_timer,
+        ):
+            try:
+                timer.stop()
+            except RuntimeError:
+                # QApplication may already have destroyed parented Qt objects
+                # when the atexit fallback runs. Invalidation is still required.
+                pass
 
     def _apply_search_results(self, query, history_clips, pinned_clips):
         if self._is_refreshing:

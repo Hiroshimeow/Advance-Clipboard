@@ -12,7 +12,7 @@ Unit tests for Clip Actions (RUN and Ctrl+Enter):
 import os
 import sys
 import tempfile
-import time
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -77,7 +77,7 @@ class ClipActionTests(unittest.TestCase):
 
         code = f"""
 import sys, os
-with open(r'{out_file}', 'w') as f:
+with open({out_file!r}, 'w') as f:
     f.write('INLINE_EXEC_OK')
 """
         action = {
@@ -87,22 +87,17 @@ with open(r'{out_file}', 'w') as f:
             "is_background": False,
         }
 
-        completed = [False]
+        completed = threading.Event()
         res_holder = []
 
         def on_done(res):
-            completed[0] = True
             res_holder.append(res)
+            completed.set()
 
         ok = ActionRunner.execute_action(self.clip_id, action, on_complete=on_done, timeout=10.0)
         self.assertTrue(ok)
 
-        # Wait for async execution
-        start = time.time()
-        while not completed[0] and (time.time() - start) < 10.0:
-            time.sleep(0.05)
-
-        self.assertTrue(completed[0])
+        self.assertTrue(completed.wait(10.0), "inline action did not complete")
         self.assertTrue(res_holder[0].success)
 
         with open(out_file, "r") as f:
@@ -123,7 +118,7 @@ with open(r'{out_file}', 'w') as f:
         with open(script_file, "w") as f:
             f.write(f"""
 import os
-with open('{out_file}', 'w') as f:
+with open({out_file!r}, 'w') as f:
     f.write(os.getcwd())
 """)
 
@@ -134,18 +129,17 @@ with open('{out_file}', 'w') as f:
             "is_background": False,
         }
 
-        completed = [False]
+        completed = threading.Event()
+        res_holder = []
         def on_done(res):
-            completed[0] = True
+            res_holder.append(res)
+            completed.set()
 
         ok = ActionRunner.execute_action(self.clip_id, action, on_complete=on_done, timeout=10.0)
         self.assertTrue(ok)
 
-        start = time.time()
-        while not completed[0] and (time.time() - start) < 10.0:
-            time.sleep(0.05)
-
-        self.assertTrue(completed[0])
+        self.assertTrue(completed.wait(10.0), "script action did not complete")
+        self.assertTrue(res_holder[0].success, res_holder[0].stderr)
         with open(out_file, "r") as f:
             cwd_written = f.read().strip()
         self.assertEqual(cwd_written, os.path.abspath(temp_dir))

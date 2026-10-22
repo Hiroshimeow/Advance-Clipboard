@@ -9,6 +9,7 @@ Unit tests for Alt+1..6 quick paste:
 """
 
 import unittest
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -17,6 +18,7 @@ from PyQt6.QtWidgets import QApplication
 
 from main import ClientApp
 from storage import get_storage
+from storage.db import transaction
 
 
 class AltQuickPasteTests(unittest.TestCase):
@@ -45,10 +47,20 @@ class AltQuickPasteTests(unittest.TestCase):
         self.p3_id, _ = self.storage.add_clip("text", "pin_gamma")
         self.storage.pin_clip(self.p3_id)
 
+        # Pinning updates timestamps too. Explicit distinct instants keep this
+        # ordering fixture independent of clock resolution and insertion speed.
+        with transaction() as conn:
+            for index, clip_id in enumerate((self.h1_id, self.h2_id, self.h3_id,
+                                             self.h4_id, self.p1_id, self.p2_id, self.p3_id), 1):
+                stamp = f"2025-01-01T00:00:{index:02d}.000000"
+                conn.execute("UPDATE clips SET updated_at = ?, pinned_at = CASE WHEN is_pinned THEN ? ELSE NULL END WHERE id = ?",
+                             (stamp, stamp, clip_id))
+
         self.client = ClientApp(enable_monitor=False, init_data=True)
         self.client.handle_paste = Mock()
 
     def tearDown(self):
+        self.client._cleanup_on_exit()
         self.client.close()
 
     def test_alt_1_to_3_pastes_history_visible_clips(self):
@@ -100,9 +112,11 @@ class AltQuickPasteTests(unittest.TestCase):
         self.client.search_input.setText("an")
         self.client.browser.on_search_text_changed("an")
         self.client._do_search()
-        import time
-        time.sleep(0.15)
-        self.client.browser._drain_search_results()
+        deadline = time.monotonic() + 3.0
+        while self.client.browser._last_search_query != "an" and time.monotonic() < deadline:
+            self.app_instance.processEvents()
+            self.client.browser._drain_search_results()
+        self.assertEqual("an", self.client.browser._last_search_query, "search did not complete")
 
         history_clips = self.client.browser.get_column_clips("history")
         self.assertTrue(any("banana" in c["content"] for c in history_clips))

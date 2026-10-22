@@ -222,7 +222,10 @@ class ClientApp(QWidget):
         self.storage.set_backup_callback(self.backup_scheduler.schedule)
 
 
-        # Register cleanup on exit
+        # Prefer cleanup while Qt wrappers are alive; atexit is a fallback.
+        self._cleanup_complete = False
+        self._cleanup_started = False
+        QApplication.instance().aboutToQuit.connect(self._cleanup_on_exit)
         atexit.register(self._cleanup_on_exit)
 
     def _init_data(self):
@@ -254,25 +257,62 @@ class ClientApp(QWidget):
 
     def _perform_backup(self):
         """Create backup outside the UI process to avoid GIL stalls."""
+        revision = self.storage.backup_revision
         if create_backup_in_subprocess():
-            self.storage.clear_backup_flag()
+            self.storage.clear_backup_flag(expected_revision=revision)
 
 
     def _cleanup_on_exit(self):
-        """Cleanup when app exits."""
+        """Stop producers and persist pending work, even after Qt teardown."""
+        if self._cleanup_started or self._cleanup_complete:
+            return
+        self._cleanup_started = True
         logger.info("cleanup_on_exit storage_need_backup=%s", self.storage.need_backup)
-        if getattr(self, "browser", None):
-            self.browser.shutdown_search()
-        # Stop Win32 monitor thread
-        if getattr(self, "win32_monitor", None):
-            monitor = self.win32_monitor
-            if monitor is not None:
-                monitor.stop()
-        if getattr(self, "ingest_bridge", None):
-            self.ingest_bridge.stop()
-        # Force immediate backup if needed
-        if self.storage.need_backup:
-            self.backup_scheduler.force_now()
+
+        def attempt(label, operation):
+            try:
+                operation()
+                return True
+            except Exception:
+                # A deleted Qt wrapper must not prevent independent backend
+                # producers from being stopped. Persistence failures stay retryable.
+                logger.exception("cleanup_failed stage=%s", label)
+                return False
+
+        for timer in (self._clipboard_capture_timer, self._hidden_refresh_timer,
+                      self._delete_flush_timer):
+            attempt("timer", timer.stop)
+        attempt("browser", self.browser.shutdown_search)
+        if self.win32_monitor is not None:
+            attempt("monitor", self.win32_monitor.stop)
+        ingest_stopped = attempt("ingest", self.ingest_bridge.stop)
+        deletes_flushed = attempt("pending_deletes", lambda: self._flush_pending_deletes(refresh_ui=False))
+        try:
+            # Never acknowledge/finalize a snapshot while accepted work can
+            # still commit, or while failed deletions remain pending.
+            if (not ingest_stopped or self.ingest_bridge.is_alive
+                    or not deletes_flushed or self._pending_delete_clip_ids):
+                return
+            if self.storage.need_backup:
+                if not attempt("backup", self.backup_scheduler.force_now):
+                    return
+            # force_now swallows worker exceptions, and a failed worker or a
+            # newer revision leaves the snapshot unacknowledged. Keep retries.
+            if self.storage.need_backup:
+                return
+            attempt("backup_cancel", self.backup_scheduler.cancel)
+            if getattr(self.storage, "_backup_callback", None) == self.backup_scheduler.schedule:
+                self.storage.set_backup_callback(None)
+            self._cleanup_complete = True
+            atexit.unregister(self._cleanup_on_exit)
+            application = QApplication.instance()
+            if application is not None:
+                try:
+                    application.aboutToQuit.disconnect(self._cleanup_on_exit)
+                except (RuntimeError, TypeError):
+                    pass
+        finally:
+            self._cleanup_started = False
 
     def initUI(self):
         self.setWindowFlags(
@@ -1111,15 +1151,16 @@ class ClientApp(QWidget):
         if not self._delete_flush_timer.isActive():
             self._delete_flush_timer.start(25)
 
-    def _flush_pending_deletes(self):
+    def _flush_pending_deletes(self, *, refresh_ui=True):
         clip_ids = list(self._pending_delete_clip_ids)
         if not clip_ids:
             return
-        self._pending_delete_clip_ids.clear()
         for clip_id in clip_ids:
             self.storage.delete_clip(clip_id)
-        self.refresh_lists()
-        self.browser.reset_after_delete_refresh()
+            self._pending_delete_clip_ids.discard(clip_id)
+        if refresh_ui:
+            self.refresh_lists()
+            self.browser.reset_after_delete_refresh()
 
 
 

@@ -84,10 +84,12 @@ python main.py
 
 ## 3. Kiểm thử & Đo đạc hiệu năng
 
-Suite kiểm thử đạt **184/184 tests PASS (100%)**:
+Chạy bộ kiểm thử trong sandbox tạm (DB, ảnh, backup và log), không dùng dữ liệu clipboard thật:
 ```bash
-python -m unittest discover tests
+python -m tests.run_isolated
 ```
+
+Không dùng `unittest discover` trực tiếp với profile thật: một số fixture cũ gọi storage mặc định. Số test và kết quả hiện tại được ghi trong `docs/REVIEW_REPAIR_VERIFICATION.md`; không coi số 184 của bản cũ là kết quả commit hiện tại.
 Bao gồm:
 - Toàn bộ 165 test chức năng và lifecycle của baseline cũ.
 - `tests/test_alt_quick_paste.py`: Kiểm tra dán nhanh `Alt+1..6`, lọc tìm kiếm, bỏ qua header/nhóm collapse.
