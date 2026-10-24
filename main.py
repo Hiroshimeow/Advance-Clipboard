@@ -65,6 +65,7 @@ from ui.widgets import (
     SearchLineEdit,
     PAGE_SIZE_HISTORY,
     PAGE_SIZE_PINNED,
+    _extract_alnum_key,
 )
 from ui.clip_list_view import ClipListView
 from ui.clip_models import HistoryListModel, PinnedListModel
@@ -594,8 +595,8 @@ class ClientApp(QWidget):
         if (modifiers & Qt.KeyboardModifier.AltModifier) and not (
             modifiers & Qt.KeyboardModifier.ControlModifier
         ):
-            if Qt.Key.Key_1 <= k <= Qt.Key.Key_6:
-                digit = k - Qt.Key.Key_0
+            if 0x31 <= int(k) <= 0x36:
+                digit = int(k) - 0x30
                 if not is_repeat and self.browser.handle_alt_digit(digit):
                     event.accept()
                     return
@@ -603,12 +604,9 @@ class ClientApp(QWidget):
         if (modifiers & Qt.KeyboardModifier.ControlModifier) and not (
             modifiers & Qt.KeyboardModifier.AltModifier
         ):
-            char = event.text()
-            if not char:
-                if Qt.Key.Key_0 <= k <= Qt.Key.Key_9 or Qt.Key.Key_A <= k <= Qt.Key.Key_Z:
-                    char = chr(k)
-            if char and len(char) == 1 and char.isalnum() and not is_repeat:
-                if self.browser.handle_ctrl_shortcut(char.upper()):
+            char = _extract_alnum_key(event)
+            if char and not is_repeat:
+                if self.browser.handle_ctrl_shortcut(char):
                     event.accept()
                     return
 

@@ -122,5 +122,54 @@ class CtrlShortcutTests(unittest.TestCase):
         self.assertIsNone(self.storage.get_clip_by_shortcut("K"))
 
 
+
+    def test_windows_ctrl_c_and_ctrl_q_control_char_events_in_search_and_app(self):
+        # On Windows Qt, pressing Ctrl+C sets event.text() to '' and Ctrl+Q sets ''.
+        # Verify both SearchLineEdit and ClientApp resolve 'C' and 'Q' via event.key() / nativeVirtualKey().
+        from PyQt6.QtCore import Qt, QEvent
+        from PyQt6.QtGui import QKeyEvent
+        from ui.widgets import SingleKeyLineEdit
+
+        self.storage.assign_shortcut(self.clip_a, "C")
+        self.storage.assign_shortcut(self.clip_b, "Q")
+        self.client.browser.refresh_shortcuts_and_actions()
+
+        # 1. Press Ctrl+C in SearchLineEdit (text='')
+        ev_ctrl_c = QKeyEvent(
+            QEvent.Type.KeyPress,
+            Qt.Key.Key_C,
+            Qt.KeyboardModifier.ControlModifier,
+            "",
+        )
+        self.client.search_input.keyPressEvent(ev_ctrl_c)
+        self.client.handle_paste.assert_called_once()
+        self.assertEqual(self.client.handle_paste.call_args[0][0]["id"], self.clip_a)
+
+        # 2. Press Ctrl+Q in SearchLineEdit (text='')
+        self.client.handle_paste.reset_mock()
+        ev_ctrl_q = QKeyEvent(
+            QEvent.Type.KeyPress,
+            Qt.Key.Key_Q,
+            Qt.KeyboardModifier.ControlModifier,
+            "",
+        )
+        self.client.search_input.keyPressEvent(ev_ctrl_q)
+        self.client.handle_paste.assert_called_once()
+        self.assertEqual(self.client.handle_paste.call_args[0][0]["id"], self.clip_b)
+
+        # 3. Press Ctrl+C on ClientApp directly (text='')
+        self.client.handle_paste.reset_mock()
+        self.client.keyPressEvent(ev_ctrl_c)
+        self.client.handle_paste.assert_called_once()
+        self.assertEqual(self.client.handle_paste.call_args[0][0]["id"], self.clip_a)
+
+        # 4. SingleKeyLineEdit accepts both plain 'c'/'q' and Ctrl+C/Ctrl+Q with ''/''
+        box = SingleKeyLineEdit()
+        box.keyPressEvent(ev_ctrl_c)
+        self.assertEqual(box.text(), "C")
+        box.keyPressEvent(ev_ctrl_q)
+        self.assertEqual(box.text(), "Q")
+
+
 if __name__ == "__main__":
     unittest.main()

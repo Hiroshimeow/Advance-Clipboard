@@ -1,7 +1,7 @@
 import math
 import os
 
-from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QEvent, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -207,6 +207,31 @@ class LineInfoPopup(QWidget):
         self.activateWindow()
 
 
+def _extract_alnum_key(event) -> str:
+    """
+    Extract a single ASCII alphanumeric key ('0'-'9', 'A'-'Z') from a QKeyEvent.
+    Checks event.key() and nativeVirtualKey() first because on Windows/Qt, pressing
+    Ctrl+A..Ctrl+Z populates event.text() with ASCII control chars (''..'').
+    """
+    try:
+        k_int = int(event.key())
+    except Exception:
+        k_int = 0
+    if 0x30 <= k_int <= 0x39 or 0x41 <= k_int <= 0x5A:
+        return chr(k_int)
+
+    vk = getattr(event, "nativeVirtualKey", lambda: 0)()
+    if 0x30 <= vk <= 0x39 or 0x41 <= vk <= 0x5A:
+        return chr(vk)
+    if 0x60 <= vk <= 0x69:
+        return chr(vk - 0x30)
+
+    text = (event.text() or "").strip().upper()
+    if len(text) == 1 and text.isascii() and text.isalnum():
+        return text
+    return ""
+
+
 class SearchLineEdit(QLineEdit):
     """
     QLineEdit with triple-click to clear, Alt+1..6 quick paste,
@@ -257,6 +282,29 @@ class SearchLineEdit(QLineEdit):
     def _reset_click_count(self):
         self.click_count = 0
 
+    def event(self, ev):
+        shortcut_override = getattr(QEvent.Type, "ShortcutOverride", None)
+        if shortcut_override is not None and ev.type() == shortcut_override:
+            k = ev.key()
+            mods = ev.modifiers()
+            if (mods & Qt.KeyboardModifier.ControlModifier) and not (
+                mods & Qt.KeyboardModifier.AltModifier
+            ):
+                if (
+                    0x30 <= int(k) <= 0x39 or 0x41 <= int(k) <= 0x5A
+                    or k in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                ):
+                    ev.accept()
+                    return True
+            if (mods & Qt.KeyboardModifier.AltModifier) and not (
+                mods & Qt.KeyboardModifier.ControlModifier
+            ):
+                if 0x31 <= int(k) <= 0x36:
+                    ev.accept()
+                    return True
+        parent_event = getattr(super(), "event", None)
+        return parent_event(ev) if parent_event is not None else False
+
     def keyPressEvent(self, event):
         k = event.key()
         modifiers = event.modifiers()
@@ -276,26 +324,28 @@ class SearchLineEdit(QLineEdit):
         if (modifiers & Qt.KeyboardModifier.AltModifier) and not (
             modifiers & Qt.KeyboardModifier.ControlModifier
         ):
-            if Qt.Key.Key_1 <= k <= Qt.Key.Key_6:
-                digit = k - Qt.Key.Key_0
-                if not is_repeat and self._on_alt_digit:
-                    if self._on_alt_digit(digit):
-                        event.accept()
-                        return
+            digit = 0
+            if 0x31 <= int(k) <= 0x36:
+                digit = int(k) - 0x30
+            else:
+                vk = getattr(event, "nativeVirtualKey", lambda: 0)()
+                if 0x31 <= vk <= 0x36:
+                    digit = vk - 0x30
+            if 1 <= digit <= 6 and not is_repeat and self._on_alt_digit:
+                if self._on_alt_digit(digit):
+                    event.accept()
+                    return
 
         # 3. Ctrl + <key> (0-9, A-Z) -> Persistent clip shortcut
+        # IMPORTANT: On Windows/Qt, Ctrl+A..Ctrl+Z sets event.text() to ASCII control
+        # characters (''..'') rather than 'A'..'Z' or ''. Check event.key()
+        # and nativeVirtualKey() FIRST so Ctrl+C, Ctrl+Q, etc. always resolve to 'C', 'Q'.
         if (modifiers & Qt.KeyboardModifier.ControlModifier) and not (
             modifiers & Qt.KeyboardModifier.AltModifier
         ):
-            char = event.text()
-            if not char:
-                if Qt.Key.Key_0 <= k <= Qt.Key.Key_9:
-                    char = chr(k)
-                elif Qt.Key.Key_A <= k <= Qt.Key.Key_Z:
-                    char = chr(k)
-
-            if char and len(char) == 1 and char.isalnum() and not is_repeat:
-                if self._on_ctrl_key and self._on_ctrl_key(char.upper()):
+            char = _extract_alnum_key(event)
+            if char and not is_repeat:
+                if self._on_ctrl_key and self._on_ctrl_key(char):
                     event.accept()
                     return
 
@@ -323,8 +373,10 @@ class SingleKeyLineEdit(QLineEdit):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMaxLength(1)
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if hasattr(self, "setMaxLength"):
+            self.setMaxLength(1)
+        if hasattr(self, "setAlignment"):
+            self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setStyleSheet("""
             QLineEdit {
                 background: #2b2b2b;
@@ -340,22 +392,40 @@ class SingleKeyLineEdit(QLineEdit):
             }
         """)
 
+    def event(self, ev):
+        shortcut_override = getattr(QEvent.Type, "ShortcutOverride", None)
+        if shortcut_override is not None and ev.type() == shortcut_override:
+            k = ev.key()
+            if 0x30 <= int(k) <= 0x39 or 0x41 <= int(k) <= 0x5A:
+                ev.accept()
+                return True
+        parent_event = getattr(super(), "event", None)
+        return parent_event(ev) if parent_event is not None else False
+
     def keyPressEvent(self, event):
         k = event.key()
-        if k in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
+        if k in (getattr(Qt.Key, "Key_Backspace", 0x01000003), getattr(Qt.Key, "Key_Delete", 0x01000007)):
             self.clear()
             self.keyChanged.emit("")
             event.accept()
             return
+        if k in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Escape):
+            super().keyPressEvent(event)
+            return
 
-        text = event.text().upper()
-        if text and len(text) == 1 and text.isalnum():
-            self.setText(text)
-            self.keyChanged.emit(text)
+        mods = event.modifiers()
+        if mods & Qt.KeyboardModifier.AltModifier:
+            event.ignore()
+            return
+
+        char = _extract_alnum_key(event)
+        if char:
+            self.setText(char)
+            self.keyChanged.emit(char)
             event.accept()
             return
 
-        # Ignore non-alphanumeric or modifiers
+        # Ignore non-alphanumeric or lone modifiers
         event.ignore()
 
     def insertFromMimeData(self, source):
@@ -470,6 +540,7 @@ class ShortcutAssignDialog(QDialog):
             self.key_edit.setText(current_sc)
             self.selected_key = current_sc
             self.btn_remove.show()
+        self.key_edit.setFocus()
 
     def _on_key_entered(self, key: str):
         self.selected_key = key.strip().upper()
