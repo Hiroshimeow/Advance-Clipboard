@@ -104,6 +104,36 @@ def _is_image_filter_query(query: str) -> bool:
     return False
 
 
+def _parse_action_search_query(query: str) -> Optional[str]:
+    normalized = (query or "").strip()
+    lower = normalized.lower()
+    for prefix in ("actions:", "action:"):
+        if lower.startswith(prefix):
+            kw = normalized[len(prefix):].strip()
+            return kw if kw else ""
+    parts = normalized.split(maxsplit=1)
+    if len(parts) == 1 and parts[0].lower() in {"action", "actions"}:
+        return ""
+    if len(parts) == 2 and parts[0].lower() in {"action", "actions"}:
+        return parts[1].strip()
+    return None
+
+
+def _parse_ctrl_search_query(query: str) -> Optional[str]:
+    normalized = (query or "").strip()
+    lower = normalized.lower()
+    for prefix in ("ctrl:", "shortcut:", "shortcuts:"):
+        if lower.startswith(prefix):
+            kw = normalized[len(prefix):].strip()
+            return kw if kw else ""
+    parts = normalized.split(maxsplit=1)
+    if len(parts) == 1 and parts[0].lower() in {"ctrl", "shortcut", "shortcuts"}:
+        return ""
+    if len(parts) == 2 and parts[0].lower() in {"ctrl", "shortcut", "shortcuts"}:
+        return parts[1].strip()
+    return None
+
+
 def _fts_match_expression(terms: List[str], *, column: Optional[str] = None) -> Optional[str]:
     """Build a literal trigram FTS candidate query, or None when LIKE fallback is required."""
     if not terms or any(len(term) < 3 for term in terms):
@@ -320,7 +350,12 @@ class ClipboardStorage:
     # ==================== SEARCH OPERATIONS (delegated) ====================
 
     def is_filter_query(self, query: str) -> bool:
-        return _parse_tag_search_query(query) is not None or _is_image_filter_query(query)
+        return (
+            _parse_tag_search_query(query) is not None
+            or _is_image_filter_query(query)
+            or _parse_action_search_query(query) is not None
+            or _parse_ctrl_search_query(query) is not None
+        )
 
     def search_pinned(
         self, query: str, limit: int = 20, *, offset: int = 0, ranked: bool = True
@@ -330,6 +365,12 @@ class ClipboardStorage:
             return self._search_pinned_tags_sql(tag_query, limit, offset)
         if _is_image_filter_query(query):
             return self._search_pinned_images_sql(limit, offset)
+        action_query = _parse_action_search_query(query)
+        if action_query is not None:
+            return self._search_pinned_actions_sql(action_query, limit, offset)
+        ctrl_query = _parse_ctrl_search_query(query)
+        if ctrl_query is not None:
+            return self._search_pinned_ctrl_sql(ctrl_query, limit, offset)
 
         terms = self.search.split_search_terms(query)
         if not terms:
@@ -349,6 +390,116 @@ class ClipboardStorage:
             include_meta=True,
             pinned_tiebreaker=True,
         )
+
+    def _search_pinned_actions_sql(self, query: str, limit: int, offset: int = 0) -> List[Dict[str, Any]]:
+        conn = get_connection()
+        terms = self.search.split_search_terms(query)
+        if not terms:
+            rows = conn.execute(
+                """SELECT c.* FROM clips c
+                   JOIN clip_actions a ON a.clip_id = c.id
+                   WHERE c.is_pinned = 1
+                   ORDER BY c.pin_order DESC, c.updated_at DESC, c.id DESC LIMIT ? OFFSET ?""",
+                (limit, offset),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        where_clauses = []
+        params = []
+        for term in terms:
+            pat = self.search.like_pattern(term)
+            where_clauses.append("(c.content LIKE ? ESCAPE '\\' OR c.tag LIKE ? ESCAPE '\\' OR c.group_name LIKE ? ESCAPE '\\' OR a.target LIKE ? ESCAPE '\\' OR a.action_type LIKE ? ESCAPE '\\')")
+            params.extend([pat, pat, pat, pat, pat])
+        rows = conn.execute(
+            f"""SELECT c.* FROM clips c
+                JOIN clip_actions a ON a.clip_id = c.id
+                WHERE c.is_pinned = 1 AND ({' AND '.join(where_clauses)})
+                ORDER BY c.pin_order DESC, c.updated_at DESC, c.id DESC LIMIT ? OFFSET ?""",
+            params + [limit, offset],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _search_history_actions_sql(self, query: str, limit: int, offset: int = 0) -> List[Dict[str, Any]]:
+        conn = get_connection()
+        terms = self.search.split_search_terms(query)
+        if not terms:
+            rows = conn.execute(
+                """SELECT c.* FROM clips c
+                   JOIN clip_actions a ON a.clip_id = c.id
+                   WHERE c.is_pinned = 0 OR (c.is_pinned = 1 AND c.pinned_at IS NOT NULL AND c.updated_at > c.pinned_at)
+                   ORDER BY c.updated_at DESC, c.id DESC LIMIT ? OFFSET ?""",
+                (limit, offset),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        where_clauses = []
+        params = []
+        for term in terms:
+            pat = self.search.like_pattern(term)
+            where_clauses.append("(c.content LIKE ? ESCAPE '\\' OR c.tag LIKE ? ESCAPE '\\' OR c.group_name LIKE ? ESCAPE '\\' OR a.target LIKE ? ESCAPE '\\' OR a.action_type LIKE ? ESCAPE '\\')")
+            params.extend([pat, pat, pat, pat, pat])
+        rows = conn.execute(
+            f"""SELECT c.* FROM clips c
+                JOIN clip_actions a ON a.clip_id = c.id
+                WHERE (c.is_pinned = 0 OR (c.is_pinned = 1 AND c.pinned_at IS NOT NULL AND c.updated_at > c.pinned_at))
+                  AND ({' AND '.join(where_clauses)})
+                ORDER BY c.updated_at DESC, c.id DESC LIMIT ? OFFSET ?""",
+            params + [limit, offset],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _search_pinned_ctrl_sql(self, query: str, limit: int, offset: int = 0) -> List[Dict[str, Any]]:
+        conn = get_connection()
+        terms = self.search.split_search_terms(query)
+        if not terms:
+            rows = conn.execute(
+                """SELECT c.* FROM clips c
+                   JOIN clip_shortcuts s ON s.clip_id = c.id
+                   WHERE c.is_pinned = 1
+                   ORDER BY s.shortcut_key ASC, c.pin_order DESC, c.id DESC LIMIT ? OFFSET ?""",
+                (limit, offset),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        where_clauses = []
+        params = []
+        for term in terms:
+            pat = self.search.like_pattern(term)
+            where_clauses.append("(s.shortcut_key LIKE ? ESCAPE '\\' OR c.content LIKE ? ESCAPE '\\' OR c.tag LIKE ? ESCAPE '\\' OR c.group_name LIKE ? ESCAPE '\\')")
+            params.extend([pat, pat, pat, pat])
+        rows = conn.execute(
+            f"""SELECT c.* FROM clips c
+                JOIN clip_shortcuts s ON s.clip_id = c.id
+                WHERE c.is_pinned = 1 AND ({' AND '.join(where_clauses)})
+                ORDER BY s.shortcut_key ASC, c.pin_order DESC, c.id DESC LIMIT ? OFFSET ?""",
+            params + [limit, offset],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _search_history_ctrl_sql(self, query: str, limit: int, offset: int = 0) -> List[Dict[str, Any]]:
+        conn = get_connection()
+        terms = self.search.split_search_terms(query)
+        if not terms:
+            rows = conn.execute(
+                """SELECT c.* FROM clips c
+                   JOIN clip_shortcuts s ON s.clip_id = c.id
+                   WHERE c.is_pinned = 0 OR (c.is_pinned = 1 AND c.pinned_at IS NOT NULL AND c.updated_at > c.pinned_at)
+                   ORDER BY s.shortcut_key ASC, c.updated_at DESC, c.id DESC LIMIT ? OFFSET ?""",
+                (limit, offset),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        where_clauses = []
+        params = []
+        for term in terms:
+            pat = self.search.like_pattern(term)
+            where_clauses.append("(s.shortcut_key LIKE ? ESCAPE '\\' OR c.content LIKE ? ESCAPE '\\' OR c.tag LIKE ? ESCAPE '\\' OR c.group_name LIKE ? ESCAPE '\\')")
+            params.extend([pat, pat, pat, pat])
+        rows = conn.execute(
+            f"""SELECT c.* FROM clips c
+                JOIN clip_shortcuts s ON s.clip_id = c.id
+                WHERE (c.is_pinned = 0 OR (c.is_pinned = 1 AND c.pinned_at IS NOT NULL AND c.updated_at > c.pinned_at))
+                  AND ({' AND '.join(where_clauses)})
+                ORDER BY s.shortcut_key ASC, c.updated_at DESC, c.id DESC LIMIT ? OFFSET ?""",
+            params + [limit, offset],
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def _search_pinned_images_sql(self, limit: int, offset: int = 0) -> List[Dict[str, Any]]:
         rows = get_connection().execute(
@@ -484,6 +635,12 @@ class ClipboardStorage:
             return self._search_history_tags_sql(tag_query, limit, offset)
         if _is_image_filter_query(query):
             return self._search_history_images_sql(limit, offset)
+        action_query = _parse_action_search_query(query)
+        if action_query is not None:
+            return self._search_history_actions_sql(action_query, limit, offset)
+        ctrl_query = _parse_ctrl_search_query(query)
+        if ctrl_query is not None:
+            return self._search_history_ctrl_sql(ctrl_query, limit, offset)
 
         terms = self.search.split_search_terms(query)
         if not terms:

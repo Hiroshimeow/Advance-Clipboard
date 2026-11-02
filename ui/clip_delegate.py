@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from PyQt6.QtCore import QRect, QSize, Qt
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QPixmap
@@ -38,6 +38,8 @@ class RowRects:
     delete: QRect
     expand: QRect
     tag: QRect
+    action_btn: QRect = field(default_factory=QRect)
+    log_btn: QRect = field(default_factory=QRect)
 
 
 class ClipRowDelegate(QStyledItemDelegate):
@@ -72,6 +74,7 @@ class ClipRowDelegate(QStyledItemDelegate):
             clip.get("group_name", ""),
             clip.get("shortcut_key"),
             bool(clip.get("has_action")),
+            bool(clip.get("is_action_running")),
             row.is_pinned,
             row.is_grouped_child,
             row.is_expanded,
@@ -113,21 +116,49 @@ class ClipRowDelegate(QStyledItemDelegate):
         copy = QRect(actions_x, y, ACTION_COLUMN_WIDTH, ACTION_BUTTON_HEIGHT)
         pin = QRect(actions_x, copy.bottom() + 1 + ACTION_BUTTON_SPACING, ACTION_COLUMN_WIDTH, ACTION_BUTTON_HEIGHT)
         delete = QRect(actions_x, pin.bottom() + 1 + ACTION_BUTTON_SPACING, ACTION_COLUMN_WIDTH, ACTION_BUTTON_HEIGHT)
-        expand = QRect(meta_x + 4, y + QFontMetrics(TAG_FONT).height() + 6, 28, 16)
+        tag_fm = QFontMetrics(TAG_FONT)
+        expand = QRect(meta_x + 4, y + tag_fm.height() + 6, 28, 16)
+
+        clip = row.clip or {}
+        is_running = bool(clip.get("is_action_running"))
+        has_action = bool(clip.get("has_action")) or is_running
 
         tag_text = self._badge_text(row)
         tag = QRect()
+        tag_h = tag_fm.height() + 4
+        tag_y = delete.bottom() + 1 + ACTION_BUTTON_SPACING
+
+        action_btn = QRect()
+        log_btn = QRect()
+        cursor_right = outer.right() - ROW_MARGIN_RIGHT
+
+        if is_running:
+            stop_label = "⏹ STOP Action"
+            log_label = "📋 Show log"
+            stop_w = tag_fm.horizontalAdvance(stop_label) + 12
+            log_w = tag_fm.horizontalAdvance(log_label) + 12
+            action_btn = QRect(cursor_right - stop_w, tag_y, stop_w, tag_h)
+            cursor_right = action_btn.left() - 4
+            log_btn = QRect(cursor_right - log_w, tag_y, log_w, tag_h)
+            cursor_right = log_btn.left() - 6
+        elif has_action:
+            run_label = "⚡ RUN Action"
+            run_w = tag_fm.horizontalAdvance(run_label) + 12
+            action_btn = QRect(cursor_right - run_w, tag_y, run_w, tag_h)
+            cursor_right = action_btn.left() - 6
+
         if tag_text:
-            tag_fm = QFontMetrics(TAG_FONT)
-            tag_h = tag_fm.height() + 4
+            avail_tag_w = max(24, cursor_right - (outer.left() + left))
             tag_text_width = min(
                 tag_fm.horizontalAdvance(tag_text) + 12,
-                outer.width() - left - ROW_MARGIN_RIGHT,
+                avail_tag_w,
             )
-            tag_x = outer.right() - ROW_MARGIN_RIGHT - tag_text_width
-            tag_y = delete.bottom() + 1 + ACTION_BUTTON_SPACING
+            tag_x = cursor_right - tag_text_width
             tag = QRect(tag_x, tag_y, tag_text_width, tag_h)
-        return RowRects(outer, content, meta, actions, copy, pin, delete, expand, tag)
+
+        return RowRects(
+            outer, content, meta, actions, copy, pin, delete, expand, tag, action_btn, log_btn
+        )
 
     def hit_test(self, option, index, pos: QPoint | None = None):  # type: ignore[name-defined]
         row = index.data(ROW_ROLE)
@@ -136,6 +167,11 @@ class ClipRowDelegate(QStyledItemDelegate):
         if row.row_kind == "group_header":
             return "group"
         rects = self.rects_for(option, row)
+        clip = row.clip or {}
+        if not rects.action_btn.isNull() and rects.action_btn.contains(pos):
+            return "stop_action" if clip.get("is_action_running") else "run_action"
+        if not rects.log_btn.isNull() and rects.log_btn.contains(pos):
+            return "show_log"
         if rects.copy.contains(pos):
             return "copy"
         if rects.pin.contains(pos):
@@ -183,8 +219,9 @@ class ClipRowDelegate(QStyledItemDelegate):
         clip = row.clip or {}
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        is_running = bool(clip.get("is_action_running"))
         bg = "#26394a" if selected else ("#2a3a4a" if hovered else "#1f1f1f")
-        border = "#3daee9" if selected else ("#3a7abf" if hovered else "#333333")
+        border = "#4caf50" if is_running else ("#3daee9" if selected else ("#3a7abf" if hovered else "#333333"))
         frame = option.rect.adjusted(ROW_FRAME_INSET_X, 3, -ROW_FRAME_INSET_X, -3)
 
         # 1. Fill background (no border yet)
@@ -216,7 +253,6 @@ class ClipRowDelegate(QStyledItemDelegate):
             if clip.get("type") == "text":
                 self._paint_button(painter, rects.expand, "▼", "#333333", "#888888")
 
-            # Subtle Alt+1..6 quick-paste indicator in meta column
             alt_sc = getattr(row, "alt_shortcut", "")
             if alt_sc:
                 alt_rect = QRect(rects.meta.left() - 2, rects.expand.bottom() + 4, rects.meta.width() + 4, 14)
@@ -227,6 +263,14 @@ class ClipRowDelegate(QStyledItemDelegate):
             self._paint_button(painter, rects.copy, "❐", "#2b5c75", "#dddddd")
             self._paint_button(painter, rects.pin, "★" if row.is_pinned else "☆", "#7a5c20" if row.is_pinned else "#3a3a3a", "#ffd700" if row.is_pinned else "#dddddd")
             self._paint_button(painter, rects.delete, "✕", "#752b2b", "#dddddd")
+
+            if is_running:
+                if not rects.log_btn.isNull():
+                    self._paint_button(painter, rects.log_btn, "📋 Show log", "#1f4e5f", "#e0f7fa")
+                if not rects.action_btn.isNull():
+                    self._paint_button(painter, rects.action_btn, "⏹ STOP Action", "#8b2626", "#ffffff")
+            elif not rects.action_btn.isNull():
+                self._paint_button(painter, rects.action_btn, "⚡ RUN Action", "#3d5a2b", "#dcedc8")
 
             tag_text = self._badge_text(row)
             if tag_text and not rects.tag.isNull():
@@ -316,8 +360,6 @@ class ClipRowDelegate(QStyledItemDelegate):
         sc = clip.get("shortcut_key")
         if sc:
             badges.append(f"[Ctrl+{sc}]")
-        if clip.get("has_action"):
-            badges.append("[⚡]")
         tag = str(clip.get("tag", "") or "")
         group_name = str(clip.get("group_name", "") or "")
         if tag:

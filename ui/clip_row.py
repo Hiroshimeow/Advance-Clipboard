@@ -86,6 +86,7 @@ class ClipRowMetrics:
             or (f"[{group_name}]" if group_name and not state.is_grouped else "")
             or item_data.get("shortcut_key")
             or item_data.get("has_action")
+            or item_data.get("is_action_running")
         )
         # Tag sits below action buttons (bottom-right), add to actions column
         if badge_text:

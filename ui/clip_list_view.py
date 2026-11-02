@@ -24,6 +24,9 @@ class ClipListView(QListView):
     rowActivated = pyqtSignal(object)
     itemClicked = pyqtSignal(object)
     previewCandidate = pyqtSignal(dict)
+    runActionRequested = pyqtSignal(dict)
+    stopActionRequested = pyqtSignal(int)
+    showLogRequested = pyqtSignal(dict)
 
     def __init__(self, model: ClipListModel | None = None, parent=None):
         super().__init__(parent)
@@ -288,6 +291,12 @@ class ClipListView(QListView):
             self.deleteRequested.emit(row.clip_id)
         elif action == "expand" and row.clip_id:
             self.expandToggleRequested.emit(row.clip_id)
+        elif action == "run_action":
+            self.runActionRequested.emit(row.clip)
+        elif action == "stop_action" and row.clip_id:
+            self.stopActionRequested.emit(row.clip_id)
+        elif action == "show_log":
+            self.showLogRequested.emit(row.clip)
         elif action == "row":
             item = self.item(index.row())
             self.itemClicked.emit(item)

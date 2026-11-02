@@ -1,3 +1,4 @@
+import sys
 import math
 import os
 
@@ -435,6 +436,30 @@ class SingleKeyLineEdit(QLineEdit):
             self.keyChanged.emit(text)
 
 
+def _bring_dialog_to_front(dialog, parent_widget=None):
+    """Ensure dialog appears strictly above the WindowStaysOnTopHint floating clipboard UI."""
+    if parent_widget is not None:
+        try:
+            parent_geo = parent_widget.frameGeometry()
+            dlg_geo = dialog.frameGeometry()
+            dlg_geo.moveCenter(parent_geo.center())
+            dialog.move(dlg_geo.topLeft())
+        except Exception:
+            pass
+    dialog.raise_()
+    dialog.activateWindow()
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            hwnd = int(dialog.winId())
+            user32 = ctypes.windll.user32
+            # HWND_TOPMOST = -1, SWP_NOSIZE = 0x0001, SWP_NOMOVE = 0x0002, SWP_SHOWWINDOW = 0x0040
+            user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)
+            user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+
+
 class ShortcutAssignDialog(QDialog):
     """Modal dialog for assigning a persistent Ctrl+<key> shortcut to a clip."""
 
@@ -446,6 +471,7 @@ class ShortcutAssignDialog(QDialog):
         self.selected_key = ""
         self.conflict_clip_id = None
 
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowStaysOnTopHint)
         self.setWindowTitle("Gán phím tắt nhanh")
         self.setFixedSize(420, 260)
         self.setStyleSheet("""
@@ -573,6 +599,12 @@ class ShortcutAssignDialog(QDialog):
         if ok:
             self.accept()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        _bring_dialog_to_front(self, self.parentWidget())
+        self.key_edit.setFocus()
+        QTimer.singleShot(10, lambda: (_bring_dialog_to_front(self, None), self.key_edit.setFocus()))
+
     def _remove_shortcut(self):
         self.storage.remove_shortcut(self.clip_id)
         self.accept()
@@ -593,6 +625,7 @@ class ActionConfigDialog(QDialog):
         self.storage = storage
         self.clip_id = clip_data.get("id")
 
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowStaysOnTopHint)
         self.setWindowTitle("Cấu hình Action cho Clip")
         self.setMinimumSize(520, 420)
         self.setStyleSheet("""
@@ -664,7 +697,8 @@ class ActionConfigDialog(QDialog):
 
         # Multi-line inline code edit (shown only for python_inline)
         self.edit_inline = QPlainTextEdit(self)
-        self.edit_inline.setPlaceholderText("Nhập mã Python tại đây...")
+        if hasattr(self.edit_inline, "setPlaceholderText"):
+            self.edit_inline.setPlaceholderText("Nhập mã Python tại đây...")
         self.edit_inline.hide()
         layout.addWidget(self.edit_inline, stretch=1)
 
@@ -829,9 +863,158 @@ class ActionConfigDialog(QDialog):
             self.lbl_error.setText("Không thể lưu action vào cơ sở dữ liệu.")
             self.lbl_error.show()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        _bring_dialog_to_front(self, self.parentWidget())
+        QTimer.singleShot(10, lambda: _bring_dialog_to_front(self, None))
+
     def _remove_action(self):
         self.storage.remove_clip_action(self.clip_id)
         self.accept()
+
+
+class ActionLogDialog(QDialog):
+    """Live terminal log viewer for a running clip action."""
+
+    def __init__(self, clip_data: dict, parent=None, on_stop_callback=None):
+        super().__init__(parent)
+        self.clip_data = clip_data
+        self.clip_id = clip_data.get("id")
+        self._on_stop_callback = on_stop_callback
+        self._last_log_text = None
+
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowTitle(f"Terminal Log - Clip #{self.clip_id}")
+        self.resize(660, 440)
+        self.setStyleSheet("""
+            QDialog { background: #181818; color: #e0e0e0; }
+            QLabel { color: #e0e0e0; font-size: 9.5pt; }
+            QPlainTextEdit {
+                background: #0f0f0f;
+                color: #d4d4d4;
+                border: 1px solid #3a3a3a;
+                border-radius: 4px;
+                font-family: 'Consolas', 'Courier New', monospace;
+                font-size: 9.5pt;
+                padding: 6px;
+            }
+            QPushButton {
+                background: #2f2f2f;
+                color: #eee;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 6px 14px;
+                font-size: 9pt;
+            }
+            QPushButton:hover { border-color: #d18616; color: white; }
+            QPushButton#stopButton {
+                background: #8b2626;
+                border-color: #aa3333;
+                color: #ffffff;
+                font-weight: bold;
+            }
+            QPushButton#stopButton:disabled {
+                background: #333;
+                border-color: #444;
+                color: #777;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        header_row = QHBoxLayout()
+        self.lbl_status = QLabel("🟢 Đang chạy Action...")
+        self.lbl_status.setStyleSheet("font-weight: bold; color: #4caf50; font-size: 10pt;")
+        header_row.addWidget(self.lbl_status, stretch=1)
+        layout.addLayout(header_row)
+
+        self.log_view = QPlainTextEdit(self)
+        if hasattr(self.log_view, "setReadOnly"):
+            self.log_view.setReadOnly(True)
+        layout.addWidget(self.log_view, stretch=1)
+
+        footer_row = QHBoxLayout()
+        self.btn_stop = QPushButton("⏹ STOP Action", self)
+        self.btn_stop.setObjectName("stopButton")
+        self.btn_stop.clicked.connect(self._stop_running_action)
+        footer_row.addWidget(self.btn_stop)
+
+        btn_copy = QPushButton("Copy Log", self)
+        btn_copy.clicked.connect(self._copy_log)
+        footer_row.addWidget(btn_copy)
+
+        footer_row.addStretch()
+
+        btn_close = QPushButton("Đóng", self)
+        btn_close.clicked.connect(self.close)
+        footer_row.addWidget(btn_close)
+        layout.addLayout(footer_row)
+
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(200)
+        self._poll_timer.timeout.connect(self.refresh_log)
+        self.refresh_log()
+        self._poll_timer.start()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        _bring_dialog_to_front(self, self.parentWidget())
+        QTimer.singleShot(10, lambda: _bring_dialog_to_front(self, None))
+
+    def closeEvent(self, event):
+        self._poll_timer.stop()
+        super().closeEvent(event)
+
+    def refresh_log(self):
+        if not self.clip_id:
+            return
+        log_text = ActionRunner.get_action_log(self.clip_id)
+        status = ActionRunner.get_action_status(self.clip_id)
+        is_running = bool(status.get("is_running"))
+        pid = status.get("pid")
+        state = status.get("state", "")
+        exit_code = status.get("exit_code")
+
+        if is_running:
+            pid_str = f" (PID {pid})" if pid else ""
+            self.lbl_status.setText(f"🟢 Đang chạy Action{pid_str}")
+            self.lbl_status.setStyleSheet("font-weight: bold; color: #4caf50; font-size: 10pt;")
+            if hasattr(self.btn_stop, "setEnabled"):
+                self.btn_stop.setEnabled(True)
+        else:
+            if hasattr(self.btn_stop, "setEnabled"):
+                self.btn_stop.setEnabled(False)
+            if state == "stopped":
+                self.lbl_status.setText("⏹ Đã dừng Action bởi người dùng")
+                self.lbl_status.setStyleSheet("font-weight: bold; color: #ffb830; font-size: 10pt;")
+            elif state == "completed":
+                self.lbl_status.setText(f"✅ Đã hoàn thành (exit code {exit_code})")
+                self.lbl_status.setStyleSheet("font-weight: bold; color: #4fc3f7; font-size: 10pt;")
+            elif state == "failed":
+                self.lbl_status.setText(f"❌ Thất bại (exit code {exit_code})")
+                self.lbl_status.setStyleSheet("font-weight: bold; color: #ef5350; font-size: 10pt;")
+
+        if log_text != self._last_log_text:
+            self._last_log_text = log_text
+            bar = self.log_view.verticalScrollBar()
+            at_bottom = bar.value() >= max(0, bar.maximum() - 20)
+            self.log_view.setPlainText(log_text or "(Chưa có log đầu ra...)")
+            if at_bottom:
+                bar.setValue(bar.maximum())
+
+    def _stop_running_action(self):
+        if self.clip_id:
+            ActionRunner.stop_action(self.clip_id)
+            if self._on_stop_callback:
+                self._on_stop_callback(self.clip_id)
+            self.refresh_log()
+
+    def _copy_log(self):
+        cb = QApplication.clipboard()
+        if cb:
+            cb.setText(self.log_view.toPlainText())
 
 
 class ClipEditPopup(QWidget):
@@ -845,7 +1028,7 @@ class ClipEditPopup(QWidget):
         self._fitting_to_screen = False
         self._search_matches = []
         self._current_search_index = -1
-        self.setWindowFlags(Qt.WindowType.Tool)
+        self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
         self.setWindowTitle(str(clip_data.get("tag") or ""))
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.setMinimumSize(360, 220)
@@ -935,6 +1118,7 @@ class ClipEditPopup(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         self._fit_to_screen()
+        _bring_dialog_to_front(self, None)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

@@ -30,8 +30,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import (
     Qt,
     QTimer,
-
     QEvent,
+    pyqtSignal,
 )
 from PyQt6.QtGui import (
     QCursor,
@@ -135,7 +135,7 @@ threading.excepthook = _log_thread_exception
 
 
 class ClientApp(QWidget):
-
+    actionStateChanged = pyqtSignal(int, str)
 
     def __init__(self, *, enable_monitor: bool = True, init_data: bool = True):
         super().__init__()
@@ -222,6 +222,13 @@ class ClientApp(QWidget):
         self.backup_scheduler = BackupScheduler(self._perform_backup)
         self.storage.set_backup_callback(self.backup_scheduler.schedule)
 
+
+        from core.action_runner import ActionRunner
+        self._action_state_cb = lambda cid, st: self.actionStateChanged.emit(cid, st)
+        self.actionStateChanged.connect(
+            self._on_action_state_changed, Qt.ConnectionType.QueuedConnection
+        )
+        ActionRunner.add_state_listener(self._action_state_cb)
 
         # Register cleanup on exit
         atexit.register(self._cleanup_on_exit)
@@ -371,6 +378,9 @@ class ClientApp(QWidget):
         self.list_history.pinToggleRequested.connect(self.handle_star)
         self.list_history.deleteRequested.connect(self.handle_delete)
         self.list_history.expandToggleRequested.connect(self.handle_toggle_expand)
+        self.list_history.runActionRequested.connect(self.handle_run_action)
+        self.list_history.stopActionRequested.connect(self.handle_stop_action)
+        self.list_history.showLogRequested.connect(self.handle_show_action_log)
         col_h.addWidget(self.list_history)
 
         # PINNED column
@@ -390,6 +400,9 @@ class ClientApp(QWidget):
         self.list_pinned.pinToggleRequested.connect(self.handle_star)
         self.list_pinned.deleteRequested.connect(self.handle_delete)
         self.list_pinned.expandToggleRequested.connect(self.handle_toggle_expand)
+        self.list_pinned.runActionRequested.connect(self.handle_run_action)
+        self.list_pinned.stopActionRequested.connect(self.handle_stop_action)
+        self.list_pinned.showLogRequested.connect(self.handle_show_action_log)
         self.list_pinned.groupToggleRequested.connect(
             lambda group, expanded: self.expand_group(group)
             if expanded
@@ -651,8 +664,38 @@ class ClientApp(QWidget):
         self.hide()
         open_url(url)
 
+    def _on_action_state_changed(self, clip_id: int, state: str):
+        if self.isVisible():
+            self.refresh_lists(force_reset_selection=False)
+        else:
+            self._schedule_hidden_ui_refresh(clip_id, full_refresh=True)
+
     def handle_run_action(self, clip_data):
         self.handle_run_clip_action_or_url(clip_data)
+
+    def handle_stop_action(self, clip_id: int):
+        from core.action_runner import ActionRunner
+        ActionRunner.stop_action(clip_id)
+        if self.isVisible():
+            self.refresh_lists(force_reset_selection=False)
+
+    def handle_show_action_log(self, clip_data):
+        from ui.widgets import ActionLogDialog
+        existing_dlg = getattr(self, "_action_log_dialog", None)
+        if existing_dlg is not None:
+            try:
+                existing_dlg.close()
+            except Exception:
+                pass
+        self._child_dialog_open = True
+        try:
+            dlg = ActionLogDialog(
+                clip_data, parent=self, on_stop_callback=self.handle_stop_action
+            )
+            self._action_log_dialog = dlg
+            dlg.exec()
+        finally:
+            self._child_dialog_open = False
 
     def handle_run_clip_action_or_url(self, clip_data):
         clip_id = clip_data.get("id")
@@ -667,6 +710,8 @@ class ClientApp(QWidget):
             def on_done(res):
                 logger.debug("action_done clip_id=%s success=%s code=%s msg=%s", clip_id, res.success, res.exit_code, res.message)
             ActionRunner.execute_action(clip_id, action, on_complete=on_done)
+            if self.isVisible() and action.get("action_type") != "url":
+                QTimer.singleShot(15, lambda: self.refresh_lists(force_reset_selection=False))
             return
 
         content = str(clip_data.get("content", "")).strip()
@@ -677,6 +722,13 @@ class ClientApp(QWidget):
 
     def closeEvent(self, event):
         """Clean up on close."""
+        cb = getattr(self, "_action_state_cb", None)
+        if cb is not None:
+            try:
+                from core.action_runner import ActionRunner
+                ActionRunner.remove_state_listener(cb)
+            except Exception:
+                pass
         if getattr(self, "preview", None):
             self.preview.reset()
         super().closeEvent(event)

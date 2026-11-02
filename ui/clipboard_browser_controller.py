@@ -1,3 +1,4 @@
+from core.action_runner import ActionRunner
 import queue
 import threading
 import time
@@ -113,6 +114,7 @@ class ClipboardBrowserController:
                 clip_dict["shortcut_key"] = self._shortcuts_cache.get(cid)
             if "has_action" not in clip_dict:
                 clip_dict["has_action"] = bool(self._actions_cache.get(cid))
+            clip_dict["is_action_running"] = ActionRunner.is_running(cid)
 
         return ClipRow(
             row_kind="clip",
@@ -125,9 +127,46 @@ class ClipboardBrowserController:
             alt_shortcut=alt_shortcut,
         )
 
+    def _reorder_running_clips_to_slot_4(self, clips, *, is_pinned: bool) -> list:
+        """
+        Pin currently running action clips at position #4 onwards (index 3, right after
+        the 3 Alt quick-paste slots) in their respective column (History or Pinned).
+        """
+        running_ids = ActionRunner.get_running_clip_ids()
+        if not running_ids:
+            return list(clips)
+
+        running_set = set(running_ids)
+        by_id = {}
+        normal_clips = []
+        for clip in clips:
+            cid = clip.get("id")
+            if cid in running_set:
+                by_id[cid] = clip
+            else:
+                normal_clips.append(clip)
+
+        if not self.current_search_query and hasattr(self.storage, "get_clip_by_id"):
+            for rcid in running_ids:
+                if rcid not in by_id:
+                    try:
+                        rclip = self.storage.get_clip_by_id(rcid)
+                        if rclip and bool(rclip.get("is_pinned")) == bool(is_pinned):
+                            by_id[rcid] = rclip
+                    except Exception:
+                        pass
+
+        running_ordered = [by_id[rcid] for rcid in running_ids if rcid in by_id]
+        if not running_ordered:
+            return list(clips)
+
+        insert_idx = min(3, len(normal_clips))
+        return normal_clips[:insert_idx] + running_ordered + normal_clips[insert_idx:]
+
     def build_history_rows(self, clips):
+        ordered_clips = self._reorder_running_clips_to_slot_4(clips, is_pinned=False)
         rows = []
-        for i, clip in enumerate(clips):
+        for i, clip in enumerate(ordered_clips):
             alt_sc = f"Alt+{i+1}" if i < 3 else ""
             rows.append(
                 self.build_clip_row(
@@ -139,16 +178,23 @@ class ClipboardBrowserController:
     def build_pinned_rows(self, groups=None, ungrouped=None, pinned_clips=None):
         query = self.current_search_query
         if pinned_clips is not None:
+            ordered_pinned = self._reorder_running_clips_to_slot_4(pinned_clips, is_pinned=True)
             rows = []
-            for i, clip in enumerate(pinned_clips):
+            for i, clip in enumerate(ordered_pinned):
                 alt_sc = f"Alt+{i+4}" if i < 3 else ""
                 rows.append(
                     self.build_clip_row(clip, True, search_query=query, alt_shortcut=alt_sc)
                 )
             return rows
 
+        running_ids = ActionRunner.get_running_clip_ids()
+        running_set = set(running_ids)
+        running_by_id = {}
+
         rows = []
         pasteable_count = 0
+        slot_4_row_insert_idx = None
+
         for group_name, clips in groups or []:
             expanded = group_name in self.expanded_groups
             rows.append(
@@ -163,6 +209,10 @@ class ClipboardBrowserController:
             )
             if expanded:
                 for clip in clips:
+                    cid = clip.get("id")
+                    if cid in running_set:
+                        running_by_id[cid] = (clip, True, group_name)
+                        continue
                     alt_sc = f"Alt+{pasteable_count+4}" if pasteable_count < 3 else ""
                     pasteable_count += 1
                     rows.append(
@@ -175,12 +225,55 @@ class ClipboardBrowserController:
                             alt_shortcut=alt_sc,
                         )
                     )
+                    if pasteable_count == 3 and slot_4_row_insert_idx is None:
+                        slot_4_row_insert_idx = len(rows)
+
         for clip in (ungrouped or []):
+            cid = clip.get("id")
+            if cid in running_set:
+                running_by_id[cid] = (clip, False, "")
+                continue
             alt_sc = f"Alt+{pasteable_count+4}" if pasteable_count < 3 else ""
             pasteable_count += 1
             rows.append(
                 self.build_clip_row(clip, True, search_query=query, alt_shortcut=alt_sc)
             )
+            if pasteable_count == 3 and slot_4_row_insert_idx is None:
+                slot_4_row_insert_idx = len(rows)
+
+        if running_ids and hasattr(self.storage, "get_clip_by_id"):
+            for rcid in running_ids:
+                if rcid not in running_by_id:
+                    try:
+                        rclip = self.storage.get_clip_by_id(rcid)
+                        if rclip and rclip.get("is_pinned"):
+                            gname = str(rclip.get("group_name", "") or "")
+                            running_by_id[rcid] = (rclip, bool(gname), gname)
+                    except Exception:
+                        pass
+
+        if running_by_id:
+            running_rows = []
+            for rcid in running_ids:
+                if rcid in running_by_id:
+                    rclip, is_grp, gname = running_by_id[rcid]
+                    alt_sc = f"Alt+{pasteable_count+4}" if pasteable_count < 3 else ""
+                    pasteable_count += 1
+                    running_rows.append(
+                        self.build_clip_row(
+                            rclip,
+                            True,
+                            is_grouped=is_grp,
+                            group_name=gname,
+                            search_query=query,
+                            alt_shortcut=alt_sc,
+                        )
+                    )
+            if slot_4_row_insert_idx is not None:
+                rows = rows[:slot_4_row_insert_idx] + running_rows + rows[slot_4_row_insert_idx:]
+            else:
+                rows.extend(running_rows)
+
         return rows
 
     def start_background_refresh(self):
@@ -337,6 +430,8 @@ class ClipboardBrowserController:
 
     def _close_expanded_editors(self, list_widget, clip_ids=None):
         """Close persistent editors before rows are reset, removed, or replaced."""
+        if not self.expanded_clip_ids and clip_ids is None:
+            return
         target_ids = set(clip_ids) if clip_ids is not None else None
         for row_idx in range(list_widget.model().rowCount()):
             row_data = list_widget.model().row_at(row_idx)
@@ -348,6 +443,9 @@ class ClipboardBrowserController:
 
     def _reopen_expanded_editors(self, list_widget):
         """Reopen persistent editors for expanded clips after a row layout change."""
+        if not self.expanded_clip_ids:
+            list_widget.viewport().update()
+            return
         list_widget.doItemsLayout()
         for row_idx in range(list_widget.model().rowCount()):
             row_data = list_widget.model().row_at(row_idx)

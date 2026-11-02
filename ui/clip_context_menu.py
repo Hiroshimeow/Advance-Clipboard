@@ -2,9 +2,10 @@ import subprocess
 import webbrowser
 from pathlib import Path
 
-from PyQt6.QtWidgets import QInputDialog, QMenu
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QInputDialog, QLineEdit, QMenu
 
-from core.action_runner import is_valid_url, open_url
+from core.action_runner import ActionRunner, is_valid_url, open_url
 
 
 def resolve_image_path(clip_data):
@@ -57,6 +58,20 @@ def _open_url_action(clip_data, parent_handler=None):
     open_url(url)
 
 
+def _get_topmost_text(owner, title: str, label: str, default_text: str = ""):
+    try:
+        return QInputDialog.getText(
+            owner,
+            title,
+            label,
+            QLineEdit.EchoMode.Normal,
+            default_text,
+            Qt.WindowType.Dialog | Qt.WindowType.WindowStaysOnTopHint,
+        )
+    except TypeError:
+        return QInputDialog.getText(owner, title, label, text=default_text)
+
+
 CONTEXT_ACTIONS = [
     ("Show preview", lambda clip: True, _show_preview),
     ("Open this image", _is_image, _open_image),
@@ -74,6 +89,7 @@ def show_clip_context_menu(owner, clip_data, is_pinned, parent_handler, global_p
         return
 
     menu = QMenu(owner)
+    menu.setWindowFlags(menu.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
     menu.setStyleSheet(
         """
         QMenu { background-color: #2d2d2d; color: #eee; border: 1px solid #444; }
@@ -83,9 +99,25 @@ def show_clip_context_menu(owner, clip_data, is_pinned, parent_handler, global_p
 
     storage = getattr(parent_handler, "storage", None)
 
-    # 1. RUN action if action exists
-    existing_action = storage.get_clip_action(clip_id) if (storage and hasattr(storage, "get_clip_action")) else None
-    if existing_action:
+    # 1. RUN / STOP Action & Show log
+    existing_action = (
+        storage.get_clip_action(clip_id)
+        if (storage and hasattr(storage, "get_clip_action"))
+        else None
+    )
+    is_action_running = ActionRunner.is_running(clip_id)
+
+    if is_action_running:
+        stop_act = menu.addAction("⏹ STOP Action")
+        font = stop_act.font()
+        font.setBold(True)
+        stop_act.setFont(font)
+        stop_act.setData(("stop_action", None))
+
+        log_act = menu.addAction("📋 Show log")
+        log_act.setData(("show_action_log", None))
+        menu.addSeparator()
+    elif existing_action:
         run_act = menu.addAction("⚡ RUN Action")
         font = run_act.font()
         font.setBold(True)
@@ -104,7 +136,11 @@ def show_clip_context_menu(owner, clip_data, is_pinned, parent_handler, global_p
         menu.addSeparator()
 
     # 3. Shortcut binding
-    existing_shortcut = storage.get_shortcut_for_clip(clip_id) if (storage and hasattr(storage, "get_shortcut_for_clip")) else None
+    existing_shortcut = (
+        storage.get_shortcut_for_clip(clip_id)
+        if (storage and hasattr(storage, "get_shortcut_for_clip"))
+        else None
+    )
     if existing_shortcut:
         sc_edit_act = menu.addAction(f"Đổi phím tắt (Ctrl+{existing_shortcut})...")
         sc_edit_act.setData(("assign_shortcut", None))
@@ -163,6 +199,10 @@ def show_clip_context_menu(owner, clip_data, is_pinned, parent_handler, global_p
         CONTEXT_ACTIONS[value][2](clip_data, parent_handler)
     elif action_type == "run_action" and hasattr(parent_handler, "handle_run_action"):
         parent_handler.handle_run_action(clip_data)
+    elif action_type == "stop_action" and hasattr(parent_handler, "handle_stop_action"):
+        parent_handler.handle_stop_action(clip_id)
+    elif action_type == "show_action_log" and hasattr(parent_handler, "handle_show_action_log"):
+        parent_handler.handle_show_action_log(clip_data)
     elif action_type == "assign_shortcut" and hasattr(parent_handler, "handle_assign_shortcut"):
         parent_handler.handle_assign_shortcut(clip_data)
     elif action_type == "remove_shortcut" and hasattr(parent_handler, "handle_remove_shortcut"):
@@ -174,8 +214,8 @@ def show_clip_context_menu(owner, clip_data, is_pinned, parent_handler, global_p
     elif action_type == "tag" and hasattr(parent_handler, "handle_add_tag"):
         setattr(parent_handler, "_child_dialog_open", True)
         try:
-            tag, ok = QInputDialog.getText(
-                owner, "Add Tag", "Enter tag name:", text=clip_data.get("tag", "")
+            tag, ok = _get_topmost_text(
+                owner, "Add Tag", "Enter tag name:", clip_data.get("tag", "")
             )
         finally:
             setattr(parent_handler, "_child_dialog_open", False)
@@ -186,7 +226,7 @@ def show_clip_context_menu(owner, clip_data, is_pinned, parent_handler, global_p
     elif action_type == "new_group" and hasattr(parent_handler, "handle_set_group"):
         setattr(parent_handler, "_child_dialog_open", True)
         try:
-            group_name, ok = QInputDialog.getText(owner, "New Group", "Enter group name:")
+            group_name, ok = _get_topmost_text(owner, "New Group", "Enter group name:")
         finally:
             setattr(parent_handler, "_child_dialog_open", False)
         if ok and group_name.strip():
