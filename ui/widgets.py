@@ -1,26 +1,29 @@
+import sys
 import math
 import os
 
-from PyQt6.QtCore import Qt, QTimer, QPoint, QSize
-from PyQt6.QtGui import QFont, QFontMetrics, QPixmap
-from PyQt6.QtGui import QMouseEvent
+from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QEvent, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
-    QMenu,
     QPlainTextEdit,
     QPushButton,
-    QApplication,
-    QSizePolicy,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
+
+from core.action_runner import ActionRunner, is_valid_url
 
 # Base directory is one level up from this file (ui/ directory)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -205,8 +208,36 @@ class LineInfoPopup(QWidget):
         self.activateWindow()
 
 
+def _extract_alnum_key(event) -> str:
+    """
+    Extract a single ASCII alphanumeric key ('0'-'9', 'A'-'Z') from a QKeyEvent.
+    Checks event.key() and nativeVirtualKey() first because on Windows/Qt, pressing
+    Ctrl+A..Ctrl+Z populates event.text() with ASCII control chars (''..'').
+    """
+    try:
+        k_int = int(event.key())
+    except Exception:
+        k_int = 0
+    if 0x30 <= k_int <= 0x39 or 0x41 <= k_int <= 0x5A:
+        return chr(k_int)
+
+    vk = getattr(event, "nativeVirtualKey", lambda: 0)()
+    if 0x30 <= vk <= 0x39 or 0x41 <= vk <= 0x5A:
+        return chr(vk)
+    if 0x60 <= vk <= 0x69:
+        return chr(vk - 0x30)
+
+    text = (event.text() or "").strip().upper()
+    if len(text) == 1 and text.isascii() and text.isalnum():
+        return text
+    return ""
+
+
 class SearchLineEdit(QLineEdit):
-    """QLineEdit with triple-click to clear functionality."""
+    """
+    QLineEdit with triple-click to clear, Alt+1..6 quick paste,
+    Ctrl+<key> clip shortcuts, and Ctrl+Enter action dispatch.
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -217,13 +248,28 @@ class SearchLineEdit(QLineEdit):
         self._on_up = None
         self._on_down = None
         self._on_enter = None
+        self._on_ctrl_enter = None
+        self._on_alt_digit = None
+        self._on_ctrl_key = None
 
     def set_key_handlers(
-        self, *, on_up=None, on_down=None, on_left=None, on_right=None, on_enter=None
+        self,
+        *,
+        on_up=None,
+        on_down=None,
+        on_left=None,
+        on_right=None,
+        on_enter=None,
+        on_ctrl_enter=None,
+        on_alt_digit=None,
+        on_ctrl_key=None,
     ):
         self._on_up = on_up
         self._on_down = on_down
         self._on_enter = on_enter
+        self._on_ctrl_enter = on_ctrl_enter
+        self._on_alt_digit = on_alt_digit
+        self._on_ctrl_key = on_ctrl_key
 
     def mousePressEvent(self, event):
         self.click_count += 1
@@ -237,8 +283,74 @@ class SearchLineEdit(QLineEdit):
     def _reset_click_count(self):
         self.click_count = 0
 
+    def event(self, ev):
+        shortcut_override = getattr(QEvent.Type, "ShortcutOverride", None)
+        if shortcut_override is not None and ev.type() == shortcut_override:
+            k = ev.key()
+            mods = ev.modifiers()
+            if (mods & Qt.KeyboardModifier.ControlModifier) and not (
+                mods & Qt.KeyboardModifier.AltModifier
+            ):
+                if (
+                    0x30 <= int(k) <= 0x39 or 0x41 <= int(k) <= 0x5A
+                    or k in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                ):
+                    ev.accept()
+                    return True
+            if (mods & Qt.KeyboardModifier.AltModifier) and not (
+                mods & Qt.KeyboardModifier.ControlModifier
+            ):
+                if 0x31 <= int(k) <= 0x36:
+                    ev.accept()
+                    return True
+        parent_event = getattr(super(), "event", None)
+        return parent_event(ev) if parent_event is not None else False
+
     def keyPressEvent(self, event):
         k = event.key()
+        modifiers = event.modifiers()
+        is_repeat = bool(getattr(event, "isAutoRepeat", lambda: False)())
+
+        # 1. Ctrl + Enter -> RUN action or Open URL
+        if (modifiers & Qt.KeyboardModifier.ControlModifier) and k in (
+            Qt.Key.Key_Return,
+            Qt.Key.Key_Enter,
+        ):
+            if not is_repeat and self._on_ctrl_enter:
+                self._on_ctrl_enter()
+                event.accept()
+                return
+
+        # 2. Alt + 1..6 -> Quick paste from visible columns
+        if (modifiers & Qt.KeyboardModifier.AltModifier) and not (
+            modifiers & Qt.KeyboardModifier.ControlModifier
+        ):
+            digit = 0
+            if 0x31 <= int(k) <= 0x36:
+                digit = int(k) - 0x30
+            else:
+                vk = getattr(event, "nativeVirtualKey", lambda: 0)()
+                if 0x31 <= vk <= 0x36:
+                    digit = vk - 0x30
+            if 1 <= digit <= 6 and not is_repeat and self._on_alt_digit:
+                if self._on_alt_digit(digit):
+                    event.accept()
+                    return
+
+        # 3. Ctrl + <key> (0-9, A-Z) -> Persistent clip shortcut
+        # IMPORTANT: On Windows/Qt, Ctrl+A..Ctrl+Z sets event.text() to ASCII control
+        # characters (''..'') rather than 'A'..'Z' or ''. Check event.key()
+        # and nativeVirtualKey() FIRST so Ctrl+C, Ctrl+Q, etc. always resolve to 'C', 'Q'.
+        if (modifiers & Qt.KeyboardModifier.ControlModifier) and not (
+            modifiers & Qt.KeyboardModifier.AltModifier
+        ):
+            char = _extract_alnum_key(event)
+            if char and not is_repeat:
+                if self._on_ctrl_key and self._on_ctrl_key(char):
+                    event.accept()
+                    return
+
+        # Standard navigation
         if k == Qt.Key.Key_Up and self._on_up:
             self._on_up()
             event.accept()
@@ -251,21 +363,684 @@ class SearchLineEdit(QLineEdit):
             self._on_enter()
             event.accept()
             return
+
         super().keyPressEvent(event)
 
 
+class SingleKeyLineEdit(QLineEdit):
+    """Single-key receiver box for shortcut binding. Accepts only 1 character (0-9, A-Z)."""
+
+    keyChanged = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        if hasattr(self, "setMaxLength"):
+            self.setMaxLength(1)
+        if hasattr(self, "setAlignment"):
+            self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet("""
+            QLineEdit {
+                background: #2b2b2b;
+                color: #ffb830;
+                border: 2px solid #555;
+                border-radius: 6px;
+                font-size: 14pt;
+                font-weight: bold;
+                padding: 4px;
+            }
+            QLineEdit:focus {
+                border-color: #d18616;
+            }
+        """)
+
+    def event(self, ev):
+        shortcut_override = getattr(QEvent.Type, "ShortcutOverride", None)
+        if shortcut_override is not None and ev.type() == shortcut_override:
+            k = ev.key()
+            if 0x30 <= int(k) <= 0x39 or 0x41 <= int(k) <= 0x5A:
+                ev.accept()
+                return True
+        parent_event = getattr(super(), "event", None)
+        return parent_event(ev) if parent_event is not None else False
+
+    def keyPressEvent(self, event):
+        k = event.key()
+        if k in (getattr(Qt.Key, "Key_Backspace", 0x01000003), getattr(Qt.Key, "Key_Delete", 0x01000007)):
+            self.clear()
+            self.keyChanged.emit("")
+            event.accept()
+            return
+        if k in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Escape):
+            super().keyPressEvent(event)
+            return
+
+        mods = event.modifiers()
+        if mods & Qt.KeyboardModifier.AltModifier:
+            event.ignore()
+            return
+
+        char = _extract_alnum_key(event)
+        if char:
+            self.setText(char)
+            self.keyChanged.emit(char)
+            event.accept()
+            return
+
+        # Ignore non-alphanumeric or lone modifiers
+        event.ignore()
+
+    def insertFromMimeData(self, source):
+        text = source.text().strip().upper()
+        if len(text) == 1 and text.isalnum():
+            self.setText(text)
+            self.keyChanged.emit(text)
+
+
+def _bring_dialog_to_front(dialog, parent_widget=None):
+    """Ensure dialog appears strictly above the WindowStaysOnTopHint floating clipboard UI."""
+    if parent_widget is not None:
+        try:
+            parent_geo = parent_widget.frameGeometry()
+            dlg_geo = dialog.frameGeometry()
+            dlg_geo.moveCenter(parent_geo.center())
+            dialog.move(dlg_geo.topLeft())
+        except Exception:
+            pass
+    dialog.raise_()
+    dialog.activateWindow()
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            hwnd = int(dialog.winId())
+            user32 = ctypes.windll.user32
+            # HWND_TOPMOST = -1, SWP_NOSIZE = 0x0001, SWP_NOMOVE = 0x0002, SWP_SHOWWINDOW = 0x0040
+            user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)
+            user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+
+
+class ShortcutAssignDialog(QDialog):
+    """Modal dialog for assigning a persistent Ctrl+<key> shortcut to a clip."""
+
+    def __init__(self, clip_data: dict, storage, parent=None):
+        super().__init__(parent)
+        self.clip_data = clip_data
+        self.storage = storage
+        self.clip_id = clip_data.get("id")
+        self.selected_key = ""
+        self.conflict_clip_id = None
+
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowTitle("Gán phím tắt nhanh")
+        self.setFixedSize(420, 260)
+        self.setStyleSheet("""
+            QDialog { background: #1f1f1f; color: #e0e0e0; }
+            QLabel { color: #e0e0e0; font-size: 10pt; }
+            QPushButton {
+                background: #333;
+                color: #eee;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 6px 14px;
+                font-size: 9pt;
+            }
+            QPushButton:hover { border-color: #d18616; color: white; }
+            QPushButton#saveButton {
+                background: #aa8030;
+                border-color: #aa8030;
+                color: white;
+                font-weight: bold;
+            }
+            QPushButton#removeButton {
+                background: #6b2828;
+                border-color: #883333;
+                color: #ffcccc;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        # Title / snippet
+        lbl_title = QLabel("Gán phím tắt nhanh cho clip:")
+        lbl_title.setStyleSheet("font-weight: bold; font-size: 11pt; color: #ffb830;")
+        layout.addWidget(lbl_title)
+
+        snippet = str(clip_data.get("content", ""))[:80].replace("\n", " ")
+        if len(str(clip_data.get("content", ""))) > 80:
+            snippet += "..."
+        lbl_snippet = QLabel(f'"{snippet}"')
+        lbl_snippet.setStyleSheet("color: #aaa; font-style: italic;")
+        lbl_snippet.setWordWrap(True)
+        layout.addWidget(lbl_snippet)
+
+        # Shortcut input row
+        input_row = QHBoxLayout()
+        input_row.setSpacing(8)
+        lbl_ctrl = QLabel("Ctrl  +")
+        lbl_ctrl.setStyleSheet("font-size: 13pt; font-weight: bold; color: #ffb830;")
+        input_row.addWidget(lbl_ctrl)
+
+        self.key_edit = SingleKeyLineEdit(self)
+        self.key_edit.setFixedSize(50, 40)
+        self.key_edit.keyChanged.connect(self._on_key_entered)
+        input_row.addWidget(self.key_edit)
+        input_row.addStretch()
+        layout.addLayout(input_row)
+
+        # Conflict notice label
+        self.lbl_conflict = QLabel("")
+        self.lbl_conflict.setStyleSheet("color: #ffcc66; font-size: 9pt;")
+        self.lbl_conflict.setWordWrap(True)
+        self.lbl_conflict.hide()
+        layout.addWidget(self.lbl_conflict)
+
+        layout.addStretch()
+
+        # Action buttons
+        btn_row = QHBoxLayout()
+        self.btn_remove = QPushButton("Gỡ phím tắt", self)
+        self.btn_remove.setObjectName("removeButton")
+        self.btn_remove.clicked.connect(self._remove_shortcut)
+        self.btn_remove.hide()
+        btn_row.addWidget(self.btn_remove)
+
+        btn_row.addStretch()
+
+        btn_cancel = QPushButton("Hủy", self)
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+
+        self.btn_save = QPushButton("Lưu", self)
+        self.btn_save.setObjectName("saveButton")
+        self.btn_save.clicked.connect(self._save_shortcut)
+        btn_row.addWidget(self.btn_save)
+
+        layout.addLayout(btn_row)
+
+        # Load existing shortcut if present
+        current_sc = self.storage.get_shortcut_for_clip(self.clip_id)
+        if current_sc:
+            self.key_edit.setText(current_sc)
+            self.selected_key = current_sc
+            self.btn_remove.show()
+        self.key_edit.setFocus()
+
+    def _on_key_entered(self, key: str):
+        self.selected_key = key.strip().upper()
+        if not self.selected_key:
+            self.lbl_conflict.hide()
+            self.btn_save.setText("Lưu")
+            self.conflict_clip_id = None
+            return
+
+        existing = self.storage.get_clip_by_shortcut(self.selected_key)
+        if existing and existing.get("id") != self.clip_id:
+            self.conflict_clip_id = existing.get("id")
+            snip = str(existing.get("content", ""))[:40].replace("\n", " ")
+            self.lbl_conflict.setText(
+                f'⚠️ Phím Ctrl+{self.selected_key} đang gán cho clip #{self.conflict_clip_id}: "{snip}". Bạn có muốn chuyển sang clip này không?'
+            )
+            self.lbl_conflict.show()
+            self.btn_save.setText("Chuyển gán")
+        else:
+            self.conflict_clip_id = None
+            self.lbl_conflict.hide()
+            self.btn_save.setText("Lưu")
+
+    def _save_shortcut(self):
+        if not self.selected_key:
+            return
+        ok, conflict_id = self.storage.assign_shortcut(
+            self.clip_id, self.selected_key, force=True
+        )
+        if ok:
+            self.accept()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        _bring_dialog_to_front(self, self.parentWidget())
+        self.key_edit.setFocus()
+        QTimer.singleShot(10, lambda: (_bring_dialog_to_front(self, None), self.key_edit.setFocus()))
+
+    def _remove_shortcut(self):
+        self.storage.remove_shortcut(self.clip_id)
+        self.accept()
+
+
+class ActionConfigDialog(QDialog):
+    """
+    Modal dialog for configuring clip actions:
+    - Script file: Python / PowerShell (.py via `uv run`, must be full path)
+    - Python inline code
+    - External command (argv)
+    - URL (open in browser)
+    """
+
+    def __init__(self, clip_data: dict, storage, parent=None):
+        super().__init__(parent)
+        self.clip_data = clip_data
+        self.storage = storage
+        self.clip_id = clip_data.get("id")
+
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowTitle("Cấu hình Action cho Clip")
+        self.setMinimumSize(520, 420)
+        self.setStyleSheet("""
+            QDialog { background: #1f1f1f; color: #e0e0e0; }
+            QLabel { color: #e0e0e0; font-size: 9.5pt; }
+            QLineEdit, QPlainTextEdit, QComboBox {
+                background: #2b2b2b;
+                color: #f0f0f0;
+                border: 1px solid #444;
+                border-radius: 4px;
+                padding: 5px 8px;
+            }
+            QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus {
+                border-color: #d18616;
+            }
+            QPushButton {
+                background: #333;
+                color: #eee;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 6px 14px;
+            }
+            QPushButton:hover { border-color: #d18616; color: white; }
+            QPushButton#saveButton {
+                background: #aa8030;
+                border-color: #aa8030;
+                color: white;
+                font-weight: bold;
+            }
+            QPushButton#removeButton {
+                background: #6b2828;
+                border-color: #883333;
+                color: #ffcccc;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        # Header
+        lbl_head = QLabel("Cấu hình hành động thực thi (RUN hoặc Ctrl+Enter):")
+        lbl_head.setStyleSheet("font-weight: bold; color: #ffb830; font-size: 11pt;")
+        layout.addWidget(lbl_head)
+
+        # Type selector
+        type_row = QHBoxLayout()
+        type_row.addWidget(QLabel("Loại action:"))
+        self.cb_type = QComboBox(self)
+        self.cb_type.addItem("File Script (Python .py / .ps1 qua uv run)", "script_file")
+        self.cb_type.addItem("Mã Python trực tiếp (Inline)", "python_inline")
+        self.cb_type.addItem("Lệnh ngoài (Command + arguments)", "command")
+        self.cb_type.addItem("Mở URL (Trình duyệt web)", "url")
+        self.cb_type.currentIndexChanged.connect(self._on_type_changed)
+        type_row.addWidget(self.cb_type, stretch=1)
+        layout.addLayout(type_row)
+
+        # Target input container
+        self.lbl_target = QLabel("Đường dẫn script (Full path):")
+        layout.addWidget(self.lbl_target)
+
+        target_row = QHBoxLayout()
+        self.edit_target = QLineEdit(self)
+        target_row.addWidget(self.edit_target, stretch=1)
+        self.btn_browse = QPushButton("Duyệt...", self)
+        self.btn_browse.clicked.connect(self._browse_file)
+        target_row.addWidget(self.btn_browse)
+        layout.addLayout(target_row)
+
+        # Multi-line inline code edit (shown only for python_inline)
+        self.edit_inline = QPlainTextEdit(self)
+        if hasattr(self.edit_inline, "setPlaceholderText"):
+            self.edit_inline.setPlaceholderText("Nhập mã Python tại đây...")
+        self.edit_inline.hide()
+        layout.addWidget(self.edit_inline, stretch=1)
+
+        # Arguments row
+        self.lbl_args = QLabel("Tham số (arguments, cách nhau bởi khoảng trắng):")
+        layout.addWidget(self.lbl_args)
+        self.edit_args = QLineEdit(self)
+        layout.addWidget(self.edit_args)
+
+        # Background checkbox
+        self.chk_bg = QCheckBox("Chạy ngầm (Detached process, ví dụ: mở Chrome / CDP / tiến trình nền)", self)
+        layout.addWidget(self.chk_bg)
+
+        # Helper hint
+        self.lbl_hint = QLabel("")
+        self.lbl_hint.setStyleSheet("color: #888; font-size: 8.5pt;")
+        layout.addWidget(self.lbl_hint)
+
+        # Error label
+        self.lbl_error = QLabel("")
+        self.lbl_error.setStyleSheet("color: #ff6666; font-size: 9pt;")
+        self.lbl_error.hide()
+        layout.addWidget(self.lbl_error)
+
+        layout.addStretch()
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        self.btn_remove = QPushButton("Gỡ Action", self)
+        self.btn_remove.setObjectName("removeButton")
+        self.btn_remove.clicked.connect(self._remove_action)
+        self.btn_remove.hide()
+        btn_row.addWidget(self.btn_remove)
+
+        btn_row.addStretch()
+
+        btn_cancel = QPushButton("Hủy", self)
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+
+        btn_save = QPushButton("Lưu Action", self)
+        btn_save.setObjectName("saveButton")
+        btn_save.clicked.connect(self._save_action)
+        btn_row.addWidget(btn_save)
+
+        layout.addLayout(btn_row)
+
+        # Load existing config
+        self._load_existing()
+
+    def _load_existing(self):
+        action = self.storage.get_clip_action(self.clip_id)
+        if not action:
+            content = str(self.clip_data.get("content", "")).strip()
+            if is_valid_url(content):
+                idx = self.cb_type.findData("url")
+                if idx >= 0:
+                    self.cb_type.setCurrentIndex(idx)
+                self.edit_target.setText(content)
+            elif os.path.isabs(content) and os.path.splitext(content)[1].lower() in (".py", ".ps1", ".bat", ".cmd", ".sh"):
+                idx = self.cb_type.findData("script_file")
+                if idx >= 0:
+                    self.cb_type.setCurrentIndex(idx)
+                self.edit_target.setText(content)
+            self._on_type_changed()
+            return
+
+        self.btn_remove.show()
+        act_type = action.get("action_type", "script_file")
+        idx = self.cb_type.findData(act_type)
+        if idx >= 0:
+            self.cb_type.setCurrentIndex(idx)
+
+        target = action.get("target", "")
+        if act_type == "python_inline":
+            self.edit_inline.setPlainText(target)
+        else:
+            self.edit_target.setText(target)
+
+        args = action.get("args") or []
+        self.edit_args.setText(" ".join(args))
+        self.chk_bg.setChecked(bool(action.get("is_background")))
+        self._on_type_changed()
+
+    def _on_type_changed(self):
+        act_type = self.cb_type.currentData()
+        self.lbl_error.hide()
+
+        if act_type == "script_file":
+            self.lbl_target.setText("Đường dẫn file script (Bắt buộc là Full path):")
+            self.lbl_target.show()
+            self.edit_target.show()
+            self.btn_browse.show()
+            self.edit_inline.hide()
+            self.lbl_args.show()
+            self.edit_args.show()
+            self.chk_bg.show()
+            self.lbl_hint.setText("Môi trường chạy là chính môi trường của script (chạy bằng: uv run <full_path>).")
+
+        elif act_type == "python_inline":
+            self.lbl_target.setText("Mã nguồn Python:")
+            self.lbl_target.show()
+            self.edit_target.hide()
+            self.btn_browse.hide()
+            self.edit_inline.show()
+            self.lbl_args.hide()
+            self.edit_args.hide()
+            self.chk_bg.show()
+            self.lbl_hint.setText("Chạy mã Python trực tiếp qua uv run python -c <code_string>.")
+
+        elif act_type == "command":
+            self.lbl_target.setText("Chương trình / Executable:")
+            self.lbl_target.show()
+            self.edit_target.show()
+            self.btn_browse.show()
+            self.edit_inline.hide()
+            self.lbl_args.show()
+            self.edit_args.show()
+            self.chk_bg.show()
+            self.lbl_hint.setText("Chạy trực tiếp qua danh sách đối số argv.")
+
+        elif act_type == "url":
+            self.lbl_target.setText("Địa chỉ Web URL:")
+            self.lbl_target.show()
+            self.edit_target.show()
+            self.btn_browse.hide()
+            self.edit_inline.hide()
+            self.lbl_args.hide()
+            self.edit_args.hide()
+            self.chk_bg.hide()
+            self.lbl_hint.setText("Mở liên kết trong trình duyệt mặc định khi bấm RUN hoặc Ctrl+Enter.")
+
+    def _browse_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Chọn file script hoặc chương trình",
+            "",
+            "Scripts (*.py *.ps1 *.bat *.cmd *.sh);;Tất cả files (*.*)",
+        )
+        if path:
+            self.edit_target.setText(os.path.abspath(path))
+
+    def _save_action(self):
+        act_type = self.cb_type.currentData()
+        target = self.edit_inline.toPlainText().strip() if act_type == "python_inline" else self.edit_target.text().strip()
+        args_text = self.edit_args.text().strip()
+        args = args_text.split() if args_text else []
+        is_bg = self.chk_bg.isChecked()
+
+        valid, err = ActionRunner.validate_action_config(act_type, target, args)
+        if not valid:
+            self.lbl_error.setText(f"Lỗi: {err}")
+            self.lbl_error.show()
+            return
+
+        ok = self.storage.set_clip_action(
+            self.clip_id, act_type, target, args=args, is_background=is_bg
+        )
+        if ok:
+            self.accept()
+        else:
+            self.lbl_error.setText("Không thể lưu action vào cơ sở dữ liệu.")
+            self.lbl_error.show()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        _bring_dialog_to_front(self, self.parentWidget())
+        QTimer.singleShot(10, lambda: _bring_dialog_to_front(self, None))
+
+    def _remove_action(self):
+        self.storage.remove_clip_action(self.clip_id)
+        self.accept()
+
+
+class ActionLogDialog(QDialog):
+    """Live terminal log viewer for a running clip action."""
+
+    def __init__(self, clip_data: dict, parent=None, on_stop_callback=None):
+        super().__init__(parent)
+        self.clip_data = clip_data
+        self.clip_id = clip_data.get("id")
+        self._on_stop_callback = on_stop_callback
+        self._last_log_text = None
+
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowTitle(f"Terminal Log - Clip #{self.clip_id}")
+        self.resize(660, 440)
+        self.setStyleSheet("""
+            QDialog { background: #181818; color: #e0e0e0; }
+            QLabel { color: #e0e0e0; font-size: 9.5pt; }
+            QPlainTextEdit {
+                background: #0f0f0f;
+                color: #d4d4d4;
+                border: 1px solid #3a3a3a;
+                border-radius: 4px;
+                font-family: 'Consolas', 'Courier New', monospace;
+                font-size: 9.5pt;
+                padding: 6px;
+            }
+            QPushButton {
+                background: #2f2f2f;
+                color: #eee;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 6px 14px;
+                font-size: 9pt;
+            }
+            QPushButton:hover { border-color: #d18616; color: white; }
+            QPushButton#stopButton {
+                background: #8b2626;
+                border-color: #aa3333;
+                color: #ffffff;
+                font-weight: bold;
+            }
+            QPushButton#stopButton:disabled {
+                background: #333;
+                border-color: #444;
+                color: #777;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        header_row = QHBoxLayout()
+        self.lbl_status = QLabel("🟢 Đang chạy Action...")
+        self.lbl_status.setStyleSheet("font-weight: bold; color: #4caf50; font-size: 10pt;")
+        header_row.addWidget(self.lbl_status, stretch=1)
+        layout.addLayout(header_row)
+
+        self.log_view = QPlainTextEdit(self)
+        if hasattr(self.log_view, "setReadOnly"):
+            self.log_view.setReadOnly(True)
+        layout.addWidget(self.log_view, stretch=1)
+
+        footer_row = QHBoxLayout()
+        self.btn_stop = QPushButton("⏹ STOP Action", self)
+        self.btn_stop.setObjectName("stopButton")
+        self.btn_stop.clicked.connect(self._stop_running_action)
+        footer_row.addWidget(self.btn_stop)
+
+        btn_copy = QPushButton("Copy Log", self)
+        btn_copy.clicked.connect(self._copy_log)
+        footer_row.addWidget(btn_copy)
+
+        footer_row.addStretch()
+
+        btn_close = QPushButton("Đóng", self)
+        btn_close.clicked.connect(self.close)
+        footer_row.addWidget(btn_close)
+        layout.addLayout(footer_row)
+
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(200)
+        self._poll_timer.timeout.connect(self.refresh_log)
+        self.refresh_log()
+        self._poll_timer.start()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        _bring_dialog_to_front(self, self.parentWidget())
+        QTimer.singleShot(10, lambda: _bring_dialog_to_front(self, None))
+
+    def closeEvent(self, event):
+        self._poll_timer.stop()
+        super().closeEvent(event)
+
+    def refresh_log(self):
+        if not self.clip_id:
+            return
+        log_text = ActionRunner.get_action_log(self.clip_id)
+        status = ActionRunner.get_action_status(self.clip_id)
+        is_running = bool(status.get("is_running"))
+        pid = status.get("pid")
+        state = status.get("state", "")
+        exit_code = status.get("exit_code")
+
+        if is_running:
+            pid_str = f" (PID {pid})" if pid else ""
+            self.lbl_status.setText(f"🟢 Đang chạy Action{pid_str}")
+            self.lbl_status.setStyleSheet("font-weight: bold; color: #4caf50; font-size: 10pt;")
+            if hasattr(self.btn_stop, "setEnabled"):
+                self.btn_stop.setEnabled(True)
+        else:
+            if hasattr(self.btn_stop, "setEnabled"):
+                self.btn_stop.setEnabled(False)
+            if state == "stopped":
+                self.lbl_status.setText("⏹ Đã dừng Action bởi người dùng")
+                self.lbl_status.setStyleSheet("font-weight: bold; color: #ffb830; font-size: 10pt;")
+            elif state == "completed":
+                self.lbl_status.setText(f"✅ Đã hoàn thành (exit code {exit_code})")
+                self.lbl_status.setStyleSheet("font-weight: bold; color: #4fc3f7; font-size: 10pt;")
+            elif state == "failed":
+                self.lbl_status.setText(f"❌ Thất bại (exit code {exit_code})")
+                self.lbl_status.setStyleSheet("font-weight: bold; color: #ef5350; font-size: 10pt;")
+
+        if log_text != self._last_log_text:
+            self._last_log_text = log_text
+            bar = self.log_view.verticalScrollBar()
+            at_bottom = bar.value() >= max(0, bar.maximum() - 20)
+            self.log_view.setPlainText(log_text or "(Chưa có log đầu ra...)")
+            if at_bottom:
+                bar.setValue(bar.maximum())
+
+    def _stop_running_action(self):
+        if self.clip_id:
+            ActionRunner.stop_action(self.clip_id)
+            if self._on_stop_callback:
+                self._on_stop_callback(self.clip_id)
+            self.refresh_log()
+
+    def _copy_log(self):
+        cb = QApplication.clipboard()
+        if cb:
+            cb.setText(self.log_view.toPlainText())
+
+
 class ClipEditPopup(QWidget):
+    SCREEN_MARGIN = 12
+
     def __init__(self, clip_data, parent_list=None, parent=None):
         super().__init__(parent)
         self.clip_data = clip_data
         self.parent_list = parent_list
         self.clip_id = clip_data.get("id")
-        self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
+        self._fitting_to_screen = False
+        self._search_matches = []
+        self._current_search_index = -1
+        self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowTitle(str(clip_data.get("tag") or ""))
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
-        self.resize(520, 320)
+        self.setMinimumSize(360, 220)
+        self.resize(560, 360)
         self.setStyleSheet("""
             QWidget { background: #1f1f1f; color: #e0e0e0; }
             QLabel { color: #d18616; font-size: 9pt; font-weight: bold; }
+            QFrame#popupChrome {
+                background: #1f1f1f;
+                border: 1px solid #3daee9;
+                border-radius: 6px;
+            }
             QPlainTextEdit {
                 background: #2a2a2a;
                 border: 1px solid #444;
@@ -273,6 +1048,15 @@ class ClipEditPopup(QWidget):
                 selection-background-color: #aa8030;
                 font: 10pt 'Segoe UI';
             }
+            QLineEdit {
+                background: #252525;
+                border: 1px solid #444;
+                border-radius: 4px;
+                color: #f0f0f0;
+                padding: 4px 8px;
+                selection-background-color: #aa8030;
+            }
+            QLineEdit:focus { border-color: #aa8030; }
             QPushButton {
                 background: #333;
                 color: #eee;
@@ -288,15 +1072,31 @@ class ClipEditPopup(QWidget):
             }
         """)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        chrome = QFrame(self)
+        chrome.setObjectName("popupChrome")
+        root.addWidget(chrome)
+
+        layout = QVBoxLayout(chrome)
+        layout.setContentsMargins(10, 10, 10, 8)
         layout.setSpacing(8)
 
-        title = QLabel("Fix pinned clip")
-        layout.addWidget(title)
+        search_row = QHBoxLayout()
+        search_row.setContentsMargins(0, 0, 0, 0)
+        search_row.setSpacing(6)
+        self.search_input = QLineEdit(chrome)
+        self.search_input.setPlaceholderText("Search in clip")
+        self.search_input.textChanged.connect(self._apply_search)
+        self.search_input.returnPressed.connect(self._next_search_match)
+        search_row.addWidget(self.search_input)
+        layout.addLayout(search_row)
 
-        self.editor = QPlainTextEdit(self)
+        self.editor = QPlainTextEdit(chrome)
         self.editor.setPlainText(str(clip_data.get("content", "")))
+        self.editor.textChanged.connect(lambda: self._apply_search(self.search_input.text()))
         layout.addWidget(self.editor, stretch=1)
 
         self.lbl_error = QLabel("")
@@ -304,16 +1104,109 @@ class ClipEditPopup(QWidget):
         self.lbl_error.hide()
         layout.addWidget(self.lbl_error)
 
-        buttons = QHBoxLayout()
-        buttons.addStretch()
-        btn_cancel = QPushButton("Cancel", self)
+        footer = QHBoxLayout()
+        footer.addStretch()
+        btn_cancel = QPushButton("Cancel", chrome)
         btn_cancel.clicked.connect(self.close)
-        buttons.addWidget(btn_cancel)
-        btn_save = QPushButton("Save", self)
+        footer.addWidget(btn_cancel)
+        btn_save = QPushButton("Save", chrome)
         btn_save.setObjectName("saveButton")
         btn_save.clicked.connect(self._save)
-        buttons.addWidget(btn_save)
-        layout.addLayout(buttons)
+        footer.addWidget(btn_save)
+        layout.addLayout(footer)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._fit_to_screen()
+        _bring_dialog_to_front(self, None)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not self._fitting_to_screen:
+            QTimer.singleShot(0, self._fit_to_screen)
+
+    def _screen_geometry(self):
+        screen = QApplication.screenAt(self.frameGeometry().center()) or QApplication.primaryScreen()
+        return screen.availableGeometry() if screen else None
+
+    def _fit_to_screen(self):
+        screen = self._screen_geometry()
+        if screen is None:
+            return
+        self._fitting_to_screen = True
+        try:
+            frame = self.frameGeometry()
+            frame_extra_width = max(0, frame.width() - self.width())
+            frame_extra_height = max(0, frame.height() - self.height())
+            max_width = max(
+                self.minimumWidth(),
+                screen.width() - (self.SCREEN_MARGIN * 2) - frame_extra_width,
+            )
+            max_height = max(
+                self.minimumHeight(),
+                screen.height() - (self.SCREEN_MARGIN * 2) - frame_extra_height,
+            )
+            width = min(self.width(), max_width)
+            height = min(self.height(), max_height)
+            if width != self.width() or height != self.height():
+                self.resize(width, height)
+                frame = self.frameGeometry()
+
+            x_min = screen.left() + self.SCREEN_MARGIN
+            y_min = screen.top() + self.SCREEN_MARGIN
+            x_max = screen.right() - frame.width() - self.SCREEN_MARGIN + 1
+            y_max = screen.bottom() - frame.height() - self.SCREEN_MARGIN + 1
+            frame_x = min(max(frame.left(), x_min), max(x_min, x_max))
+            frame_y = min(max(frame.top(), y_min), max(y_min, y_max))
+            if frame_x != frame.left() or frame_y != frame.top():
+                self.move(self.pos() + (QPoint(frame_x, frame_y) - frame.topLeft()))
+        finally:
+            self._fitting_to_screen = False
+
+    def _apply_search(self, query):
+        self._search_matches = []
+        self._current_search_index = -1
+        self.editor.setExtraSelections([])
+        query = str(query or "")
+        if not query:
+            return
+
+        cursor = QTextCursor(self.editor.document())
+        while True:
+            cursor = self.editor.document().find(query, cursor)
+            if cursor.isNull():
+                break
+            self._search_matches.append(QTextCursor(cursor))
+
+        self._highlight_search_matches()
+        if self._search_matches:
+            self._current_search_index = 0
+            self._show_search_match(0)
+
+    def _highlight_search_matches(self):
+        highlight_format = QTextCharFormat()
+        highlight_format.setBackground(QColor("#5a4318"))
+        highlight_format.setForeground(QColor("#ffffff"))
+        selections = []
+        for cursor in self._search_matches:
+            selection = QTextEdit.ExtraSelection()
+            selection.cursor = QTextCursor(cursor)
+            selection.format = highlight_format
+            selections.append(selection)
+        self.editor.setExtraSelections(selections)
+
+    def _show_search_match(self, index):
+        if not self._search_matches:
+            return
+        index %= len(self._search_matches)
+        self._current_search_index = index
+        self.editor.setTextCursor(QTextCursor(self._search_matches[index]))
+        self.editor.ensureCursorVisible()
+
+    def _next_search_match(self):
+        if not self._search_matches:
+            return
+        self._show_search_match(self._current_search_index + 1)
 
     def _save(self):
         if not self.parent_list or not self.clip_id:
@@ -401,359 +1294,12 @@ class GroupHeaderWidget(QWidget):
         super().mousePressEvent(event)
 
 
-class ClipItemWidget(QWidget):
-    def __init__(
-        self,
-        item_data,
-        is_pinned=False,
-        parent_list=None,
-        is_grouped=False,
-        expanded=False,
-        available_width=300,
-    ):
-        super().__init__()
-        self.item_data = item_data
-        self.clip_id = item_data.get("id")
-        self.is_pinned = is_pinned
-        self.parent_list = parent_list
-        self.is_grouped = is_grouped
-        self.expanded = expanded
-        self.available_width = max(240, int(available_width))
-        self.action_width = 32
-        self.side_badge_width = 36
-        self.outer_left_margin = 8 if not is_grouped else 22
-        self.outer_right_margin = 2
-        self.outer_spacing = 4
-        self.line_count = (
-            len(self.item_data["content"].splitlines())
-            if self.item_data["type"] == "text"
-            else 1
-        )
+try:
+    from .clip_row import ClipRowWidget
 
-        layout = QHBoxLayout()
-        layout.setContentsMargins(self.outer_left_margin, 6, self.outer_right_margin, 6)
-        layout.setSpacing(self.outer_spacing)
+    ClipItemWidget = ClipRowWidget
+except ImportError:
+    def ClipItemWidget(*args, **kwargs):
+        from .clip_row import ClipRowWidget
 
-        self.content_container = QWidget()
-        self.content_container.setMinimumWidth(0)
-        self.content_container.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
-        )
-        self.content_layout = QGridLayout(self.content_container)
-        self.content_layout.setContentsMargins(0, 0, 0, 0)
-        self.content_layout.setSpacing(4)
-
-        if self.item_data["type"] == "text":
-            text = self.item_data["content"]
-            display_text = text
-            if not self.expanded and len(text) > MAX_DISPLAY_CHARS:
-                display_text = text[:MAX_DISPLAY_CHARS] + "..."
-            fixed_side_width = (
-                self.outer_left_margin
-                + self.outer_right_margin
-                + (self.outer_spacing * 2)
-                + self.action_width
-                + self.side_badge_width
-                + 4
-                + (15 if is_grouped else 0)
-            )
-            text_width = max(120, min(520, self.available_width - fixed_side_width))
-            self.rendered_lines, text_h = _visible_text_height(
-                display_text,
-                TEXT_FONT,
-                text_width,
-                EXPANDED_MAX_LINES if self.expanded else COLLAPSED_MAX_LINES,
-            )
-            if self.expanded and self.rendered_lines > EXPANDED_MAX_LINES:
-                self.lbl_content = QPlainTextEdit(self)
-                self.lbl_content.setPlainText(display_text)
-                self.lbl_content.setReadOnly(True)
-                self.lbl_content.setFrameStyle(QFrame.Shape.NoFrame)
-                self.lbl_content.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-                self.lbl_content.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-                self.lbl_content.setStyleSheet(
-                    "QPlainTextEdit { color: #e0e0e0; background: transparent; padding: 0px; }"
-                )
-                self.lbl_content.setFont(TEXT_FONT)
-            else:
-                self.lbl_content = QLabel(display_text)
-                self.lbl_content.setStyleSheet("color: #e0e0e0; background: transparent; padding-top: 1px; padding-bottom: 1px;")
-                self.lbl_content.setFont(TEXT_FONT)
-                self.lbl_content.setWordWrap(True)
-                self.lbl_content.setAlignment(
-                    Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
-                )
-            self.lbl_content.setMinimumWidth(0)
-            self.lbl_content.setMaximumWidth(text_width)
-            self.lbl_content.setSizePolicy(
-                QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
-            )
-            self.lbl_content.setFixedHeight(text_h)
-            self.content_layout.addWidget(self.lbl_content, 0, 0)
-            self.display_height = text_h
-        else:
-            self.lbl_content = QLabel()
-            self.lbl_content.setFixedSize(THUMB_SIZE)
-            self.lbl_content.setScaledContents(False)
-            self.lbl_content.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.lbl_content.setStyleSheet(
-                "border: 1px solid #444; background-color: #000; border-radius: 4px;"
-            )
-            p = os.path.join(IMAGE_DIR, self.item_data["content"])
-            self.image_path = p
-            self._loaded_pixmap_cache = None
-            if os.path.exists(p):
-                self._apply_thumbnail_pixmap()
-            self.content_layout.addWidget(
-                self.lbl_content,
-                0,
-                0,
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
-            )
-            self.display_height = THUMB_SIZE.height()
-
-        # Tag label — stored here; added to badge column (btn_v_widget) later so layout exists first
-        self.has_tag = False
-        self.tag_height = 0
-        tag_text = self.item_data.get("tag", "")
-        group_name = self.item_data.get("group_name", "")
-        badge_text = tag_text or (
-            f"[{group_name}]" if group_name and not is_grouped else ""
-        )
-        self.has_tag = bool(badge_text)
-        self._badge_text = badge_text
-        if self.has_tag:
-            tag_fm = QFontMetrics(TAG_FONT)
-            self.tag_height = tag_fm.height() + 6
-
-        self.btn_v_widget = QWidget()
-        self.btn_v_widget.setFixedWidth(self.side_badge_width)
-        self.btn_v_widget.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
-        )
-        self.btn_v_layout = QVBoxLayout(self.btn_v_widget)
-        self.btn_v_layout.setContentsMargins(1, 0, 0, 0)
-        self.btn_v_layout.setSpacing(4)
-
-        # Insert tag label at the top of the badge column if present
-        if self.has_tag:
-            self.lbl_tag = QLabel(self._badge_text)
-            self.lbl_tag.setStyleSheet("""
-                QLabel {
-                    color: #d18616;
-                    font-size: 7pt;
-                    font-style: italic;
-                    font-weight: normal;
-                    background: rgba(209, 134, 22, 0.15);
-                    border-radius: 3px;
-                    padding: 1px 5px;
-                    margin: 0px;
-                }
-            """)
-            self.lbl_tag.setFont(TAG_FONT)
-            self.lbl_tag.setFixedHeight(self.tag_height)
-            self.lbl_tag.setMaximumWidth(200)
-            self.lbl_tag.setSizePolicy(
-                QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed
-            )
-            self.btn_v_layout.insertWidget(0, self.lbl_tag)
-
-        def create_badge_btn(text, tooltip, style, func, h=16):
-            btn = QPushButton(text)
-            btn.setToolTip(tooltip)
-            btn.setFixedSize(28, max(h, 16))
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setStyleSheet(style)
-            btn.clicked.connect(func)
-            return btn
-
-        style_arrow = "QPushButton { background: #333; color: #888; border: none; border-radius: 2px; font-size: 8pt; } QPushButton:hover { background: #444; color: #fff; }"
-
-        self.lbl_line_count = QLabel(str(self.line_count), self.content_container)
-        self.lbl_line_count.setToolTip("Số dòng")
-        self.lbl_line_count.setStyleSheet(
-            "QLabel { color: #e6c36a; background: transparent; font-size: 8pt; font-weight: 600; }"
-        )
-        self.lbl_line_count.adjustSize()
-        expand_symbol = "▲" if self.expanded else "▼"
-        expand_tooltip = "Collapse" if self.expanded else "Expand"
-        self.btn_expand = create_badge_btn(
-            expand_symbol, expand_tooltip, style_arrow, self.on_expand_clicked, 14
-        )
-
-        if self.item_data["type"] == "text":
-            self.btn_v_layout.addWidget(self.btn_expand)
-        self.btn_v_layout.addStretch()
-
-        # move badge column out of the content grid so it doesn't inflate text width
-        self.content_layout.setColumnStretch(0, 1)
-        layout.addWidget(self.content_container, 1)
-        # badge column sits between text and action buttons
-        layout.addWidget(self.btn_v_widget, 0, Qt.AlignmentFlag.AlignTop)
-
-        self.btn_container = QWidget()
-        self.btn_container.setFixedWidth(self.action_width)
-        self.btn_container.setMinimumWidth(self.action_width)
-        self.btn_container.setMaximumWidth(self.action_width)
-        self.btn_container.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
-        )
-        btn_layout = QVBoxLayout(self.btn_container)
-        btn_layout.setContentsMargins(0, 0, 0, 0)
-        btn_layout.setSpacing(4)
-
-        def create_act_btn(text, tooltip, color, hover, func):
-            btn = QPushButton(text)
-            btn.setToolTip(tooltip)
-            btn.setFixedSize(32, 22)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setStyleSheet(
-                f"QPushButton {{ background: {color}; border: none; border-radius: 3px; color: #ddd; font-size: 8pt; }} QPushButton:hover {{ background: {hover}; color: #fff; }}"
-            )
-            btn.clicked.connect(func)
-            return btn
-
-        btn_layout.addWidget(
-            create_act_btn("❐", "Copy", "#2b5c75", "#3daee9", self.on_copy_clicked)
-        )
-        star_char = "★" if is_pinned else "☆"
-        star_bg = "#7a5c20" if is_pinned else "#3a3a3a"
-        star_hover = "#aa8030" if is_pinned else "#555"
-        self.btn_star = create_act_btn(
-            star_char, "Pin/Unpin", star_bg, star_hover, self.on_star_clicked
-        )
-        if is_pinned:
-            self.btn_star.setStyleSheet(self.btn_star.styleSheet() + "color: #ffd700;")
-        btn_layout.addWidget(self.btn_star)
-        btn_layout.addWidget(
-            create_act_btn("✕", "Delete", "#752b2b", "#e93d3d", self.on_delete_clicked)
-        )
-
-        # ensure action column stays flush-right
-        layout.addWidget(self.btn_container, alignment=Qt.AlignmentFlag.AlignRight)
-        layout.setStretchFactor(self.content_container, 1)
-        layout.setStretchFactor(self.btn_container, 0)
-        self.setLayout(layout)
-
-        # pinned rows need enough vertical space to show all action buttons (3 x 22 + spacing + margins ~= 78px)
-        min_widget_h = 75 if self.is_pinned else 60
-        total_h = self.display_height + self.tag_height
-        self.setFixedWidth(self.available_width)
-        self.setFixedHeight(max(total_h, min_widget_h) + ROW_VERTICAL_PADDING)
-        self.lbl_line_count.move(
-            max(0, self.content_container.width() - self.lbl_line_count.width() - 4),
-            0,
-        )
-
-    def show_line_info(self):
-        self.popup = LineInfoPopup(self.line_count)
-        p = self.lbl_line_count.mapToGlobal(QPoint(0, 0))
-        self.popup.show_at(QPoint(p.x() - self.popup.width() - 5, p.y()))
-
-    def on_expand_clicked(self):
-        if self.parent_list and self.clip_id:
-            self.parent_list.handle_toggle_expand(self.clip_id)
-
-    def on_copy_clicked(self):
-        if self.parent_list:
-            self.parent_list.handle_copy_only(self.item_data)
-
-    def _apply_thumbnail_pixmap(self):
-        if self.item_data.get("type") != "image":
-            return
-        image_path = getattr(self, "image_path", None)
-        if not image_path or not os.path.exists(image_path):
-            return
-        pix = self._loaded_pixmap_cache
-        if pix is None or pix.isNull():
-            pix = QPixmap(image_path)
-            self._loaded_pixmap_cache = pix
-        if pix.isNull():
-            return
-        scaled = pix.scaled(
-            THUMB_SIZE,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.FastTransformation,
-        )
-        self.lbl_content.setPixmap(scaled)
-
-    def on_star_clicked(self):
-        if self.parent_list and self.clip_id:
-            self.parent_list.handle_star(self.clip_id, not self.is_pinned)
-
-    def on_delete_clicked(self):
-        if self.parent_list and self.clip_id:
-            self.parent_list.handle_delete(self.clip_id)
-
-    def contextMenuEvent(self, event):
-        menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu { background-color: #2d2d2d; color: #eee; border: 1px solid #444; }
-            QMenu::item:selected { background-color: #d18616; color: white; }
-        """)
-
-        group_menu = menu.addMenu("📁 Add to Group")
-        if self.parent_list:
-            groups = self.parent_list.storage.get_groups()
-            for g in groups:
-                act = group_menu.addAction(g)
-                act.setData(("group", g))
-            if groups:
-                group_menu.addSeparator()
-            new_group_act = group_menu.addAction("➕ New Group...")
-            new_group_act.setData(("new_group", None))
-            current_group = self.item_data.get("group_name", "")
-            if current_group:
-                remove_act = menu.addAction(f"❌ Remove from '{current_group}'")
-                remove_act.setData(("remove_group", None))
-            menu.addSeparator()
-        add_tag_act = menu.addAction("🏷️ Add Tag")
-        add_tag_act.setData(("tag", None))
-        if self.is_pinned and self.item_data.get("type") == "text":
-            fix_act = menu.addAction("🛠 Fix")
-            fix_act.setData(("fix", None))
-
-        action = menu.exec(self.mapToGlobal(event.pos()))
-        if action:
-            data = action.data()
-            if data:
-                action_type, value = data
-                if action_type == "tag":
-                    self.on_add_tag()
-                elif action_type == "group":
-                    self.on_set_group(value)
-                elif action_type == "new_group":
-                    self.on_new_group()
-                elif action_type == "remove_group":
-                    self.on_set_group("")
-                elif action_type == "fix":
-                    self.on_fix_clip()
-
-    def on_add_tag(self):
-        current_tag = self.item_data.get("tag", "")
-        tag, ok = QInputDialog.getText(
-            self, "Add Tag", "Enter tag name:", text=current_tag
-        )
-        if ok and self.clip_id and self.parent_list:
-            self.parent_list.handle_add_tag(self.clip_id, tag)
-
-    def on_set_group(self, group_name):
-        if self.clip_id and self.parent_list:
-            self.parent_list.handle_set_group(self.clip_id, group_name)
-
-    def on_new_group(self):
-        group_name, ok = QInputDialog.getText(self, "New Group", "Enter group name:")
-        if ok and group_name.strip() and self.clip_id and self.parent_list:
-            self.parent_list.handle_set_group(self.clip_id, group_name.strip())
-
-    def on_fix_clip(self):
-        if not self.parent_list or not self.clip_id:
-            return
-        self.edit_popup = ClipEditPopup(self.item_data, self.parent_list, self)
-        self.edit_popup.move(self.mapToGlobal(QPoint(10, 10)))
-        self.edit_popup.show()
-
-
-from .clip_row import ClipRowWidget
-
-ClipItemWidget = ClipRowWidget
+        return ClipRowWidget(*args, **kwargs)

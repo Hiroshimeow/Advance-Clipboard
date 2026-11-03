@@ -4,25 +4,20 @@ This file tracks planned enhancements for `Advance-Clipboard`.
 
 ## High Priority
 
-- **UI Module Decomposition**: Split `main.py` further into focused controller modules (hotkeys, clipboard processing, window lifecycle).
-- **Settings Panel**: Add a GUI to configure `neural/config.json` without editing files.
-- **Node Interaction**: Improve node click behavior to directly load and focus the clip in the UI instead of just searching for it.
-- **Theme Support**: Add more color themes for the Galaxy map (Matrix, Nebula, Sunset).
+- **UI Module Decomposition**: Split `main.py` further into focused controller modules for hotkeys, clipboard processing, and window lifecycle.
+- **Settings Panel**: Add a GUI for hotkey, theme, backup, and startup preferences.
+- **Pinned Popup Polish**: Continue improving resize affordances, search navigation, and screen-edge placement.
+- **Context Menu Flow**: Make group and tag actions faster for large pinned lists.
 
-## Search & Indexing
+## Search & Ranking
 
-- **Search Diagnostics**: Show why a result matched (score source and ranking breakdown).
-- **Corpus Size Threshold**: Keep history semantic search limited or sampled when the database grows beyond 50k+ clips.
+- **Search Diagnostics**: Show why a result matched, including title, tag, group, and text score sources.
+- **Large History Performance**: Keep search and pagination responsive when the database grows beyond 50k clips.
 - **Multilingual Optimizations**: Test and refine search behavior for non-English clipboard content.
-
-## AI & LLM (Optional/Opt-in)
-
-- **LLM Query Rewriting**: Optionally expand vague queries into better semantic search terms.
-- **Auto-Tagging**: LLM-assisted suggestions for tags and groups based on clip content.
-- **Summarization**: Provide a "Summary of recent clips" view.
 
 ## UX & Stability
 
 - **Global Settings**: Keyboard shortcut customization.
 - **Personalization**: Prefer results that the user has selected frequently in the past.
-- **Performance**: Throttle D3.js animations on lower-end machines if many nodes are visible.
+- **Backup Visibility**: Surface backup status, last export time, and recovery result in settings.
+- **Import/Export Tools**: Add explicit user-controlled export and restore actions.

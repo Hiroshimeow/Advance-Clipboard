@@ -1,17 +1,18 @@
 """
-SQLite Storage Layer for Clipboard Manager (Facade)
-- Single source of truth
-- MD5 hash dedup
-- Pagination support
-- Thread-safe operations
+SQLite Storage Layer for Advance Clipboard Workspace (Facade)
+- Single source of truth with WAL mode
+- MD5 hash deduplication
+- Selective FTS5 trigram + covering-index hybrid retrieval
+- Persistent clip shortcuts (Ctrl+key) and clip actions (RUN / Ctrl+Enter)
+- JSON backup & recovery
 """
 
 from typing import Optional, List, Dict, Any, Tuple
 from .db import (
     get_connection,
+    close_connection,
     transaction,
     init_db,
-    init_neural_tables,
     DB_FILE,
 )
 
@@ -22,101 +23,39 @@ _transaction = transaction
 from .clips import ClipRepository, compute_hash
 from .search import SearchService
 
-_NEURAL_REPOSITORY_IMPORT_ERROR: Exception | None = None
 
-try:
-    from .neural import NeuralRepository
-except Exception as exc:
-    _NEURAL_REPOSITORY_IMPORT_ERROR = exc
-
-    class NeuralRepository:
-        """No-op fallback so clipboard core can boot without neural extras."""
-
-        def save_vector(self, clip_id: int, vector_bytes: bytes):
-            return None
-
-        def get_vector(self, clip_id: int) -> Optional[bytes]:
-            return None
-
-        def save_links(self, links_list: List[Tuple[int, int, float]]):
-            return None
-
-        def get_links(self, clip_id_list: List[int]) -> List[Dict[str, Any]]:
-            return []
-
-        def get_unindexed_clip_ids(self, limit: int = 100) -> List[int]:
-            return []
-
-        def get_recent_history_ids(self, limit: int = 200) -> List[int]:
-            return []
-
-        def get_all_pinned_ids(self) -> List[int]:
-            return []
-
-        def get_unindexed_ids_within_window(
-            self, recent_limit: int = 200, include_pinned: bool = True, limit: int = 100
-        ) -> List[int]:
-            return []
-
-        def get_neural_window_totals(
-            self, recent_limit: int = 200, include_pinned: bool = True
-        ) -> Tuple[int, int]:
-            return 0, 0
-
-        def get_all_clip_ids_with_vectors(self, limit: int = 500) -> List[int]:
-            return []
-
-        def get_neural_data(
-            self, clip_ids: List[int]
-        ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-            return [], []
-
-
-def _lexical_rank(row: Dict[str, Any], query: str, *, include_meta: bool = False) -> int:
-    """Fast deterministic UI-search ranking.
-
-    Ranking policy for clipboard UX:
-    1. exact content match
-    2. prefix content match
-    3. phrase/content containment
-    4. all-token content match
-    5. optional tag/group metadata match
-    Recency is handled as a stable tie-breaker by updated_at.
-    """
-    normalized_query = " ".join((query or "").lower().split())
+def _lexical_tier(row: Dict[str, Any], query: str, *, include_meta: bool = False) -> int:
+    """Return the deterministic relevance tier for one search row."""
+    raw_query = query or ""
+    normalized_query = " ".join(raw_query.lower().split())
     if not normalized_query:
-        return 0
+        return 9
 
-    content = " ".join(str(row.get("content", "")).lower().split())
+    raw_content = str(row.get("content", ""))
+    tag_query_cmp = raw_query.strip().lower()
+    tag_cmp = str(row.get("tag", "")).strip().lower()
+    content = " ".join(raw_content.lower().split())
     tag = " ".join(str(row.get("tag", "")).lower().split())
     group = " ".join(str(row.get("group_name", "")).lower().split())
-    terms = [t for t in normalized_query.split() if t]
+    terms = normalized_query.split()
 
-    score = 0
-    if content == normalized_query:
-        score += 10000
+    if include_meta and tag_cmp == tag_query_cmp:
+        return 1
+    if raw_content == raw_query:
+        return 2
+    if include_meta and tag_cmp.startswith(tag_query_cmp):
+        return 3
+    if include_meta and terms and all(term in tag for term in terms):
+        return 4
     if content.startswith(normalized_query):
-        score += 7000
+        return 5
     if normalized_query in content:
-        score += 4500
+        return 6
     if terms and all(term in content for term in terms):
-        score += 2500
-    if terms:
-        score += sum(250 for term in terms if term in content)
-
-    if include_meta:
-        meta = f"{tag} {group}".strip()
-        if meta:
-            if normalized_query in meta:
-                score += 1800
-            if terms and all(term in meta for term in terms):
-                score += 900
-            score += sum(120 for term in terms if term in meta)
-
-    # Prefer text clips for text queries; image filenames should not outrank text.
-    if row.get("type") == "text":
-        score += 100
-    return score
+        return 7
+    if include_meta and terms and all(term in group for term in terms):
+        return 8
+    return 9
 
 
 def _rank_lexical_rows(
@@ -127,25 +66,80 @@ def _rank_lexical_rows(
     include_meta: bool = False,
     pinned_tiebreaker: bool = False,
 ) -> List[Dict[str, Any]]:
-    def sort_key(row: Dict[str, Any]):
-        return (
-            _lexical_rank(row, query, include_meta=include_meta),
+    ranked = sorted(
+        rows,
+        key=lambda row: (
             str(row.get("updated_at") or ""),
             int(row.get("pin_order") or 0) if pinned_tiebreaker else 0,
             int(row.get("id") or 0),
-        )
-
-    return sorted(rows, key=sort_key, reverse=True)[:limit]
+        ),
+        reverse=True,
+    )
+    ranked.sort(key=lambda row: _lexical_tier(row, query, include_meta=include_meta))
+    return ranked[:limit]
 
 
 def _parse_tag_search_query(query: str) -> Optional[str]:
-    parts = (query or "").strip().split(maxsplit=1)
-    if len(parts) != 2:
+    normalized = (query or "").strip()
+    lower = normalized.lower()
+    for prefix in ("tags:", "tag:"):
+        if lower.startswith(prefix):
+            kw = normalized[len(prefix):].strip()
+            return kw if kw else ""
+    parts = normalized.split(maxsplit=1)
+    if len(parts) == 1 and parts[0].lower() in {"tag", "tags"}:
+        return ""
+    if len(parts) == 2 and parts[0].lower() in {"tag", "tags"}:
+        return parts[1].strip()
+    return None
+
+
+def _is_image_filter_query(query: str) -> bool:
+    s = (query or "").strip().lower()
+    norm = " ".join(s.replace(":", ": ").split())
+    if norm in {"type image", "type img", "type: image", "type: img"}:
+        return True
+    if s in {"image:", "img:", "images:", "type:image", "type:img", "type:images"}:
+        return True
+    return False
+
+
+def _parse_action_search_query(query: str) -> Optional[str]:
+    normalized = (query or "").strip()
+    lower = normalized.lower()
+    for prefix in ("actions:", "action:"):
+        if lower.startswith(prefix):
+            kw = normalized[len(prefix):].strip()
+            return kw if kw else ""
+    parts = normalized.split(maxsplit=1)
+    if len(parts) == 1 and parts[0].lower() in {"action", "actions"}:
+        return ""
+    if len(parts) == 2 and parts[0].lower() in {"action", "actions"}:
+        return parts[1].strip()
+    return None
+
+
+def _parse_ctrl_search_query(query: str) -> Optional[str]:
+    normalized = (query or "").strip()
+    lower = normalized.lower()
+    for prefix in ("ctrl:", "shortcut:", "shortcuts:"):
+        if lower.startswith(prefix):
+            kw = normalized[len(prefix):].strip()
+            return kw if kw else ""
+    parts = normalized.split(maxsplit=1)
+    if len(parts) == 1 and parts[0].lower() in {"ctrl", "shortcut", "shortcuts"}:
+        return ""
+    if len(parts) == 2 and parts[0].lower() in {"ctrl", "shortcut", "shortcuts"}:
+        return parts[1].strip()
+    return None
+
+
+def _fts_match_expression(terms: List[str], *, column: Optional[str] = None) -> Optional[str]:
+    """Build a literal trigram FTS candidate query, or None when LIKE fallback is required."""
+    if not terms or any(len(term) < 3 for term in terms):
         return None
-    prefix, keyword = parts[0].lower(), parts[1].strip()
-    if prefix not in {"tag", "tags"} or not keyword:
-        return None
-    return keyword
+    prefix = f"{column} : " if column else ""
+    return " AND ".join(f'{prefix}"{term.replace(chr(34), chr(34) * 2)}"' for term in terms)
 
 
 class ClipboardStorage:
@@ -157,21 +151,11 @@ class ClipboardStorage:
     def __init__(self):
         self.clips = ClipRepository()
         self.search = SearchService()
-        self.neural = NeuralRepository()
-
-        self._neural_event_callback = None
-
-        # Initialize tables
         init_db()
-        init_neural_tables()
 
     def set_backup_callback(self, callback):
         """Set callback to trigger backup when data changes."""
         self._backup_callback = callback
-
-    def set_neural_event_callback(self, callback):
-        """Set callback for lightweight neural enqueue events."""
-        self._neural_event_callback = callback
 
     def _mark_dirty(self):
         """Mark that backup is needed."""
@@ -180,22 +164,22 @@ class ClipboardStorage:
         if self._backup_callback:
             self._backup_callback()
 
-    def _emit_neural_event(self, event_type: str, clip_id: int):
-        if self._neural_event_callback:
-            try:
-                self._neural_event_callback(event_type, clip_id)
-            except Exception:
-                pass
-
-    def trigger_daily_rebuild(self):
-        self.search.trigger_daily_rebuild(self)
-
     @property
     def need_backup(self) -> bool:
         return ClipboardStorage._need_backup
 
     def clear_backup_flag(self):
         ClipboardStorage._need_backup = False
+
+    def _fts_probe_rowids(self, conn, fts_query: str, cap: int = 250) -> Optional[List[int]]:
+        """Probe FTS5 rowids to optimize selective and non-matching queries."""
+        rows = conn.execute(
+            "SELECT rowid FROM clips_fts WHERE clips_fts MATCH ? LIMIT ?",
+            (fts_query, cap + 1),
+        ).fetchall()
+        if len(rows) <= cap:
+            return [int(r[0]) for r in rows]
+        return None
 
     # ==================== PUBLIC API (delegated) ====================
 
@@ -205,30 +189,19 @@ class ClipboardStorage:
 
     def add_clip(self, clip_type: str, content: str, tag: str = "") -> Tuple[int, bool]:
         clip_id, is_new, was_pinned = self.clips.add_clip(clip_type, content, tag)
-        if is_new or True:  # always mark dirty for updated_at changes
-            self._mark_dirty()
-
-        if is_new:
-            # Incrementally add to search index
-            clip = self.get_clip_by_id(clip_id)
-            if clip and clip.get("type") == "text":
-                self.search.add_record("pinned" if was_pinned else "history", clip)
-            self._emit_neural_event("new_clip", clip_id)
-
+        self._mark_dirty()
         return clip_id, is_new
 
     def pin_clip(self, clip_id: int) -> bool:
         ok = self.clips.pin_clip(clip_id)
         if ok:
             self._mark_dirty()
-            self._emit_neural_event("pin_state_changed", clip_id)
         return ok
 
     def unpin_clip(self, clip_id: int) -> bool:
         ok = self.clips.unpin_clip(clip_id)
         if ok:
             self._mark_dirty()
-            self._emit_neural_event("pin_state_changed", clip_id)
         return ok
 
     def delete_clip(self, clip_id: int) -> bool:
@@ -309,7 +282,10 @@ class ClipboardStorage:
         return self.clips.is_duplicate(content)
 
     def import_clips(self, clips: List[Dict[str, Any]]) -> int:
-        return self.clips.import_clips(clips)
+        count = self.clips.import_clips(clips)
+        if count > 0:
+            self._mark_dirty()
+        return count
 
     def is_db_valid(self) -> bool:
         return self.clips.is_db_valid()
@@ -317,51 +293,240 @@ class ClipboardStorage:
     def get_clip_count(self) -> int:
         return self.clips.get_clip_count()
 
+    # ==================== SHORTCUT & ACTION DELEGATES ====================
+
+    def assign_shortcut(self, clip_id: int, key: str, *, force: bool = False) -> Tuple[bool, Optional[int]]:
+        ok, conflict_id = self.clips.assign_shortcut(clip_id, key, force=force)
+        if ok:
+            self._mark_dirty()
+        return ok, conflict_id
+
+    def remove_shortcut(self, clip_id: int) -> bool:
+        ok = self.clips.remove_shortcut(clip_id)
+        if ok:
+            self._mark_dirty()
+        return ok
+
+    def get_shortcut_for_clip(self, clip_id: int) -> Optional[str]:
+        return self.clips.get_shortcut_for_clip(clip_id)
+
+    def get_clip_by_shortcut(self, key: str) -> Optional[Dict[str, Any]]:
+        return self.clips.get_clip_by_shortcut(key)
+
+    def get_all_shortcuts(self) -> Dict[int, str]:
+        return self.clips.get_all_shortcuts()
+
+    def set_clip_action(
+        self,
+        clip_id: int,
+        action_type: str,
+        target: str,
+        *,
+        args: Optional[List[str]] = None,
+        is_background: bool = False,
+    ) -> bool:
+        ok = self.clips.set_clip_action(
+            clip_id, action_type, target, args=args, is_background=is_background
+        )
+        if ok:
+            self._mark_dirty()
+        return ok
+
+    def get_clip_action(self, clip_id: int) -> Optional[Dict[str, Any]]:
+        return self.clips.get_clip_action(clip_id)
+
+    def remove_clip_action(self, clip_id: int) -> bool:
+        ok = self.clips.remove_clip_action(clip_id)
+        if ok:
+            self._mark_dirty()
+        return ok
+
+    def get_all_clip_actions(self) -> Dict[int, Dict[str, Any]]:
+        return self.clips.get_all_clip_actions()
+
+    def get_action_clip_ids(self) -> set:
+        return self.clips.get_action_clip_ids()
+
     # ==================== SEARCH OPERATIONS (delegated) ====================
 
+    def is_filter_query(self, query: str) -> bool:
+        return (
+            _parse_tag_search_query(query) is not None
+            or _is_image_filter_query(query)
+            or _parse_action_search_query(query) is not None
+            or _parse_ctrl_search_query(query) is not None
+        )
+
     def search_pinned(
-        self, query: str, limit: int = 20, *, semantic: bool = True
+        self, query: str, limit: int = 20, *, offset: int = 0, ranked: bool = True
     ) -> List[Dict[str, Any]]:
         tag_query = _parse_tag_search_query(query)
         if tag_query is not None:
-            return self._search_pinned_tags_sql(tag_query, limit)
+            return self._search_pinned_tags_sql(tag_query, limit, offset)
+        if _is_image_filter_query(query):
+            return self._search_pinned_images_sql(limit, offset)
+        action_query = _parse_action_search_query(query)
+        if action_query is not None:
+            return self._search_pinned_actions_sql(action_query, limit, offset)
+        ctrl_query = _parse_ctrl_search_query(query)
+        if ctrl_query is not None:
+            return self._search_pinned_ctrl_sql(ctrl_query, limit, offset)
 
         terms = self.search.split_search_terms(query)
         if not terms:
             return []
 
         lexical_rows = self._search_pinned_sql(query, max(limit * 8, 80))
-        ranked_lexical_rows = _rank_lexical_rows(
-            lexical_rows,
+        priority_rows = self._search_pinned_priority_tags_sql(query, limit)
+        exact_row = self.get_clip_by_hash(compute_hash(query))
+        if exact_row and exact_row.get("content") == query and exact_row.get("is_pinned"):
+            priority_rows.append(exact_row)
+        merged = {row["id"]: row for row in lexical_rows}
+        merged.update({row["id"]: row for row in priority_rows})
+        return _rank_lexical_rows(
+            list(merged.values()),
             query,
-            limit=max(limit * 3, 20),
+            limit=limit,
             include_meta=True,
             pinned_tiebreaker=True,
         )
-        if not semantic:
-            return ranked_lexical_rows[:limit]
-        if self.search.has_index("pinned"):
-            all_rows = self._get_all_pinned_for_search()
-            ranked_ids = self.search.search(
-                "pinned",
-                query,
-                all_rows,
-                max(limit * 3, 20),
-                [r["id"] for r in ranked_lexical_rows],
-            )
-            return self.search.merge_ranked_results(
-                ranked_ids=ranked_ids,
-                semantic_rows=all_rows,
-                lexical_rows=ranked_lexical_rows,
-                limit=limit,
-            )
-        return ranked_lexical_rows[:limit]
+
+    def _search_pinned_actions_sql(self, query: str, limit: int, offset: int = 0) -> List[Dict[str, Any]]:
+        conn = get_connection()
+        terms = self.search.split_search_terms(query)
+        if not terms:
+            rows = conn.execute(
+                """SELECT c.* FROM clips c
+                   JOIN clip_actions a ON a.clip_id = c.id
+                   WHERE c.is_pinned = 1
+                   ORDER BY c.pin_order DESC, c.updated_at DESC, c.id DESC LIMIT ? OFFSET ?""",
+                (limit, offset),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        where_clauses = []
+        params = []
+        for term in terms:
+            pat = self.search.like_pattern(term)
+            where_clauses.append("(c.content LIKE ? ESCAPE '\\' OR c.tag LIKE ? ESCAPE '\\' OR c.group_name LIKE ? ESCAPE '\\' OR a.target LIKE ? ESCAPE '\\' OR a.action_type LIKE ? ESCAPE '\\')")
+            params.extend([pat, pat, pat, pat, pat])
+        rows = conn.execute(
+            f"""SELECT c.* FROM clips c
+                JOIN clip_actions a ON a.clip_id = c.id
+                WHERE c.is_pinned = 1 AND ({' AND '.join(where_clauses)})
+                ORDER BY c.pin_order DESC, c.updated_at DESC, c.id DESC LIMIT ? OFFSET ?""",
+            params + [limit, offset],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _search_history_actions_sql(self, query: str, limit: int, offset: int = 0) -> List[Dict[str, Any]]:
+        conn = get_connection()
+        terms = self.search.split_search_terms(query)
+        if not terms:
+            rows = conn.execute(
+                """SELECT c.* FROM clips c
+                   JOIN clip_actions a ON a.clip_id = c.id
+                   WHERE c.is_pinned = 0 OR (c.is_pinned = 1 AND c.pinned_at IS NOT NULL AND c.updated_at > c.pinned_at)
+                   ORDER BY c.updated_at DESC, c.id DESC LIMIT ? OFFSET ?""",
+                (limit, offset),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        where_clauses = []
+        params = []
+        for term in terms:
+            pat = self.search.like_pattern(term)
+            where_clauses.append("(c.content LIKE ? ESCAPE '\\' OR c.tag LIKE ? ESCAPE '\\' OR c.group_name LIKE ? ESCAPE '\\' OR a.target LIKE ? ESCAPE '\\' OR a.action_type LIKE ? ESCAPE '\\')")
+            params.extend([pat, pat, pat, pat, pat])
+        rows = conn.execute(
+            f"""SELECT c.* FROM clips c
+                JOIN clip_actions a ON a.clip_id = c.id
+                WHERE (c.is_pinned = 0 OR (c.is_pinned = 1 AND c.pinned_at IS NOT NULL AND c.updated_at > c.pinned_at))
+                  AND ({' AND '.join(where_clauses)})
+                ORDER BY c.updated_at DESC, c.id DESC LIMIT ? OFFSET ?""",
+            params + [limit, offset],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _search_pinned_ctrl_sql(self, query: str, limit: int, offset: int = 0) -> List[Dict[str, Any]]:
+        conn = get_connection()
+        terms = self.search.split_search_terms(query)
+        if not terms:
+            rows = conn.execute(
+                """SELECT c.* FROM clips c
+                   JOIN clip_shortcuts s ON s.clip_id = c.id
+                   WHERE c.is_pinned = 1
+                   ORDER BY s.shortcut_key ASC, c.pin_order DESC, c.id DESC LIMIT ? OFFSET ?""",
+                (limit, offset),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        where_clauses = []
+        params = []
+        for term in terms:
+            pat = self.search.like_pattern(term)
+            where_clauses.append("(s.shortcut_key LIKE ? ESCAPE '\\' OR c.content LIKE ? ESCAPE '\\' OR c.tag LIKE ? ESCAPE '\\' OR c.group_name LIKE ? ESCAPE '\\')")
+            params.extend([pat, pat, pat, pat])
+        rows = conn.execute(
+            f"""SELECT c.* FROM clips c
+                JOIN clip_shortcuts s ON s.clip_id = c.id
+                WHERE c.is_pinned = 1 AND ({' AND '.join(where_clauses)})
+                ORDER BY s.shortcut_key ASC, c.pin_order DESC, c.id DESC LIMIT ? OFFSET ?""",
+            params + [limit, offset],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _search_history_ctrl_sql(self, query: str, limit: int, offset: int = 0) -> List[Dict[str, Any]]:
+        conn = get_connection()
+        terms = self.search.split_search_terms(query)
+        if not terms:
+            rows = conn.execute(
+                """SELECT c.* FROM clips c
+                   JOIN clip_shortcuts s ON s.clip_id = c.id
+                   WHERE c.is_pinned = 0 OR (c.is_pinned = 1 AND c.pinned_at IS NOT NULL AND c.updated_at > c.pinned_at)
+                   ORDER BY s.shortcut_key ASC, c.updated_at DESC, c.id DESC LIMIT ? OFFSET ?""",
+                (limit, offset),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        where_clauses = []
+        params = []
+        for term in terms:
+            pat = self.search.like_pattern(term)
+            where_clauses.append("(s.shortcut_key LIKE ? ESCAPE '\\' OR c.content LIKE ? ESCAPE '\\' OR c.tag LIKE ? ESCAPE '\\' OR c.group_name LIKE ? ESCAPE '\\')")
+            params.extend([pat, pat, pat, pat])
+        rows = conn.execute(
+            f"""SELECT c.* FROM clips c
+                JOIN clip_shortcuts s ON s.clip_id = c.id
+                WHERE (c.is_pinned = 0 OR (c.is_pinned = 1 AND c.pinned_at IS NOT NULL AND c.updated_at > c.pinned_at))
+                  AND ({' AND '.join(where_clauses)})
+                ORDER BY s.shortcut_key ASC, c.updated_at DESC, c.id DESC LIMIT ? OFFSET ?""",
+            params + [limit, offset],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _search_pinned_images_sql(self, limit: int, offset: int = 0) -> List[Dict[str, Any]]:
+        rows = get_connection().execute(
+            "SELECT * FROM clips WHERE is_pinned = 1 AND type = 'image' ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def _search_pinned_sql(self, query: str, limit: int) -> List[Dict[str, Any]]:
         terms = self.search.split_search_terms(query)
         if not terms:
             return []
         conn = get_connection()
+        fts_query = _fts_match_expression(terms)
+        if fts_query is not None:
+            selective_ids = self._fts_probe_rowids(conn, fts_query)
+            if selective_ids is not None:
+                if not selective_ids:
+                    return []
+                placeholders = ",".join("?" for _ in selective_ids)
+                rows = conn.execute(
+                    f"""SELECT * FROM clips
+                        WHERE is_pinned = 1 AND id IN ({placeholders})
+                        ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ?""",
+                    selective_ids + [limit],
+                ).fetchall()
+                return [dict(r) for r in rows]
         where_clauses = []
         params = []
         for term in terms:
@@ -369,16 +534,87 @@ class ClipboardStorage:
             where_clauses.append("(content LIKE ? ESCAPE '\\' OR tag LIKE ? ESCAPE '\\' OR group_name LIKE ? ESCAPE '\\')")
             params.extend([pattern, pattern, pattern])
         rows = conn.execute(
-            f"SELECT * FROM clips WHERE is_pinned = 1 AND ({' AND '.join(where_clauses)}) ORDER BY pin_order DESC LIMIT ?",
+            f"SELECT * FROM clips INDEXED BY idx_pinned_search WHERE is_pinned = 1 AND ({' AND '.join(where_clauses)}) ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ?",
             params + [limit],
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def _search_pinned_tags_sql(self, query: str, limit: int) -> List[Dict[str, Any]]:
+    def _search_pinned_priority_tags_sql(self, query: str, limit: int) -> List[Dict[str, Any]]:
         terms = self.search.split_search_terms(query)
         if not terms:
             return []
+        tag_query_cmp = (query or "").strip().lower()
+        prefix_pattern = self.search.like_pattern(tag_query_cmp)[1:]
         conn = get_connection()
+        fts_query = _fts_match_expression(terms, column="tag")
+        if fts_query is not None:
+            selective_ids = self._fts_probe_rowids(conn, fts_query)
+            if selective_ids is not None:
+                if not selective_ids:
+                    return []
+                placeholders = ",".join("?" for _ in selective_ids)
+                rows = conn.execute(
+                    f"""SELECT * FROM clips
+                        WHERE is_pinned = 1 AND tag <> '' AND id IN ({placeholders})
+                        ORDER BY CASE
+                            WHEN LOWER(TRIM(tag)) = ? THEN 0
+                            WHEN LOWER(TRIM(tag)) LIKE ? ESCAPE '\\' THEN 1
+                            ELSE 2
+                        END, updated_at DESC, pin_order DESC, id DESC LIMIT ?""",
+                    selective_ids + [tag_query_cmp, prefix_pattern, limit],
+                ).fetchall()
+                return [dict(r) for r in rows]
+            rows = conn.execute(
+                """SELECT * FROM clips INDEXED BY idx_pinned
+                   WHERE is_pinned = 1 AND tag <> ''
+                     AND id IN (SELECT rowid FROM clips_fts WHERE clips_fts MATCH ?)
+                   ORDER BY CASE
+                       WHEN LOWER(TRIM(tag)) = ? THEN 0
+                       WHEN LOWER(TRIM(tag)) LIKE ? ESCAPE '\\' THEN 1
+                       ELSE 2
+                   END, updated_at DESC, pin_order DESC, id DESC LIMIT ?""",
+                (fts_query, tag_query_cmp, prefix_pattern, limit),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        where_clauses = []
+        params = []
+        for term in terms:
+            where_clauses.append("tag LIKE ? ESCAPE '\\'")
+            params.append(self.search.like_pattern(term))
+        rows = conn.execute(
+            f"""SELECT * FROM clips INDEXED BY idx_pinned
+                WHERE is_pinned = 1 AND tag <> '' AND ({' AND '.join(where_clauses)})
+                ORDER BY CASE
+                    WHEN LOWER(TRIM(tag)) = ? THEN 0
+                    WHEN LOWER(TRIM(tag)) LIKE ? ESCAPE '\\' THEN 1
+                    ELSE 2
+                END, updated_at DESC, pin_order DESC, id DESC LIMIT ?""",
+            params + [tag_query_cmp, prefix_pattern, limit],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _search_pinned_tags_sql(self, query: str, limit: int, offset: int = 0) -> List[Dict[str, Any]]:
+        terms = self.search.split_search_terms(query)
+        conn = get_connection()
+        if not terms:
+            rows = conn.execute(
+                """SELECT * FROM clips INDEXED BY idx_pinned_search
+                   WHERE is_pinned = 1 AND tag <> ''
+                   ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ? OFFSET ?""",
+                (limit, offset),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+        fts_query = _fts_match_expression(terms, column="tag")
+        if fts_query is not None:
+            rows = conn.execute(
+                """SELECT * FROM clips INDEXED BY idx_pinned_search
+                   WHERE is_pinned = 1 AND tag <> ''
+                     AND id IN (SELECT rowid FROM clips_fts WHERE clips_fts MATCH ?)
+                   ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ? OFFSET ?""",
+                (fts_query, limit, offset),
+            ).fetchall()
+            return [dict(r) for r in rows]
         where_clauses = []
         params = []
         for term in terms:
@@ -386,54 +622,80 @@ class ClipboardStorage:
             where_clauses.append("tag LIKE ? ESCAPE '\\'")
             params.append(pattern)
         rows = conn.execute(
-            f"SELECT * FROM clips WHERE is_pinned = 1 AND tag <> '' AND ({' AND '.join(where_clauses)}) ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ?",
-            params + [limit],
+            f"SELECT * FROM clips WHERE is_pinned = 1 AND tag <> '' AND ({' AND '.join(where_clauses)}) ORDER BY updated_at DESC, pin_order DESC, id DESC LIMIT ? OFFSET ?",
+            params + [limit, offset],
         ).fetchall()
         return [dict(r) for r in rows]
 
     def search_history(
-        self, query: str, limit: int = 20, *, semantic: bool = True
+        self, query: str, limit: int = 20, *, offset: int = 0, ranked: bool = True
     ) -> List[Dict[str, Any]]:
         tag_query = _parse_tag_search_query(query)
         if tag_query is not None:
-            return self._search_history_tags_sql(tag_query, limit)
+            return self._search_history_tags_sql(tag_query, limit, offset)
+        if _is_image_filter_query(query):
+            return self._search_history_images_sql(limit, offset)
+        action_query = _parse_action_search_query(query)
+        if action_query is not None:
+            return self._search_history_actions_sql(action_query, limit, offset)
+        ctrl_query = _parse_ctrl_search_query(query)
+        if ctrl_query is not None:
+            return self._search_history_ctrl_sql(ctrl_query, limit, offset)
 
         terms = self.search.split_search_terms(query)
         if not terms:
             return []
 
         lexical_rows = self._search_history_sql(query, max(limit * 8, 80))
-        ranked_lexical_rows = _rank_lexical_rows(
-            lexical_rows,
+        priority_rows = self._search_history_priority_tags_sql(query, limit)
+        exact_row = self.get_clip_by_hash(compute_hash(query))
+        if exact_row and exact_row.get("content") == query:
+            is_history = not exact_row.get("is_pinned") or (
+                exact_row.get("pinned_at") is not None
+                and str(exact_row.get("updated_at") or "") > str(exact_row.get("pinned_at") or "")
+            )
+            if is_history:
+                priority_rows.append(exact_row)
+        merged = {row["id"]: row for row in lexical_rows}
+        merged.update({row["id"]: row for row in priority_rows})
+        return _rank_lexical_rows(
+            list(merged.values()),
             query,
-            limit=max(limit * 3, 20),
+            limit=limit,
             include_meta=True,
             pinned_tiebreaker=False,
         )
-        if not semantic:
-            return ranked_lexical_rows[:limit]
-        if self.search.has_index("history"):
-            all_rows = self._get_all_history_for_search()
-            ranked_ids = self.search.search(
-                "history",
-                query,
-                all_rows,
-                max(limit * 3, 20),
-                [r["id"] for r in ranked_lexical_rows],
-            )
-            return self.search.merge_ranked_results(
-                ranked_ids=ranked_ids,
-                semantic_rows=all_rows,
-                lexical_rows=ranked_lexical_rows,
-                limit=limit,
-            )
-        return ranked_lexical_rows[:limit]
+
+    def _search_history_images_sql(self, limit: int, offset: int = 0) -> List[Dict[str, Any]]:
+        rows = get_connection().execute(
+            """SELECT * FROM clips INDEXED BY idx_updated
+               WHERE type = 'image'
+                 AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
+               ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?""",
+            (limit, offset),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def _search_history_sql(self, query: str, limit: int) -> List[Dict[str, Any]]:
         terms = self.search.split_search_terms(query)
         if not terms:
             return []
         conn = get_connection()
+        fts_query = _fts_match_expression(terms)
+        if fts_query is not None:
+            selective_ids = self._fts_probe_rowids(conn, fts_query)
+            if selective_ids is not None:
+                if not selective_ids:
+                    return []
+                placeholders = ",".join("?" for _ in selective_ids)
+                rows = conn.execute(
+                    f"""SELECT * FROM clips
+                        WHERE id IN ({placeholders})
+                          AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
+                        ORDER BY updated_at DESC LIMIT ?""",
+                    selective_ids + [limit],
+                ).fetchall()
+                return [dict(r) for r in rows]
         where_clauses = []
         params = []
         for term in terms:
@@ -441,7 +703,7 @@ class ClipboardStorage:
             where_clauses.append("(content LIKE ? ESCAPE '\\' OR tag LIKE ? ESCAPE '\\' OR group_name LIKE ? ESCAPE '\\')")
             params.extend([pattern, pattern, pattern])
         rows = conn.execute(
-            f"""SELECT * FROM clips
+            f"""SELECT * FROM clips INDEXED BY idx_updated
                 WHERE ({' AND '.join(where_clauses)})
                   AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
                 ORDER BY updated_at DESC LIMIT ?""",
@@ -449,11 +711,87 @@ class ClipboardStorage:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def _search_history_tags_sql(self, query: str, limit: int) -> List[Dict[str, Any]]:
+    def _search_history_priority_tags_sql(self, query: str, limit: int) -> List[Dict[str, Any]]:
         terms = self.search.split_search_terms(query)
         if not terms:
             return []
+        tag_query_cmp = (query or "").strip().lower()
+        prefix_pattern = self.search.like_pattern(tag_query_cmp)[1:]
         conn = get_connection()
+        fts_query = _fts_match_expression(terms, column="tag")
+        if fts_query is not None:
+            selective_ids = self._fts_probe_rowids(conn, fts_query)
+            if selective_ids is not None:
+                if not selective_ids:
+                    return []
+                placeholders = ",".join("?" for _ in selective_ids)
+                rows = conn.execute(
+                    f"""SELECT * FROM clips
+                        WHERE tag <> '' AND id IN ({placeholders})
+                          AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
+                        ORDER BY CASE
+                            WHEN LOWER(TRIM(tag)) = ? THEN 0
+                            WHEN LOWER(TRIM(tag)) LIKE ? ESCAPE '\\' THEN 1
+                            ELSE 2
+                        END, updated_at DESC, id DESC LIMIT ?""",
+                    selective_ids + [tag_query_cmp, prefix_pattern, limit],
+                ).fetchall()
+                return [dict(r) for r in rows]
+            rows = conn.execute(
+                """SELECT * FROM clips
+                   WHERE tag <> ''
+                     AND id IN (SELECT rowid FROM clips_fts WHERE clips_fts MATCH ?)
+                     AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
+                   ORDER BY CASE
+                       WHEN LOWER(TRIM(tag)) = ? THEN 0
+                       WHEN LOWER(TRIM(tag)) LIKE ? ESCAPE '\\' THEN 1
+                       ELSE 2
+                   END, updated_at DESC, id DESC LIMIT ?""",
+                (fts_query, tag_query_cmp, prefix_pattern, limit),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        where_clauses = []
+        params = []
+        for term in terms:
+            where_clauses.append("tag LIKE ? ESCAPE '\\'")
+            params.append(self.search.like_pattern(term))
+        rows = conn.execute(
+            f"""SELECT * FROM clips
+                WHERE tag <> '' AND ({' AND '.join(where_clauses)})
+                  AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
+                ORDER BY CASE
+                    WHEN LOWER(TRIM(tag)) = ? THEN 0
+                    WHEN LOWER(TRIM(tag)) LIKE ? ESCAPE '\\' THEN 1
+                    ELSE 2
+                END, updated_at DESC, id DESC LIMIT ?""",
+            params + [tag_query_cmp, prefix_pattern, limit],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _search_history_tags_sql(self, query: str, limit: int, offset: int = 0) -> List[Dict[str, Any]]:
+        terms = self.search.split_search_terms(query)
+        conn = get_connection()
+        if not terms:
+            rows = conn.execute(
+                """SELECT * FROM clips INDEXED BY idx_updated
+                   WHERE tag <> ''
+                     AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
+                   ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?""",
+                (limit, offset),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+        fts_query = _fts_match_expression(terms, column="tag")
+        if fts_query is not None:
+            rows = conn.execute(
+                """SELECT * FROM clips INDEXED BY idx_updated
+                   WHERE tag <> ''
+                     AND id IN (SELECT rowid FROM clips_fts WHERE clips_fts MATCH ?)
+                     AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
+                   ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?""",
+                (fts_query, limit, offset),
+            ).fetchall()
+            return [dict(r) for r in rows]
         where_clauses = []
         params = []
         for term in terms:
@@ -465,77 +803,14 @@ class ClipboardStorage:
                 WHERE tag <> ''
                   AND ({' AND '.join(where_clauses)})
                   AND (is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at))
-                ORDER BY updated_at DESC, id DESC LIMIT ?""",
-            params + [limit],
+                ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?""",
+            params + [limit, offset],
         ).fetchall()
         return [dict(r) for r in rows]
-
-    def _get_all_pinned_for_search(self) -> List[Dict[str, Any]]:
-        conn = get_connection()
-        rows = conn.execute(
-            "SELECT * FROM clips WHERE is_pinned = 1 ORDER BY pin_order DESC"
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    def _get_all_history_for_search(self) -> List[Dict[str, Any]]:
-        conn = get_connection()
-        rows = conn.execute(
-            """SELECT * FROM clips
-               WHERE is_pinned = 0 OR (is_pinned = 1 AND pinned_at IS NOT NULL AND updated_at > pinned_at)
-               ORDER BY updated_at DESC"""
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    # ==================== NEURAL OPERATIONS (delegated) ====================
-
-    def save_vector(self, clip_id: int, vector_bytes: bytes):
-        self.neural.save_vector(clip_id, vector_bytes)
-
-    def get_vector(self, clip_id: int) -> Optional[bytes]:
-        return self.neural.get_vector(clip_id)
-
-    def save_links(self, links_list: List[Tuple[int, int, float]]):
-        self.neural.save_links(links_list)
-
-    def get_links(self, clip_id_list: List[int]) -> List[Dict[str, Any]]:
-        return self.neural.get_links(clip_id_list)
-
-    def get_unindexed_clip_ids(self, limit: int = 100) -> List[int]:
-        return self.neural.get_unindexed_clip_ids(limit)
-
-    def get_recent_history_ids(self, limit: int = 200) -> List[int]:
-        return self.neural.get_recent_history_ids(limit)
-
-    def get_all_pinned_ids(self) -> List[int]:
-        return self.neural.get_all_pinned_ids()
-
-    def get_unindexed_ids_within_window(
-        self, recent_limit: int = 200, include_pinned: bool = True, limit: int = 100
-    ) -> List[int]:
-        return self.neural.get_unindexed_ids_within_window(
-            recent_limit, include_pinned, limit
-        )
-
-    def get_neural_window_totals(
-        self, recent_limit: int = 200, include_pinned: bool = True
-    ) -> Tuple[int, int]:
-        return self.neural.get_neural_window_totals(recent_limit, include_pinned)
-
-    def get_all_clip_ids_with_vectors(self, limit: int = 500) -> List[int]:
-        return self.neural.get_all_clip_ids_with_vectors(limit)
-
-    def get_neural_data(
-        self, clip_ids: List[int]
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        return self.neural.get_neural_data(clip_ids)
 
 
 # Global instance
 _storage: Optional[ClipboardStorage] = None
-
-
-def get_neural_support_error() -> Exception | None:
-    return _NEURAL_REPOSITORY_IMPORT_ERROR
 
 
 def get_storage() -> ClipboardStorage:
