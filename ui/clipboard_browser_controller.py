@@ -1,3 +1,4 @@
+from core.action_runner import ActionRunner
 import queue
 import threading
 import time
@@ -57,6 +58,10 @@ class ClipboardBrowserController:
         self._layout_refresh_timer.setSingleShot(True)
         self._layout_refresh_timer.timeout.connect(self._refresh_visible_row_layouts)
 
+        self._shortcuts_cache = {}
+        self._actions_cache = {}
+        self.refresh_shortcuts_and_actions()
+
 
 
     def bind_viewports(self):
@@ -90,32 +95,106 @@ class ClipboardBrowserController:
         self.app.list_history.doItemsLayout()
         self.app.list_pinned.doItemsLayout()
 
-    def build_clip_row(self, clip, is_pinned, *, is_grouped=False, group_name="", search_query=""):
+    def refresh_shortcuts_and_actions(self):
+        try:
+            self._shortcuts_cache = self.storage.get_all_shortcuts()
+            if hasattr(self.storage, "get_action_clip_ids"):
+                self._actions_cache = {cid: True for cid in self.storage.get_action_clip_ids()}
+            else:
+                self._actions_cache = {cid: True for cid in self.storage.get_all_clip_actions()}
+        except Exception:
+            self._shortcuts_cache = {}
+            self._actions_cache = {}
+
+    def build_clip_row(self, clip, is_pinned, *, is_grouped=False, group_name="", search_query="", alt_shortcut=""):
+        clip_dict = dict(clip)
+        cid = clip_dict.get("id")
+        if cid:
+            if "shortcut_key" not in clip_dict:
+                clip_dict["shortcut_key"] = self._shortcuts_cache.get(cid)
+            if "has_action" not in clip_dict:
+                clip_dict["has_action"] = bool(self._actions_cache.get(cid))
+            clip_dict["is_action_running"] = ActionRunner.is_running(cid)
+
         return ClipRow(
             row_kind="clip",
-            clip=dict(clip),
+            clip=clip_dict,
             group_name=group_name or str(clip.get("group_name", "") or ""),
             is_pinned=bool(is_pinned),
             is_grouped_child=bool(is_grouped),
-            is_expanded=clip.get("id") in self.expanded_clip_ids,
+            is_expanded=clip_dict.get("id") in self.expanded_clip_ids,
             search_query=search_query,
+            alt_shortcut=alt_shortcut,
         )
 
+    def _reorder_running_clips_to_slot_4(self, clips, *, is_pinned: bool) -> list:
+        """
+        Pin currently running action clips at position #4 onwards (index 3, right after
+        the 3 Alt quick-paste slots) in their respective column (History or Pinned).
+        """
+        running_ids = ActionRunner.get_running_clip_ids()
+        if not running_ids:
+            return list(clips)
+
+        running_set = set(running_ids)
+        by_id = {}
+        normal_clips = []
+        for clip in clips:
+            cid = clip.get("id")
+            if cid in running_set:
+                by_id[cid] = clip
+            else:
+                normal_clips.append(clip)
+
+        if not self.current_search_query and hasattr(self.storage, "get_clip_by_id"):
+            for rcid in running_ids:
+                if rcid not in by_id:
+                    try:
+                        rclip = self.storage.get_clip_by_id(rcid)
+                        if rclip and bool(rclip.get("is_pinned")) == bool(is_pinned):
+                            by_id[rcid] = rclip
+                    except Exception:
+                        pass
+
+        running_ordered = [by_id[rcid] for rcid in running_ids if rcid in by_id]
+        if not running_ordered:
+            return list(clips)
+
+        insert_idx = min(3, len(normal_clips))
+        return normal_clips[:insert_idx] + running_ordered + normal_clips[insert_idx:]
+
     def build_history_rows(self, clips):
-        return [
-            self.build_clip_row(clip, False, search_query=self.current_search_query)
-            for clip in clips
-        ]
+        ordered_clips = self._reorder_running_clips_to_slot_4(clips, is_pinned=False)
+        rows = []
+        for i, clip in enumerate(ordered_clips):
+            alt_sc = f"Alt+{i+1}" if i < 3 else ""
+            rows.append(
+                self.build_clip_row(
+                    clip, False, search_query=self.current_search_query, alt_shortcut=alt_sc
+                )
+            )
+        return rows
 
     def build_pinned_rows(self, groups=None, ungrouped=None, pinned_clips=None):
         query = self.current_search_query
         if pinned_clips is not None:
-            return [
-                self.build_clip_row(clip, True, search_query=query)
-                for clip in pinned_clips
-            ]
+            ordered_pinned = self._reorder_running_clips_to_slot_4(pinned_clips, is_pinned=True)
+            rows = []
+            for i, clip in enumerate(ordered_pinned):
+                alt_sc = f"Alt+{i+4}" if i < 3 else ""
+                rows.append(
+                    self.build_clip_row(clip, True, search_query=query, alt_shortcut=alt_sc)
+                )
+            return rows
+
+        running_ids = ActionRunner.get_running_clip_ids()
+        running_set = set(running_ids)
+        running_by_id = {}
 
         rows = []
+        pasteable_count = 0
+        slot_4_row_insert_idx = None
+
         for group_name, clips in groups or []:
             expanded = group_name in self.expanded_groups
             rows.append(
@@ -129,20 +208,72 @@ class ClipboardBrowserController:
                 )
             )
             if expanded:
-                rows.extend(
-                    self.build_clip_row(
-                        clip,
-                        True,
-                        is_grouped=True,
-                        group_name=group_name,
-                        search_query=query,
+                for clip in clips:
+                    cid = clip.get("id")
+                    if cid in running_set:
+                        running_by_id[cid] = (clip, True, group_name)
+                        continue
+                    alt_sc = f"Alt+{pasteable_count+4}" if pasteable_count < 3 else ""
+                    pasteable_count += 1
+                    rows.append(
+                        self.build_clip_row(
+                            clip,
+                            True,
+                            is_grouped=True,
+                            group_name=group_name,
+                            search_query=query,
+                            alt_shortcut=alt_sc,
+                        )
                     )
-                    for clip in clips
-                )
-        rows.extend(
-            self.build_clip_row(clip, True, search_query=query)
-            for clip in (ungrouped or [])
-        )
+                    if pasteable_count == 3 and slot_4_row_insert_idx is None:
+                        slot_4_row_insert_idx = len(rows)
+
+        for clip in (ungrouped or []):
+            cid = clip.get("id")
+            if cid in running_set:
+                running_by_id[cid] = (clip, False, "")
+                continue
+            alt_sc = f"Alt+{pasteable_count+4}" if pasteable_count < 3 else ""
+            pasteable_count += 1
+            rows.append(
+                self.build_clip_row(clip, True, search_query=query, alt_shortcut=alt_sc)
+            )
+            if pasteable_count == 3 and slot_4_row_insert_idx is None:
+                slot_4_row_insert_idx = len(rows)
+
+        if running_ids and hasattr(self.storage, "get_clip_by_id"):
+            for rcid in running_ids:
+                if rcid not in running_by_id:
+                    try:
+                        rclip = self.storage.get_clip_by_id(rcid)
+                        if rclip and rclip.get("is_pinned"):
+                            gname = str(rclip.get("group_name", "") or "")
+                            running_by_id[rcid] = (rclip, bool(gname), gname)
+                    except Exception:
+                        pass
+
+        if running_by_id:
+            running_rows = []
+            for rcid in running_ids:
+                if rcid in running_by_id:
+                    rclip, is_grp, gname = running_by_id[rcid]
+                    alt_sc = f"Alt+{pasteable_count+4}" if pasteable_count < 3 else ""
+                    pasteable_count += 1
+                    running_rows.append(
+                        self.build_clip_row(
+                            rclip,
+                            True,
+                            is_grouped=is_grp,
+                            group_name=gname,
+                            search_query=query,
+                            alt_shortcut=alt_sc,
+                        )
+                    )
+            if slot_4_row_insert_idx is not None:
+                rows = rows[:slot_4_row_insert_idx] + running_rows + rows[slot_4_row_insert_idx:]
+            else:
+                rows.extend(running_rows)
+
         return rows
 
     def start_background_refresh(self):
@@ -299,6 +430,8 @@ class ClipboardBrowserController:
 
     def _close_expanded_editors(self, list_widget, clip_ids=None):
         """Close persistent editors before rows are reset, removed, or replaced."""
+        if not self.expanded_clip_ids and clip_ids is None:
+            return
         target_ids = set(clip_ids) if clip_ids is not None else None
         for row_idx in range(list_widget.model().rowCount()):
             row_data = list_widget.model().row_at(row_idx)
@@ -310,6 +443,9 @@ class ClipboardBrowserController:
 
     def _reopen_expanded_editors(self, list_widget):
         """Reopen persistent editors for expanded clips after a row layout change."""
+        if not self.expanded_clip_ids:
+            list_widget.viewport().update()
+            return
         list_widget.doItemsLayout()
         for row_idx in range(list_widget.model().rowCount()):
             row_data = list_widget.model().row_at(row_idx)
@@ -422,6 +558,9 @@ class ClipboardBrowserController:
 
     def activate_current(self):
         """Paste the currently active item."""
+        if getattr(self.app, "is_ui_dirty", False) and getattr(self.app, "pending_ui_clip_ids", None):
+            if hasattr(self.app, "_refresh_after_show"):
+                self.app._refresh_after_show()
         w = self._active_list()
         if not w:
             return
@@ -432,6 +571,69 @@ class ClipboardBrowserController:
         data = ci.data(Qt.ItemDataRole.UserRole)
         self.app.handle_paste(data)
         self.app.search_input.setFocus()
+
+    def activate_current_action(self):
+        """Run action or open URL for currently selected clip."""
+        w = self._active_list()
+        if not w:
+            return
+        self._ensure_current_item()
+        ci = w.currentItem()
+        if not self._is_pasteable_item(ci):
+            return
+        data = ci.data(Qt.ItemDataRole.UserRole)
+        if not data or not data.get("id"):
+            return
+        self.app.handle_run_clip_action_or_url(data)
+
+    def get_column_clips(self, side: str) -> list:
+        """Get visible, pasteable clips in currently displayed model order."""
+        view = self.app.list_history if side == "history" else self.app.list_pinned
+        clips = []
+        for row in view.rows():
+            if row.is_clip and row.clip:
+                clips.append(row.clip)
+        return clips
+
+    def handle_alt_digit(self, digit: int) -> bool:
+        """
+        Alt+1..3 -> History clip 1, 2, 3
+        Alt+4..6 -> Pinned clip 1, 2, 3
+        """
+        if getattr(self.app, "is_ui_dirty", False) and getattr(self.app, "pending_ui_clip_ids", None):
+            if hasattr(self.app, "_refresh_after_show"):
+                self.app._refresh_after_show()
+        if self.search_debounce_timer.isActive():
+            self.search_debounce_timer.stop()
+            self.app._do_search()
+
+        if 1 <= digit <= 3:
+            clips = self.get_column_clips("history")
+            idx = digit - 1
+            if idx < len(clips):
+                target_clip = clips[idx]
+                self.app.handle_paste(target_clip)
+                return True
+        elif 4 <= digit <= 6:
+            clips = self.get_column_clips("pinned")
+            idx = digit - 4
+            if idx < len(clips):
+                target_clip = clips[idx]
+                self.app.handle_paste(target_clip)
+                return True
+        return False
+
+    def handle_ctrl_shortcut(self, char: str) -> bool:
+        """Handle Ctrl+<0-9, a-z> shortcut to paste mapped clip."""
+        norm_key = (char or "").strip().upper()
+        if not norm_key or len(norm_key) != 1 or not norm_key.isalnum():
+            return False
+
+        clip = self.storage.get_clip_by_shortcut(norm_key)
+        if clip:
+            self.app.handle_paste(clip)
+            return True
+        return False
 
     def on_search_text_changed(self, text):
         """Debounced search optimized for interactive typing."""
@@ -632,6 +834,7 @@ class ClipboardBrowserController:
             history_blocker = QSignalBlocker(history_bar)
             pinned_blocker = QSignalBlocker(pinned_bar)
 
+            self.refresh_shortcuts_and_actions()
             # 1. Refresh History
             self.history_offset = 0
 
@@ -813,6 +1016,25 @@ class ClipboardBrowserController:
                 changed = True
 
             if changed:
+                model = self.app.list_history.model()
+                for idx in range(min(4, model.rowCount())):
+                    r_data = model.row_at(idx)
+                    if r_data and r_data.is_clip:
+                        expected_alt = f"Alt+{idx+1}" if idx < 3 else ""
+                        if r_data.alt_shortcut != expected_alt:
+                            model.replace_row(
+                                idx,
+                                ClipRow(
+                                    row_kind="clip",
+                                    clip=r_data.clip,
+                                    group_name=r_data.group_name,
+                                    is_pinned=r_data.is_pinned,
+                                    is_grouped_child=r_data.is_grouped_child,
+                                    is_expanded=r_data.is_expanded,
+                                    search_query=r_data.search_query,
+                                    alt_shortcut=expected_alt,
+                                ),
+                            )
                 self.history_offset = max(self.history_offset, self.app.list_history.count())
                 self.app.list_history.scrollToTop()
                 self.app.list_history.setCurrentRow(0)

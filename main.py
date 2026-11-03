@@ -30,8 +30,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import (
     Qt,
     QTimer,
-
     QEvent,
+    pyqtSignal,
 )
 from PyQt6.QtGui import (
     QCursor,
@@ -65,6 +65,7 @@ from ui.widgets import (
     SearchLineEdit,
     PAGE_SIZE_HISTORY,
     PAGE_SIZE_PINNED,
+    _extract_alnum_key,
 )
 from ui.clip_list_view import ClipListView
 from ui.clip_models import HistoryListModel, PinnedListModel
@@ -84,7 +85,7 @@ FAULT_LOG_FILE = os.path.join(LOG_DIR, "Advance Clipboard.fault.log")
 UI_EDGE_MARGIN = 150  # Minimum distance from screen edges
 SW_RESTORE = 9
 ENABLE_RESTORE_FOCUS_AFTER_BG_CLICK = True
-FOCUS_RESTORE_POLL_MS = 8
+FOCUS_RESTORE_POLL_MS = 4
 FOCUS_RESTORE_TIMEOUT_MS = 180
 
 # Ensure image directory exists
@@ -96,7 +97,7 @@ if not os.path.exists(LOG_DIR):
 
 logger = logging.getLogger("advance_clipboard")
 if not logger.handlers:
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.INFO if os.environ.get("ADVANCE_CLIPBOARD_DEBUG") == "1" else logging.WARNING)
     file_handler = logging.FileHandler(DEBUG_LOG_FILE, encoding="utf-8")
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
@@ -134,7 +135,7 @@ threading.excepthook = _log_thread_exception
 
 
 class ClientApp(QWidget):
-
+    actionStateChanged = pyqtSignal(int, str)
 
     def __init__(self, *, enable_monitor: bool = True, init_data: bool = True):
         super().__init__()
@@ -159,6 +160,8 @@ class ClientApp(QWidget):
         self.last_focus_window_handle = None
         self._ui_opening_until = 0.0
         self._paste_in_progress = False
+        self._child_dialog_open = False
+        self._ignore_monitor_until = 0.0
         self._last_clipboard_capture_at = 0.0
         self._last_ingested_clipboard_key = None
         self._last_ingested_clipboard_at = 0.0
@@ -219,6 +222,13 @@ class ClientApp(QWidget):
         self.backup_scheduler = BackupScheduler(self._perform_backup)
         self.storage.set_backup_callback(self.backup_scheduler.schedule)
 
+
+        from core.action_runner import ActionRunner
+        self._action_state_cb = lambda cid, st: self.actionStateChanged.emit(cid, st)
+        self.actionStateChanged.connect(
+            self._on_action_state_changed, Qt.ConnectionType.QueuedConnection
+        )
+        ActionRunner.add_state_listener(self._action_state_cb)
 
         # Register cleanup on exit
         atexit.register(self._cleanup_on_exit)
@@ -327,6 +337,9 @@ class ClientApp(QWidget):
             on_up=self.browser.nav_up,
             on_down=self.browser.nav_down,
             on_enter=self.browser.activate_current,
+            on_ctrl_enter=self.browser.activate_current_action,
+            on_alt_digit=self.browser.handle_alt_digit,
+            on_ctrl_key=self.browser.handle_ctrl_shortcut,
         )
         search_row.addWidget(self.search_input, stretch=1)
 
@@ -365,6 +378,9 @@ class ClientApp(QWidget):
         self.list_history.pinToggleRequested.connect(self.handle_star)
         self.list_history.deleteRequested.connect(self.handle_delete)
         self.list_history.expandToggleRequested.connect(self.handle_toggle_expand)
+        self.list_history.runActionRequested.connect(self.handle_run_action)
+        self.list_history.stopActionRequested.connect(self.handle_stop_action)
+        self.list_history.showLogRequested.connect(self.handle_show_action_log)
         col_h.addWidget(self.list_history)
 
         # PINNED column
@@ -384,6 +400,9 @@ class ClientApp(QWidget):
         self.list_pinned.pinToggleRequested.connect(self.handle_star)
         self.list_pinned.deleteRequested.connect(self.handle_delete)
         self.list_pinned.expandToggleRequested.connect(self.handle_toggle_expand)
+        self.list_pinned.runActionRequested.connect(self.handle_run_action)
+        self.list_pinned.stopActionRequested.connect(self.handle_stop_action)
+        self.list_pinned.showLogRequested.connect(self.handle_show_action_log)
         self.list_pinned.groupToggleRequested.connect(
             lambda group, expanded: self.expand_group(group)
             if expanded
@@ -462,7 +481,6 @@ class ClientApp(QWidget):
         self.browser.refresh_pinned_list()
 
     def toggle_visibility(self):
-        print(f"[MainUI] toggle_visibility: visible={self.isVisible()}")
         if self.isVisible():
             self.hide()
         else:
@@ -502,17 +520,8 @@ class ClientApp(QWidget):
             try:
                 our_hwnd = int(self.winId())
                 user32 = ctypes.windll.user32
-                f_hwnd = user32.GetForegroundWindow()
-                if f_hwnd != our_hwnd:
-                    ft, at = (
-                        user32.GetWindowThreadProcessId(f_hwnd, None),
-                        user32.GetWindowThreadProcessId(our_hwnd, None),
-                    )
-                    user32.AttachThreadInput(ft, at, True)
-                    user32.SetForegroundWindow(our_hwnd)
-                    user32.SetFocus(our_hwnd)
-                    user32.AttachThreadInput(ft, at, False)
-            except:
+                user32.SetForegroundWindow(our_hwnd)
+            except Exception:
                 pass
         self.raise_()
         self.activateWindow()
@@ -577,8 +586,149 @@ class ClientApp(QWidget):
         self.refresh_lists()
         self.is_ui_dirty = False
 
+    def keyPressEvent(self, event):
+        k = event.key()
+        if k == Qt.Key.Key_Escape:
+            self.hide()
+            event.accept()
+            return
+
+        modifiers = event.modifiers()
+        is_repeat = bool(getattr(event, "isAutoRepeat", lambda: False)())
+
+        if (modifiers & Qt.KeyboardModifier.ControlModifier) and k in (
+            Qt.Key.Key_Return,
+            Qt.Key.Key_Enter,
+        ):
+            if not is_repeat:
+                self.browser.activate_current_action()
+                event.accept()
+                return
+
+        if (modifiers & Qt.KeyboardModifier.AltModifier) and not (
+            modifiers & Qt.KeyboardModifier.ControlModifier
+        ):
+            if 0x31 <= int(k) <= 0x36:
+                digit = int(k) - 0x30
+                if not is_repeat and self.browser.handle_alt_digit(digit):
+                    event.accept()
+                    return
+
+        if (modifiers & Qt.KeyboardModifier.ControlModifier) and not (
+            modifiers & Qt.KeyboardModifier.AltModifier
+        ):
+            char = _extract_alnum_key(event)
+            if char and not is_repeat:
+                if self.browser.handle_ctrl_shortcut(char):
+                    event.accept()
+                    return
+
+        super().keyPressEvent(event)
+
+    def handle_assign_shortcut(self, clip_data):
+        from ui.widgets import ShortcutAssignDialog
+        self._child_dialog_open = True
+        try:
+            dlg = ShortcutAssignDialog(clip_data, self.storage, parent=self)
+            accepted = dlg.exec()
+        finally:
+            self._child_dialog_open = False
+        if accepted:
+            self.browser.refresh_shortcuts_and_actions()
+            self.refresh_lists()
+
+    def handle_remove_shortcut(self, clip_id):
+        self.storage.remove_shortcut(clip_id)
+        self.browser.refresh_shortcuts_and_actions()
+        self.refresh_lists()
+
+    def handle_configure_action(self, clip_data):
+        from ui.widgets import ActionConfigDialog
+        self._child_dialog_open = True
+        try:
+            dlg = ActionConfigDialog(clip_data, self.storage, parent=self)
+            accepted = dlg.exec()
+        finally:
+            self._child_dialog_open = False
+        if accepted:
+            self.browser.refresh_shortcuts_and_actions()
+            self.refresh_lists()
+
+    def handle_remove_action(self, clip_id):
+        self.storage.remove_clip_action(clip_id)
+        self.browser.refresh_shortcuts_and_actions()
+        self.refresh_lists()
+
+    def handle_open_url(self, url):
+        from core.action_runner import open_url
+        self.hide()
+        open_url(url)
+
+    def _on_action_state_changed(self, clip_id: int, state: str):
+        if self.isVisible():
+            self.refresh_lists(force_reset_selection=False)
+        else:
+            self._schedule_hidden_ui_refresh(clip_id, full_refresh=True)
+
+    def handle_run_action(self, clip_data):
+        self.handle_run_clip_action_or_url(clip_data)
+
+    def handle_stop_action(self, clip_id: int):
+        from core.action_runner import ActionRunner
+        ActionRunner.stop_action(clip_id)
+        if self.isVisible():
+            self.refresh_lists(force_reset_selection=False)
+
+    def handle_show_action_log(self, clip_data):
+        from ui.widgets import ActionLogDialog
+        existing_dlg = getattr(self, "_action_log_dialog", None)
+        if existing_dlg is not None:
+            try:
+                existing_dlg.close()
+            except Exception:
+                pass
+        self._child_dialog_open = True
+        try:
+            dlg = ActionLogDialog(
+                clip_data, parent=self, on_stop_callback=self.handle_stop_action
+            )
+            self._action_log_dialog = dlg
+            dlg.exec()
+        finally:
+            self._child_dialog_open = False
+
+    def handle_run_clip_action_or_url(self, clip_data):
+        clip_id = clip_data.get("id")
+        if not clip_id:
+            return
+
+        action = self.storage.get_clip_action(clip_id)
+        if action:
+            from core.action_runner import ActionRunner
+            if action.get("action_type") == "url":
+                self.hide()
+            def on_done(res):
+                logger.debug("action_done clip_id=%s success=%s code=%s msg=%s", clip_id, res.success, res.exit_code, res.message)
+            ActionRunner.execute_action(clip_id, action, on_complete=on_done)
+            if self.isVisible() and action.get("action_type") != "url":
+                QTimer.singleShot(15, lambda: self.refresh_lists(force_reset_selection=False))
+            return
+
+        content = str(clip_data.get("content", "")).strip()
+        from core.action_runner import is_valid_url, open_url
+        if is_valid_url(content):
+            self.hide()
+            open_url(content)
+
     def closeEvent(self, event):
         """Clean up on close."""
+        cb = getattr(self, "_action_state_cb", None)
+        if cb is not None:
+            try:
+                from core.action_runner import ActionRunner
+                ActionRunner.remove_state_listener(cb)
+            except Exception:
+                pass
         if getattr(self, "preview", None):
             self.preview.reset()
         super().closeEvent(event)
@@ -590,7 +740,7 @@ class ClientApp(QWidget):
             return
         data = item.data(Qt.ItemDataRole.UserRole)
         if data and isinstance(data, dict) and "content" in data:
-            logger.info(
+            logger.debug(
                 "item_clicked clip_id=%s type=%s preview=%r",
                 data.get("id"),
                 data.get("type"),
@@ -600,7 +750,7 @@ class ClientApp(QWidget):
 
     def handle_paste(self, data):
         if self._paste_in_progress or not data or "content" not in data:
-            logger.info(
+            logger.debug(
                 "handle_paste_skipped in_progress=%s has_data=%s has_content=%s",
                 self._paste_in_progress,
                 bool(data),
@@ -610,7 +760,7 @@ class ClientApp(QWidget):
 
         self._paste_in_progress = True
         self.input_locked = True
-        logger.info(
+        logger.debug(
             "handle_paste_start clip_id=%s type=%s target_hwnd=%s",
             data.get("id"),
             data.get("type"),
@@ -651,21 +801,10 @@ class ClientApp(QWidget):
 
     def _prepare_clipboard_and_paste(self, data, attempt_index):
         retry_delays = (0, 8, 16, 32)
-        logger.info(
-            "prepare_clipboard attempt=%s clip_id=%s type=%s",
-            attempt_index,
-            data.get("id"),
-            data.get("type"),
-        )
+        self._set_pending_clipboard_guard(data)
 
         if not self._write_clipboard_payload(data):
             next_attempt = attempt_index + 1
-            logger.warning(
-                "prepare_clipboard_failed attempt=%s clip_id=%s next_attempt=%s",
-                attempt_index,
-                data.get("id"),
-                next_attempt,
-            )
             if next_attempt < len(retry_delays):
                 QTimer.singleShot(
                     retry_delays[next_attempt],
@@ -680,26 +819,18 @@ class ClientApp(QWidget):
                 self._finish_paste_attempt(clear_guard=True)
             return
 
-        self._set_pending_clipboard_guard(data)
-        logger.info("prepare_clipboard_success clip_id=%s", data.get("id"))
         self.hide()
-        # Hide first, then poll until Windows actually gives foreground back to
-        # the original target. This avoids a fixed sleep that is sometimes too
-        # short for slow apps and unnecessarily long for fast ones.
+        if sys.platform == "win32" and self.last_active_window_handle:
+            self._restore_target_focus(self.last_active_window_handle)
         QTimer.singleShot(0, self._begin_restore_focus_and_paste)
 
     def _write_clipboard_payload(self, data):
         try:
             if data["type"] == "text":
                 self.clipboard.setText(data["content"])
-                ok = self.clipboard.text() == data["content"]
-                logger.info(
-                    "write_clipboard_text clip_id=%s success=%s length=%s",
-                    data.get("id"),
-                    ok,
-                    len(data["content"]),
-                )
-                return ok
+                if sys.platform == "win32":
+                    return True
+                return self.clipboard.text() == data["content"]
 
             p = os.path.join(IMAGE_DIR, data["content"])
             if not os.path.exists(p):
@@ -748,7 +879,7 @@ class ClientApp(QWidget):
         ready = self._ready_to_paste()
         foreground = user32.GetForegroundWindow()
         elapsed_ms = (time.perf_counter() - self._restore_focus_started_at) * 1000
-        logger.info(
+        logger.debug(
             "restore_focus_poll ready=%s target=%s foreground=%s elapsed_ms=%.1f",
             ready,
             target_hwnd,
@@ -821,10 +952,6 @@ class ClientApp(QWidget):
         if sys.platform != "win32":
             return True
         user32 = ctypes.windll.user32
-        ctrl_down = bool(user32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
-        alt_down = bool(user32.GetAsyncKeyState(VK_MENU) & 0x8000)
-        if ctrl_down or alt_down:
-            return False
         target_hwnd = self.last_active_window_handle
         if target_hwnd:
             self._restore_target_focus(target_hwnd)
@@ -905,7 +1032,7 @@ class ClientApp(QWidget):
             return False
 
     def _perform_keyboard_paste(self):
-        logger.info(
+        logger.debug(
             "perform_keyboard_paste target_hwnd=%s", self.last_active_window_handle
         )
         target_hwnd = self.last_active_window_handle
@@ -922,8 +1049,9 @@ class ClientApp(QWidget):
                     )
                     self._finish_paste_attempt(clear_guard=False)
                     return
-            simulate_paste()
-            logger.info("simulate_paste_done target_hwnd=%s", target_hwnd)
+            focus_hwnd = getattr(self, "last_focus_window_handle", None)
+            simulate_paste(target_hwnd=target_hwnd, focus_hwnd=focus_hwnd)
+            logger.debug("simulate_paste_done target_hwnd=%s focus_hwnd=%s", target_hwnd, focus_hwnd)
         except Exception as exc:
             logger.error("perform_keyboard_paste_failed: %s", exc)
         self._finish_paste_attempt()
@@ -931,6 +1059,8 @@ class ClientApp(QWidget):
 
     def _finish_paste_attempt(self, clear_guard=False):
         self._paste_in_progress = False
+        self._child_dialog_open = False
+        self._ignore_monitor_until = 0.0
         self.input_locked = False
         if clear_guard:
             self.pending_clipboard_guard = None
@@ -945,6 +1075,7 @@ class ClientApp(QWidget):
             "content": data["content"],
             "expires_at": time.monotonic() + 1.5,
         }
+        self._ignore_monitor_until = time.monotonic() + 0.35
 
     def _clear_pending_clipboard_guard_if_expired(self):
         if (
@@ -1041,13 +1172,13 @@ class ClientApp(QWidget):
         self.browser.reset_after_delete_refresh()
 
 
-    def keyPressEvent(self, e):
-        if e.key() == Qt.Key.Key_Escape:
-            self.hide()
-        super().keyPressEvent(e)
+
 
     def on_clipboard_change_delayed(self):
         """Coalesce clipboard format bursts before reading the final payload."""
+        if self._paste_in_progress or time.monotonic() < getattr(self, "_ignore_monitor_until", 0.0):
+            self._ignore_monitor_until = 0.0
+            return
         if not self._clipboard_capture_timer.isActive():
             self._last_clipboard_capture_at = time.perf_counter()
         self._clipboard_capture_timer.start()
@@ -1154,7 +1285,11 @@ class ClientApp(QWidget):
 
     def changeEvent(self, e):
         if e.type() == QEvent.Type.ActivationChange and not self.isActiveWindow():
-            self.hide()
+            if not getattr(self, "_child_dialog_open", False):
+                edit_popup = getattr(self, "_edit_popup", None)
+                if not (edit_popup is not None and edit_popup.isVisible()):
+                    if getattr(QApplication, "activeModalWidget", lambda: None)() is None and getattr(QApplication, "activePopupWidget", lambda: None)() is None:
+                        self.hide()
         super().changeEvent(e)
 
 

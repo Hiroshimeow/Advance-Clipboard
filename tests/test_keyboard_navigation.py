@@ -21,6 +21,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 if not hasattr(ctypes, "WINFUNCTYPE"):
     ctypes.WINFUNCTYPE = ctypes.CFUNCTYPE
 
+_orig_clipboard_monitor = sys.modules.get("core.clipboard_monitor")
 _clipboard_monitor_mod = types.ModuleType("core.clipboard_monitor")
 _clipboard_monitor_mod.Win32ClipboardMonitor = MagicMock()
 _clipboard_monitor_mod.VK_CONTROL = 0x11
@@ -1334,3 +1335,10 @@ class KeyboardNavigationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def tearDownModule():
+    if _orig_clipboard_monitor is not None:
+        sys.modules["core.clipboard_monitor"] = _orig_clipboard_monitor
+    else:
+        sys.modules.pop("core.clipboard_monitor", None)
